@@ -172,6 +172,11 @@ TileEngine::init(Cesium3DTilesSelection::IPrepareRendererResources *prepare)
 	// children stream in — visible as missing ground where detail demand is
 	// highest (close range / pointing down).
 	options.forbidHoles = true;
+	// Fog culling is tuned for globe-anchored cameras and silently drops
+	// tiles by slant distance at low camera altitudes — seen as a smooth
+	// arc of missing ground across the window. Our windowed-frustum SSE
+	// already bounds the load; disable it.
+	options.enableFogCulling = false;
 
 	const std::string url = "https://tile.googleapis.com/v1/3dtiles/root.json?key=" + key_;
 	impl_->tileset = std::make_unique<Tileset>(externals, url, options);
@@ -199,22 +204,15 @@ TileEngine::update(const geo::GeoCamera &cam, double viewW, double viewH, double
 	double ul = glm::length(upOrtho);
 	upOrtho = ul > 1e-12 ? upOrtho / ul : glm::dvec3(0.0, 0.0, 1.0);
 
+	// ONE mono symmetric ViewState — exactly cesium-unity's
+	// CameraManager::unityCameraToViewState (the proven Google-P3DT path,
+	// used even by the Leia stereo Unity app). The display's off-axis
+	// stereo is a render-time projection concern only; selection uses the
+	// head camera's real forward/up with a symmetric frustum.
 	ViewState view(cam.pos, cam.dir, upOrtho, glm::dvec2(viewW, viewH), hfovRad, vfovRad,
 	               CesiumGeospatial::Ellipsoid::WGS84);
 
-	// Coverage frustum: the narrow window frustum above drives DETAIL (its
-	// fov sets the SSE denominator), but content off the display plane —
-	// tilted-diorama tops, popped-out towers, steep-down ground — can fall
-	// outside it while still visible through the off-axis window. A wide
-	// second frustum from the same pose guarantees selection coverage. Its
-	// QUARTER-RES viewport makes its SSE demand ~4 LODs coarser than the
-	// window frustum, so the peripheral coverage stays cheap (without this
-	// it ballooned to ~1400 drawn tiles / 1.3 GB).
-	const double wideFov = glm::radians(110.0);
-	ViewState wide(cam.pos, cam.dir, upOrtho, glm::dvec2(viewW * 0.25, viewH * 0.25), wideFov,
-	               wideFov, CesiumGeospatial::Ellipsoid::WGS84);
-
-	const ViewUpdateResult &result = impl_->tileset->updateView({view, wide});
+	const ViewUpdateResult &result = impl_->tileset->updateView({view});
 	impl_->asyncSystem.dispatchMainThreadTasks();
 	impl_->lastResult = &result;
 

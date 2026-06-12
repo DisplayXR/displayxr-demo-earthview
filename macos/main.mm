@@ -2050,29 +2050,43 @@ int main() {
                                 g_xrFromEcef = geo::xrFromEcefCamera(g_geoNav.cam, viewerPos, s);
                             }
 
-                            // EXACT selection camera from the located views:
-                            // g_xrFromEcef is the precise XR<->geo mapping in
-                            // BOTH view models, so the selection eye is the
-                            // center-eye position mapped through its inverse,
-                            // and the direction is the asymmetric (Kooima)
-                            // frustum's tangent-space center. The bounding
-                            // symmetric FOV covers the off-axis extents.
-                            // (Rig pose is identity in this app — eye-space
-                            // axes coincide with XR axes.)
+                            // Selection camera = the viewer's HEAD camera
+                            // looking through the display, mapped to geo via
+                            // inverse(g_xrFromEcef) — identical in both view
+                            // models since g_xrFromEcef encodes the mode. This
+                            // is cesium-unity's mono "main camera" approach
+                            // (CameraManager::unityCameraToViewState): the
+                            // off-axis stereo is render-only, selection uses a
+                            // plain symmetric frustum. Direction is the gaze to
+                            // the display centre (the eye sits slightly off it);
+                            // up is the display up.
                             geo::GeoCamera selCam;
                             {
                                 glm::dmat4 invWorld = glm::inverse(g_xrFromEcef);
                                 glm::dmat3 invRot = glm::dmat3(invWorld); // incl. 1/s — normalize after
                                 selCam.pos = glm::dvec3(invWorld * glm::dvec4(viewerPos, 1.0));
-                                glm::dvec3 dirXr = glm::normalize(glm::dvec3(
-                                    0.5 * (std::tan((double)ufov.angleRight) + std::tan((double)ufov.angleLeft)),
-                                    0.5 * (std::tan((double)ufov.angleUp) + std::tan((double)ufov.angleDown)),
-                                    -1.0));
-                                selCam.dir = glm::normalize(invRot * dirXr);
+                                // Direction = the eye's FORWARD axis (-Z), not
+                                // the gaze-to-display-centre. cesium's ViewState
+                                // is symmetric; centring on forward + sizing the
+                                // half-angles below is the smallest symmetric
+                                // frustum that CONTAINS the off-axis display
+                                // frustum.
+                                selCam.dir = glm::normalize(invRot * glm::dvec3(0.0, 0.0, -1.0));
                                 selCam.up = glm::normalize(invRot * glm::dvec3(0.0, 1.0, 0.0));
                             }
-                            double hfov = (double)(ufov.angleRight - ufov.angleLeft) * 1.1;
-                            double vfov = (double)(ufov.angleUp - ufov.angleDown) * 1.1;
+                            // The eye is off-centre, so the display subtends an
+                            // ASYMMETRIC angle (bottom edge farther below -Z
+                            // than the top is above). A symmetric frustum that
+                            // contains it needs half-angle = max(|down|,|up|)
+                            // vertically and max(|left|,|right|) horizontally —
+                            // sizing to (up-down) instead clips the far edge
+                            // (the bottom-of-window strip). + margin.
+                            double vHalf = std::max(std::fabs((double)ufov.angleUp),
+                                                    std::fabs((double)ufov.angleDown));
+                            double hHalf = std::max(std::fabs((double)ufov.angleLeft),
+                                                    std::fabs((double)ufov.angleRight));
+                            double vfov = 2.0 * vHalf * 1.15;
+                            double hfov = 2.0 * hHalf * 1.15;
 
                             const auto& tiles = g_tileEngine.update(
                                 selCam, (double)renderW, (double)renderH, hfov, vfov);
@@ -2208,7 +2222,8 @@ int main() {
                             // (autonomous verification — no keyboard needed).
                             static long autocapFrame =
                                 getenv("DXR_AUTOCAP") ? atol(getenv("DXR_AUTOCAP")) : 0;
-                            if (autocapFrame > 0 && (long)g_frameCount == autocapFrame) {
+                            if (autocapFrame > 0 && (long)g_frameCount >= autocapFrame) {
+                                autocapFrame = 0; // one-shot
                                 g_input.captureAtlasRequested = true;
                             }
                             if (g_input.captureAtlasRequested) {
