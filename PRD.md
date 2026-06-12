@@ -261,15 +261,35 @@ API key and where to put it. App stays up (empty starfield/grid), no crash.
 
 | M | Deliverable | Gate |
 |---|---|---|
-| **M0 — spike** | Flat desktop window (macOS, no OpenXR): cesium-native builds via FetchContent/vcpkg, fetches root.json with a real key, renders one city mono with libcurl accessor | **Build-vs-fallback decision** on cesium-native (esp. dependency weight); validates key + session + Draco path end-to-end |
+| **M0 — spike** ✅ **DONE 2026-06-11** | Headless `spike/` (no window, no GPU): cesium-native v0.61 builds via ezvcpkg, fetches root.json (key+session), SSE tile selection, Draco/glTF/JPEG decode, software-rasterizes the Eiffel Tower neighborhood to PNG + prints Google attribution | **cesium-native build gate PASSED** on macOS arm64 — fallback client not needed. Three integration facts captured (see below) |
 | **M1 — macOS XR** | `earthview_handle_vk_macos`: stereo via view rig on sim display, diorama navigation, bookmarks, attribution HUD, linter-clean | §6.2 invariants verified; atlas capture shows correct L/R parallax |
 | **M2 — Windows** | `earthview_handle_vk_win` on real Leia panel; installer + run scripts; `/make-app-logos` manifest + icons | Visual check on hardware; weave correctness; 60 fps |
 | **M3 — Android** | NDK leg on NP02J via OOP runtime; reduced SSE/texture budget; auto-orbit | 30+ fps, no OOM across bookmark cycle; rig_applied=1 |
 | **M4 — release** | `publish-demo-earthview.yml`, versions.json wiring, `/dxr-release earthview` support, README + coverage/bookmark list | First tagged release; bundle inclusion decision deferred |
 
-M0 is deliberately tiny (~2–3 days) because it retires the only existential
-risk (cesium-native build complexity, especially its dependency closure on
-Android NDK).
+M0 is deliberately tiny because it retires the only existential risk
+(cesium-native build complexity). **It passed first session** — Paris renders.
+
+### M0 integration facts (carry into M1, save M1 from re-discovering them)
+1. **`Cesium3DTilesContent::registerAllTileContentTypes()` is mandatory** at
+   startup. Without it the `GltfConverters` registry is empty, every `.glb`
+   tile falls through to the JSON tileset parser ("Invalid value at byte
+   offset 0"), and geometry silently never loads — tiles *select* but have 0
+   render content. Highest-value gotcha.
+2. **Y-up → Z-up.** 3D Tiles content is glTF (Y-up); the ellipsoid/ECEF camera
+   frame is Z-up. `Model::forEachPrimitiveInScene` does **not** bake the
+   conversion. Premultiply the rotation `(x,y,z)→(x,-z,y)` onto
+   `Tile::getTransform()`.
+3. **Key propagation is automatic.** cesium-native carries the root URL's
+   `key=` to child requests itself; an injecting `IAssetAccessor` is only a
+   safeguard, not required.
+4. **Build:** ezvcpkg pulls Draco/KTX/TLS and bootstraps in ~11 min first
+   configure; `registerAllTileContentTypes()` lives in the
+   `Cesium3DTilesContent` target (link it alongside `Cesium3DTilesSelection`
+   + `CesiumCurl`).
+5. **Settle detection:** "queues empty" alone fires before any mesh loads
+   (upper P3DT tiles are external-tileset pointers). Wait until
+   `tilesToRenderThisFrame` contains tiles with `isRenderContent()`.
 
 ---
 
