@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
-    <title>3D Model Viewer</title>
+    <title>EarthView</title>
     <organization>com.displayxr</organization>
     <os-version min="13.0" />
     <license file="LICENSE" />
@@ -9,9 +9,9 @@
         <line choice="demo" />
     </choices-outline>
     <choice id="demo" visible="true" start_selected="true" enabled="false"
-        title="3D Model Viewer"
-        description="DisplayXR demo: real-time 3D Model Viewerting viewer for glasses-free 3D displays. Loads .glb / .gltf scenes and renders with asymmetric per-eye Kooima projection. Requires the DisplayXR runtime to be installed.">
-        <pkg-ref id="com.displayxr.modelviewer" />
+        title="EarthView"
+        description="DisplayXR demo: a streaming 3D city viewer on Google Photorealistic 3D Tiles for glasses-free 3D displays. Fly the full-scale world or frame a neighborhood as a tabletop diorama, rendered with asymmetric per-eye Kooima projection. Requires the DisplayXR runtime to be installed and a Google Map Tiles API key.">
+        <pkg-ref id="com.displayxr.earthview" />
     </choice>
-    <pkg-ref id="com.displayxr.modelviewer" version="1.0" onConclusion="none">modelviewer.pkg</pkg-ref>
+    <pkg-ref id="com.displayxr.earthview" version="1.0" onConclusion="none">earthview.pkg</pkg-ref>
 </installer-gui-script>

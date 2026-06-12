@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>3D Model Viewer</title>
+<title>EarthView</title>
 <style>
 body { font: 13px -apple-system, sans-serif; margin: 1em 2em; color: #222; }
 h1 { font-size: 1.3em; margin-bottom: 0.4em; }
@@ -12,19 +12,29 @@ code { background: #eee; padding: 0 4px; border-radius: 3px; }
 </style>
 </head>
 <body>
-<h1>3D Model Viewer</h1>
+<h1>EarthView</h1>
 <p>
-Real-time glTF 2.0 PBR model viewer for glasses-free 3D displays, built on
-the <strong>DisplayXR</strong> OpenXR runtime via Vulkan. Loads
-<code>.glb</code> and <code>.gltf</code> models and renders with asymmetric
-per-eye Kooima projection.
+A real-time streaming 3D city viewer for glasses-free 3D displays, built on
+the <strong>DisplayXR</strong> OpenXR runtime via Vulkan. EarthView streams
+<strong>Google Photorealistic 3D Tiles</strong> &mdash; fly the full-scale
+world maps-style, or double-click to frame a neighborhood as a tabletop
+diorama inside the display's depth volume, rendered with asymmetric per-eye
+Kooima projection.
 </p>
 <p>
-Once installed, the app lands at
-<code>/Applications/3D Model Viewer.app</code>. A bundled
-<code>sample.glb</code> auto-loads at startup; press <strong>L</strong> or
-drag-and-drop another model to load it.
+Once installed, the app lands at <code>/Applications/EarthView.app</code>.
+Cycle preset cities with <strong>B</strong> (Paris, San Francisco, New York,
+Tokyo, Sydney); double-click to acquire an orbit center, <strong>C</strong>
+to fly again.
 </p>
+<div class="note">
+<strong>Google Map Tiles API key required.</strong> EarthView needs a key to
+stream tiles: set <code>GOOGLE_MAPS_API_KEY</code> or put
+<code>key=&hellip;</code> in <code>earthview.ini</code> next to the app.
+Enable the <em>Map Tiles API</em> in the Google Cloud Console and create a
+key. Without one, the app opens to a how-to card and does not crash. The key
+is never bundled.
+</div>
 <div class="note">
 <strong>Prerequisite:</strong> the <strong>DisplayXR runtime</strong> must be
 installed first. Download

@@ -16,6 +16,20 @@
 # binary DIRECTLY (no SIP-protected intermediary like `nohup`).
 set -euo pipefail
 
+# --- API key for local dev --------------------------------------------------
+# Source a gitignored .env.local (repo root) if present so GOOGLE_MAPS_API_KEY
+# is set without exporting it by hand. .env.local is the dev key store on this
+# machine; it is never committed (.gitignore) and never staged into the .pkg.
+# (The distributed app gets its key from the user, not from here — see
+# docs/api-key.md.)
+ENV_LOCAL="$(cd "$(dirname "$0")/.." && pwd)/.env.local"
+if [ -f "$ENV_LOCAL" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_LOCAL"
+    set +a
+fi
+
 # --- Locate a runtime: dev build first, then installed ----------------------
 # Override with DISPLAYXR_RUNTIME_DIR=/path/to/runtime-package.
 RT=""

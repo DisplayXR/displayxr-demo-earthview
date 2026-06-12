@@ -1,5 +1,5 @@
 #!/bin/bash
-# Create a macOS .app bundle for the Model Viewer demo.
+# Create a macOS .app bundle for the EarthView demo.
 #
 # Adapted from the runtime repo's installer/macos/create_app_bundle.sh.
 # Differences from that template:
@@ -8,24 +8,27 @@
 #    by the runtime .pkg's postinstall). The bundled openxr_loader.1.dylib
 #    handles standard OpenXR discovery from there.
 #  - Launcher does NOT export XR_RUNTIME_JSON. System runtime wins.
-#  - The bundled sample.glb scene is copied next to the binary (matches
-#    the CMake POST_BUILD step the demo already does).
+#  - The Google attribution logo (google_logo.png) is copied next to the
+#    binary (matches the CMake POST_BUILD step). No scene is bundled —
+#    EarthView streams Google Photorealistic 3D Tiles and needs a Map Tiles
+#    API key at runtime (GOOGLE_MAPS_API_KEY or earthview.ini); a keyless
+#    first run shows an in-app how-to-get-a-key card, never crashes.
 #  - The DisplayXR app manifest (macos/displayxr/...) and icons are copied
 #    into Contents/Resources/displayxr/ so a future macOS shell port can
 #    discover them in-bundle.
 #
 # Usage: ./create_app_bundle.sh <artifact-dir> [output.app]
 #   <artifact-dir>: dir containing bin/<binary>, lib/<bundled dylibs>, and
-#                   assets/sample.glb + displayxr/{manifest.json,icons}.
+#                   assets/google_logo.png + displayxr/{manifest.json,icons}.
 set -e
 
 ARTIFACT_DIR="${1:?Usage: $0 <artifact-dir> [output.app]}"
-APP_BUNDLE="${2:-3D Model Viewer.app}"
-BINARY_NAME="model_viewer_handle_vk_macos"
+APP_BUNDLE="${2:-EarthView.app}"
+BINARY_NAME="earthview_handle_vk_macos"
 VERSION="${DISPLAYXR_VERSION:-1.0.0}"
 
-BUNDLE_DISPLAY_NAME="3D Model Viewer"
-BUNDLE_ID="com.displayxr.modelviewer"
+BUNDLE_DISPLAY_NAME="EarthView"
+BUNDLE_ID="com.displayxr.earthview"
 
 if [ ! -f "$ARTIFACT_DIR/bin/$BINARY_NAME" ]; then
     echo "Error: $BINARY_NAME binary not found in $ARTIFACT_DIR/bin/" >&2
@@ -81,14 +84,14 @@ export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export VK_ICD_FILENAMES="$DIR/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$DIR/MoltenVK_icd.json"
 cd "$DIR"
-exec "$DIR/model_viewer_handle_vk_macos" "$@"
+exec "$DIR/earthview_handle_vk_macos" "$@"
 LAUNCHER
 chmod +x "$APP_BUNDLE/Contents/MacOS/$BUNDLE_DISPLAY_NAME"
 
-# --- Resources: binary, bundled scene, app manifest + icons ---
+# --- Resources: binary, Google attribution logo, app manifest + icons ---
 cp "$ARTIFACT_DIR/bin/$BINARY_NAME" "$APP_BUNDLE/Contents/Resources/"
-if [ -f "$ARTIFACT_DIR/assets/sample.glb" ]; then
-    cp "$ARTIFACT_DIR/assets/sample.glb" "$APP_BUNDLE/Contents/Resources/"
+if [ -f "$ARTIFACT_DIR/assets/google_logo.png" ]; then
+    cp "$ARTIFACT_DIR/assets/google_logo.png" "$APP_BUNDLE/Contents/Resources/"
 fi
 if [ -d "$ARTIFACT_DIR/displayxr" ]; then
     cp -R "$ARTIFACT_DIR/displayxr/." "$APP_BUNDLE/Contents/Resources/displayxr/"
