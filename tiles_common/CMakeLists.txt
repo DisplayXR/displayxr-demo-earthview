@@ -49,7 +49,12 @@ foreach(GLSL_REL ${SHADER_SOURCES})
 endforeach()
 
 add_library(tile_renderer STATIC
-    model_renderer.h           # TEMPORARY Checkpoint-A stub (no-op ModelRenderer)
+    geo_math.h
+    geo_math.cpp
+    tile_engine.h
+    tile_engine.cpp
+    tile_renderer.h
+    tile_renderer.cpp
     model_vulkan_utils.h
     model_vulkan_utils.cpp
     ${SHADER_HEADERS}
