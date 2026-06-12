@@ -201,7 +201,20 @@ TileEngine::update(const geo::GeoCamera &cam, double viewW, double viewH, double
 
 	ViewState view(cam.pos, cam.dir, upOrtho, glm::dvec2(viewW, viewH), hfovRad, vfovRad,
 	               CesiumGeospatial::Ellipsoid::WGS84);
-	const ViewUpdateResult &result = impl_->tileset->updateView({view});
+
+	// Coverage frustum: the narrow window frustum above drives DETAIL (its
+	// fov sets the SSE denominator), but content off the display plane —
+	// tilted-diorama tops, popped-out towers, steep-down ground — can fall
+	// outside it while still visible through the off-axis window. A wide
+	// second frustum from the same pose guarantees selection coverage. Its
+	// QUARTER-RES viewport makes its SSE demand ~4 LODs coarser than the
+	// window frustum, so the peripheral coverage stays cheap (without this
+	// it ballooned to ~1400 drawn tiles / 1.3 GB).
+	const double wideFov = glm::radians(110.0);
+	ViewState wide(cam.pos, cam.dir, upOrtho, glm::dvec2(viewW * 0.25, viewH * 0.25), wideFov,
+	               wideFov, CesiumGeospatial::Ellipsoid::WGS84);
+
+	const ViewUpdateResult &result = impl_->tileset->updateView({view, wide});
 	impl_->asyncSystem.dispatchMainThreadTasks();
 	impl_->lastResult = &result;
 

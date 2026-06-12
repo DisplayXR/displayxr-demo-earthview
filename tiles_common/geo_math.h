@@ -161,6 +161,10 @@ struct GeoNav
 	// Esc/Space: release back to camera-centric, reframe current bookmark.
 	void
 	releaseOrbit();
+	// 'C': release back to camera-centric CONTINUOUSLY — the free camera
+	// takes over exactly where the diorama view was (no reframe jump).
+	void
+	releaseToFly(double zdpXr);
 };
 
 } // namespace geo

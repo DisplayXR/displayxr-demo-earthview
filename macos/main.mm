@@ -114,6 +114,7 @@ struct InputState {
     float dollySteps = 0.0f;              // scroll steps (exponential zoom)
     bool cycleBookmarkRequested = false;  // 'B'
     bool releaseOrbitRequested = false;   // Esc-like release (Space shares reset)
+    bool releaseToFlyRequested = false;   // 'C': orbit -> fly, continuous (no reframe)
 
     // Auto-orbit (turntable) mode
     bool animateEnabled = true;  // Always on; auto-orbit kicks in after 10 s idle.
@@ -325,6 +326,15 @@ static void MarkUserInput(InputState& input) {
 // ============================================================================
 
 static void UpdateGeoNav(InputState& input, float dt) {
+    if (input.releaseToFlyRequested) {
+        input.releaseToFlyRequested = false;
+        if (g_geoNav.orbitAcquired) {
+            g_geoNav.releaseToFly(std::max(g_viewerPosXr.z, 0.1));
+            LOG_INFO("Released orbit -> fly mode (continuous)");
+        }
+        input.lastInputTimeSec = NowSec();
+        input.animationActive = false;
+    }
     if (input.resetViewRequested || input.releaseOrbitRequested) {
         input.resetViewRequested = false;
         input.releaseOrbitRequested = false;
@@ -531,8 +541,8 @@ static NSTextField *g_attributionText = nil;
         case 'b': case 'B':   // cycle city bookmarks (Paris default)
             g_input.cycleBookmarkRequested = true;
             break;
-        case 'c': case 'C':
-            g_input.cameraMode = !g_input.cameraMode;
+        case 'c': case 'C':   // back to camera-centric fly mode, continuously
+            g_input.releaseToFlyRequested = true;
             break;
         case 'i': case 'I':
             g_input.captureAtlasRequested = true;
@@ -1774,7 +1784,7 @@ int main() {
 
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Controls: WASD=Pan  E/Q=Climb  LMB-drag=Look  Scroll=Dolly  DblClick=Orbit-acquire");
-    LOG_INFO("          B=City  Esc/Space=Release/Reset  -/= Depth  M=Auto-Orbit  V=Mode");
+    LOG_INFO("          B=City  C=Orbit->Fly  Esc/Space=Release/Reset  -/= Depth  M=Auto-Orbit  V=Mode");
     LOG_INFO("          I=Capture  T=EyeTracking  Tab=HUD  ESC=Quit");
 
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -2020,34 +2030,7 @@ int main() {
                                 ufov.angleUp = std::max(ufov.angleUp, eyeViews[e].fov.angleUp);
                             }
                             viewerPos /= (double)eyeCount;
-
-                            // The rig frustums are OFF-AXIS (Kooima): a
-                            // symmetric selection frustum around cam.dir
-                            // misses tiles on the fat side (seen as unloaded
-                            // bottom-of-window). Tilt the selection direction
-                            // to the frustum center and cover the full
-                            // angular extent, with margin.
-                            // Base selection camera per view model: the geo
-                            // camera (camera-centric) or a synthetic camera
-                            // matching the diorama footprint (orbit-acquired).
-                            geo::GeoCamera selCam = g_geoNav.orbitAcquired
-                                ? geo::dioramaSelectionCamera(
-                                      g_geoNav.orbitCenter, g_geoNav.dioramaScale,
-                                      g_geoNav.dioramaYaw, g_geoNav.dioramaTilt, viewerPos)
-                                : g_geoNav.cam;
                             g_viewerPosXr = viewerPos;
-                            {
-                                double cx = 0.5 * (double)(ufov.angleRight + ufov.angleLeft);
-                                double cy = 0.5 * (double)(ufov.angleUp + ufov.angleDown);
-                                glm::dvec3 r = glm::normalize(glm::cross(selCam.dir, selCam.up));
-                                glm::dvec3 u = glm::normalize(glm::cross(r, selCam.dir));
-                                glm::dmat4 yawR = glm::rotate(glm::dmat4(1.0), -cx, u);
-                                glm::dmat4 pitR = glm::rotate(glm::dmat4(1.0), cy, r);
-                                selCam.dir = glm::normalize(
-                                    glm::dvec3(pitR * yawR * glm::dvec4(selCam.dir, 0.0)));
-                            }
-                            double hfov = (double)(ufov.angleRight - ufov.angleLeft) * 1.15;
-                            double vfov = (double)(ufov.angleUp - ufov.angleDown) * 1.15;
 
                             if (g_geoNav.orbitAcquired) {
                                 // Display-centric diorama around the acquired
@@ -2066,6 +2049,30 @@ int main() {
                                 double s = geo::stereoScaleForDistance(g_geoNav.targetDist, zdp);
                                 g_xrFromEcef = geo::xrFromEcefCamera(g_geoNav.cam, viewerPos, s);
                             }
+
+                            // EXACT selection camera from the located views:
+                            // g_xrFromEcef is the precise XR<->geo mapping in
+                            // BOTH view models, so the selection eye is the
+                            // center-eye position mapped through its inverse,
+                            // and the direction is the asymmetric (Kooima)
+                            // frustum's tangent-space center. The bounding
+                            // symmetric FOV covers the off-axis extents.
+                            // (Rig pose is identity in this app — eye-space
+                            // axes coincide with XR axes.)
+                            geo::GeoCamera selCam;
+                            {
+                                glm::dmat4 invWorld = glm::inverse(g_xrFromEcef);
+                                glm::dmat3 invRot = glm::dmat3(invWorld); // incl. 1/s — normalize after
+                                selCam.pos = glm::dvec3(invWorld * glm::dvec4(viewerPos, 1.0));
+                                glm::dvec3 dirXr = glm::normalize(glm::dvec3(
+                                    0.5 * (std::tan((double)ufov.angleRight) + std::tan((double)ufov.angleLeft)),
+                                    0.5 * (std::tan((double)ufov.angleUp) + std::tan((double)ufov.angleDown)),
+                                    -1.0));
+                                selCam.dir = glm::normalize(invRot * dirXr);
+                                selCam.up = glm::normalize(invRot * glm::dvec3(0.0, 1.0, 0.0));
+                            }
+                            double hfov = (double)(ufov.angleRight - ufov.angleLeft) * 1.1;
+                            double vfov = (double)(ufov.angleUp - ufov.angleDown) * 1.1;
 
                             const auto& tiles = g_tileEngine.update(
                                 selCam, (double)renderW, (double)renderH, hfov, vfov);
@@ -2129,6 +2136,8 @@ int main() {
                             VkFormat swapFormat = (VkFormat)xr.swapchain.format;
 
                             if (g_tilesActive) {
+                                glm::dvec3 pickAccum(0.0);
+                                int pickHits = 0;
                                 for (int eye = 0; eye < eyeCount; eye++) {
                                     g_tileRenderer.renderEye(
                                         targetImage, swapFormat,
@@ -2138,12 +2147,14 @@ int main() {
                                         viewMat[eye].data(), projMat[eye].data(),
                                         g_drawList);
 
-                                    // Deferred double-click pick: eye 0's depth is
-                                    // current — read the clicked texel, unproject
-                                    // through the double inverse MVP, map XR->ECEF,
-                                    // acquire as the diorama orbit center.
-                                    if (eye == 0 && g_pendingPick) {
-                                        g_pendingPick = false;
+                                    // Deferred double-click pick, CENTER-eye:
+                                    // after each of the first two eyes renders,
+                                    // read its depth at the clicked texel and
+                                    // unproject through that eye's matrices;
+                                    // the acquired point is the midpoint of
+                                    // the per-eye hits (a left-eye-only ray
+                                    // lands visibly right of the aimed spot).
+                                    if (g_pendingPick && eye < 2 && !g_drawList.empty()) {
                                         // Negative-height viewport: ndcY=+1 -> row 0.
                                         uint32_t px = (uint32_t)std::min(std::max(
                                             (g_pickNdcX + 1.0f) * 0.5f * (float)renderW, 0.0f),
@@ -2152,25 +2163,33 @@ int main() {
                                             (1.0f - g_pickNdcY) * 0.5f * (float)renderH, 0.0f),
                                             (float)(renderH - 1));
                                         float d = g_tileRenderer.readDepth(px, py);
-                                        if (d < 1.0f && !g_drawList.empty()) {
-                                            glm::dmat4 V = glm::dmat4(glm::make_mat4(viewMat[0].data()));
-                                            glm::dmat4 P = glm::dmat4(glm::make_mat4(projMat[0].data()));
+                                        if (d < 1.0f) {
+                                            glm::dmat4 V = glm::dmat4(glm::make_mat4(viewMat[eye].data()));
+                                            glm::dmat4 P = glm::dmat4(glm::make_mat4(projMat[eye].data()));
                                             glm::dvec4 clip((double)g_pickNdcX, (double)g_pickNdcY,
                                                             (double)d, 1.0);
                                             glm::dvec4 w = glm::inverse(P * V) * clip;
                                             if (std::abs(w.w) > 1e-12) {
-                                                glm::dvec3 xrPos = glm::dvec3(w) / w.w;
-                                                glm::dvec3 ecef = glm::dvec3(
-                                                    glm::inverse(g_xrFromEcef) * glm::dvec4(xrPos, 1.0));
-                                                g_geoNav.acquireOrbit(
-                                                    ecef, std::max(g_viewerPosXr.z, 0.1));
-                                                g_dioramaCenterXr = xrPos; // glide from here
-                                                LOG_INFO("Orbit acquired (diorama): ECEF (%.1f, %.1f, %.1f)",
-                                                         ecef.x, ecef.y, ecef.z);
+                                                pickAccum += glm::dvec3(w) / w.w;
+                                                pickHits++;
                                             }
-                                        } else {
-                                            LOG_INFO("Pick missed (sky) — staying camera-centric");
                                         }
+                                    }
+                                }
+                                // Finalize the center-eye pick once all sampled
+                                // eyes have rendered.
+                                if (g_pendingPick) {
+                                    g_pendingPick = false;
+                                    if (pickHits > 0) {
+                                        glm::dvec3 xrPos = pickAccum / (double)pickHits;
+                                        glm::dvec3 ecef = glm::dvec3(
+                                            glm::inverse(g_xrFromEcef) * glm::dvec4(xrPos, 1.0));
+                                        g_geoNav.acquireOrbit(ecef, std::max(g_viewerPosXr.z, 0.1));
+                                        g_dioramaCenterXr = xrPos; // glide from here
+                                        LOG_INFO("Orbit acquired (diorama, %d-eye pick): ECEF (%.1f, %.1f, %.1f)",
+                                                 pickHits, ecef.x, ecef.y, ecef.z);
+                                    } else {
+                                        LOG_INFO("Pick missed (sky) — staying camera-centric");
                                     }
                                 }
                             } else {
@@ -2312,7 +2331,7 @@ int main() {
                         "%@"
                         "Vdisplay: (%.2f, %.2f, %.2f)\n"
                         "\nWASD=Pan  E/Q=Climb  LMB-drag=Look  Scroll=Dolly\n"
-                        "DblClick=Orbit  B=City  Esc/Space=Release  -/= Depth\n"
+                        "DblClick=Orbit  B=City  C=Fly  Esc/Space=Release  -/= Depth\n"
                         "M=Auto-Orbit  V=Mode  I=Capture  Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         (xr.renderingModeCount > 0 && xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') ? xr.renderingModeNames[g_input.currentRenderingMode] : "Unknown",

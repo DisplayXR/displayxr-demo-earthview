@@ -294,13 +294,20 @@ GeoNav::elevate(double dyNorm)
 void
 GeoNav::acquireOrbit(const glm::dvec3 &centerEcef, double zdpXr)
 {
+	const bool reAcquire = orbitAcquired;
 	orbitAcquired = true;
 	orbitCenter = centerEcef;
 	targetDist = glm::length(cam.pos - centerEcef);
 	cam.dir = glm::normalize(centerEcef - cam.pos);
 	cam.up = glm::normalize(wgs84().geodeticSurfaceNormal(centerEcef));
 
-	// Seed the diorama from the camera view so the double-click transition
+	// Re-centering within the diorama (double-click on another spot): keep
+	// the user's zoom / spin / tilt — only the center moves.
+	if (reAcquire) {
+		return;
+	}
+
+	// First acquire: seed the diorama from the camera view so the transition
 	// preserves the apparent framing (no zoom / orientation jump):
 	//  - yaw  = the camera's compass azimuth at the picked point
 	//  - tilt = the camera's elevation above the local horizon
@@ -312,6 +319,24 @@ GeoNav::acquireOrbit(const glm::dvec3 &centerEcef, double zdpXr)
 	                         glm::radians(85.0));
 	dioramaScale = std::clamp(stereoScaleForDistance(targetDist, zdpXr),
 	                          1.0 / 50000.0, 1.0 / 200.0);
+}
+
+void
+GeoNav::releaseToFly(double zdpXr)
+{
+	if (!orbitAcquired) {
+		return;
+	}
+	// Continuity: become the free camera that sees what the diorama showed —
+	// the viewer axis mapped through the diorama rotation, standing back at
+	// the zoom-equivalent distance.
+	GeoCamera c = dioramaSelectionCamera(orbitCenter, dioramaScale, dioramaYaw, dioramaTilt,
+	                                     glm::dvec3(0.0, 0.0, zdpXr));
+	cam.pos = c.pos;
+	cam.dir = c.dir;
+	cam.up = glm::normalize(wgs84().geodeticSurfaceNormal(c.pos)); // nav up
+	targetDist = std::max(zdpXr, 0.1) / dioramaScale;
+	orbitAcquired = false;
 }
 
 void
