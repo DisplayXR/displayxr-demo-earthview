@@ -8,11 +8,14 @@
 // Key supply: GOOGLE_MAPS_API_KEY env var, or `key=...` in earthview.ini
 // (repo root or cwd).
 
+#include <Cesium3DTilesContent/registerAllTileContentTypes.h>
 #include <Cesium3DTilesSelection/Tileset.h>
 #include <Cesium3DTilesSelection/TilesetExternals.h>
 #include <Cesium3DTilesSelection/ViewState.h>
 #include <Cesium3DTilesSelection/ViewUpdateResult.h>
 #include <CesiumAsync/AsyncSystem.h>
+#include <CesiumAsync/IAssetAccessor.h>
+#include <CesiumAsync/IAssetRequest.h>
 #include <CesiumAsync/ITaskProcessor.h>
 #include <CesiumCurl/CurlAssetAccessor.h>
 #include <CesiumGeospatial/Cartographic.h>
@@ -23,6 +26,8 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+
+#include <spdlog/spdlog.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -50,7 +55,7 @@ constexpr double kTargetLatDeg = 48.8584;
 constexpr double kCamDistance = 2500.0; // m from target
 constexpr double kCamElevDeg = 35.0;    // above horizon
 constexpr int kSettleFrames = 5;
-constexpr int kTimeoutSec = 180;
+constexpr int kTimeoutSec = 120;
 
 class ThreadTaskProcessor : public CesiumAsync::ITaskProcessor
 {
@@ -60,6 +65,55 @@ public:
 	{
 		std::thread(std::move(f)).detach();
 	}
+};
+
+// cesium-native propagates the root URL's `key` query param to every child
+// request for Google P3DT, so a bare CurlAssetAccessor is sufficient. This
+// decorator is a belt-and-suspenders safeguard: it re-appends `key=...` to any
+// tile.googleapis.com URL that somehow arrives without one (e.g. a child URI
+// whose own query string replaced the base query during resolution).
+class KeyInjectingAccessor : public CesiumAsync::IAssetAccessor
+{
+public:
+	KeyInjectingAccessor(std::shared_ptr<CesiumAsync::IAssetAccessor> inner, std::string key)
+	    : _inner(std::move(inner)), _key(std::move(key))
+	{
+	}
+
+	CesiumAsync::Future<std::shared_ptr<CesiumAsync::IAssetRequest>>
+	get(const CesiumAsync::AsyncSystem &asyncSystem, const std::string &url,
+	    const std::vector<THeader> &headers = {}) override
+	{
+		return _inner->get(asyncSystem, withKey(url), headers);
+	}
+
+	CesiumAsync::Future<std::shared_ptr<CesiumAsync::IAssetRequest>>
+	request(const CesiumAsync::AsyncSystem &asyncSystem, const std::string &verb,
+	        const std::string &url, const std::vector<THeader> &headers = {},
+	        const std::span<const std::byte> &payload = {}) override
+	{
+		return _inner->request(asyncSystem, verb, withKey(url), headers, payload);
+	}
+
+	void
+	tick() noexcept override
+	{
+		_inner->tick();
+	}
+
+private:
+	std::string
+	withKey(const std::string &url) const
+	{
+		if (url.find("tile.googleapis.com") == std::string::npos ||
+		    url.find("key=") != std::string::npos) {
+			return url;
+		}
+		return url + (url.find('?') == std::string::npos ? "?key=" : "&key=") + _key;
+	}
+
+	std::shared_ptr<CesiumAsync::IAssetAccessor> _inner;
+	std::string _key;
 };
 
 std::string
@@ -140,6 +194,9 @@ struct RasterStats
 	size_t trianglesDrawn = 0;
 	size_t primitives = 0;
 	size_t texturedPrimitives = 0;
+	size_t behind = 0;
+	size_t degenerate = 0;
+	size_t offscreen = 0;
 };
 
 void
@@ -243,6 +300,7 @@ rasterizePrimitive(Framebuffer &fb,
 			}
 		}
 		if (reject) {
+			stats.behind++;
 			continue;
 		}
 
@@ -257,6 +315,7 @@ rasterizePrimitive(Framebuffer &fb,
 
 		double area = (s[1].x - s[0].x) * (s[2].y - s[0].y) - (s[2].x - s[0].x) * (s[1].y - s[0].y);
 		if (std::abs(area) < 1e-9) {
+			stats.degenerate++;
 			continue;
 		}
 		double invArea = 1.0 / area;
@@ -266,6 +325,7 @@ rasterizePrimitive(Framebuffer &fb,
 		int minY = std::max(0, int(std::floor(std::min({s[0].y, s[1].y, s[2].y}))));
 		int maxY = std::min(kHeight - 1, int(std::ceil(std::max({s[0].y, s[1].y, s[2].y}))));
 		if (minX > maxX || minY > maxY) {
+			stats.offscreen++;
 			continue;
 		}
 		stats.trianglesDrawn++;
@@ -316,8 +376,16 @@ main()
 		return 2;
 	}
 
+	spdlog::set_level(spdlog::level::critical); // mute per-request parse-warning spam
+
+	// REQUIRED: register glb/b3dm/etc converters with GltfConverters. Without
+	// this the converter registry is empty, every glb tile falls through to the
+	// JSON tileset parser, and geometry silently never loads.
+	Cesium3DTilesContent::registerAllTileContentTypes();
+
 	CesiumAsync::AsyncSystem asyncSystem(std::make_shared<ThreadTaskProcessor>());
-	auto pAccessor = std::make_shared<CesiumCurl::CurlAssetAccessor>();
+	auto pAccessor = std::make_shared<KeyInjectingAccessor>(
+	    std::make_shared<CesiumCurl::CurlAssetAccessor>(), key);
 	auto pCredits = std::make_shared<CesiumUtility::CreditSystem>();
 
 	TilesetExternals externals{pAccessor, nullptr, asyncSystem, pCredits};
@@ -357,9 +425,17 @@ main()
 		result = &tileset.updateView({view});
 		asyncSystem.dispatchMainThreadTasks();
 
+		// Count tiles that actually carry renderable glTF this frame — Google
+		// P3DT's upper tiles are external-tileset pointers with no geometry, so
+		// "queues empty" alone fires before any mesh has loaded.
+		int renderTiles = 0;
+		for (const auto &pTile : result->tilesToRenderThisFrame) {
+			if (pTile->getContent().isRenderContent()) {
+				++renderTiles;
+			}
+		}
 		bool quiet = result->workerThreadTileLoadQueueLength == 0 &&
-		             result->mainThreadTileLoadQueueLength == 0 &&
-		             !result->tilesToRenderThisFrame.empty();
+		             result->mainThreadTileLoadQueueLength == 0 && renderTiles > 0;
 		settled = quiet ? settled + 1 : 0;
 		if (settled >= kSettleFrames) {
 			break;
@@ -393,27 +469,42 @@ main()
 	glm::dmat4 projMat = glm::perspective(vfov, double(kWidth) / double(kHeight), 10.0, 1.0e7);
 	glm::dmat4 viewProj = projMat * viewMat;
 
+	// 3D Tiles content is glTF (Y-up); the ellipsoid/ECEF frame the camera uses
+	// is Z-up. cesium-native's tile transform does not bake in the conversion,
+	// so premultiply the Y-up -> Z-up rotation: (x,y,z) -> (x,-z,y).
+	glm::dmat4 yUpToZUp(1.0);
+	yUpToZUp[1] = glm::dvec4(0, 0, 1, 0);
+	yUpToZUp[2] = glm::dvec4(0, -1, 0, 0);
+
 	Framebuffer fb;
 	RasterStats stats;
+	int nRender = 0, nMeshes = 0, nCallback = 0;
 	for (const auto &pTile : result->tilesToRenderThisFrame) {
 		const TileContent &content = pTile->getContent();
 		if (!content.isRenderContent()) {
 			continue;
 		}
+		++nRender;
 		const CesiumGltf::Model &model = content.getRenderContent()->getModel();
-		const glm::dmat4 tileTransform = pTile->getTransform();
+		nMeshes += int(model.meshes.size());
+		const glm::dmat4 tileTransform = yUpToZUp * pTile->getTransform();
 		model.forEachPrimitiveInScene(
 		    -1, [&](const CesiumGltf::Model &m, const CesiumGltf::Node &, const CesiumGltf::Mesh &,
 		            const CesiumGltf::MeshPrimitive &prim, const glm::dmat4 &nodeTransform) {
+			    ++nCallback;
 			    rasterizePrimitive(fb, viewProj, tileTransform * nodeTransform, m, prim, stats);
 		    });
 	}
+	std::printf("Diag: %d render-content tiles, %d meshes, %d primitive-callbacks fired\n", nRender,
+	            nMeshes, nCallback);
 
 	const char *outPath = "/tmp/earthview_m0.png";
 	stbi_write_png(outPath, kWidth, kHeight, 4, fb.color.data(), kWidth * 4);
 	std::printf("Wrote %s\n", outPath);
-	std::printf("Stats: %zu primitives (%zu textured), %zu tris, %zu drawn\n", stats.primitives,
-	            stats.texturedPrimitives, stats.triangles, stats.trianglesDrawn);
+	std::printf("Stats: %zu primitives (%zu textured), %zu tris, %zu drawn "
+	            "(behind=%zu degen=%zu offscreen=%zu)\n",
+	            stats.primitives, stats.texturedPrimitives, stats.triangles, stats.trianglesDrawn,
+	            stats.behind, stats.degenerate, stats.offscreen);
 
 	// Attribution (mandatory display in the real app — printed here)
 	std::printf("--- Data attribution ---\n");

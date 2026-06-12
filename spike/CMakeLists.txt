@@ -17,4 +17,5 @@ add_subdirectory(
 add_executable(earthview_m0 main.cpp)
 target_link_libraries(earthview_m0 PRIVATE
     Cesium3DTilesSelection
+    Cesium3DTilesContent
     CesiumCurl)

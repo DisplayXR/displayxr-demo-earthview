@@ -18,3 +18,7 @@ compile_commands.json
 
 # Claude Code worktrees
 .claude/worktrees/
+
+# M0 render artifact (Google imagery — not committed; regenerate via spike)
+docs/m0_paris.png
+docs_m0_paris.png
