@@ -1978,7 +1978,17 @@ int main() {
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 const XrView& sv = srcViews[eye];
                                 float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
-                                float near_z = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
+                                // EarthView's streamed ground pops out close to
+                                // the eye (foreground at the window bottom can
+                                // sit at a small fraction of ez), so the
+                                // modelviewer near = ez - rigVH clipped it to
+                                // the sky (the 'clipped looking down / missing
+                                // bottom strip' bug — confirmed via the eye-0
+                                // PNG dump: foreground ~2.9m vs near ~4.8m).
+                                // Put the near plane just in front of the eye,
+                                // scaled to ez so it's robust to the world
+                                // scale s.
+                                float near_z = (ez * 0.01f > 1.0e-4f) ? (ez * 0.01f) : 1.0e-4f;
                                 float far_z  = ez + 1000.0f * rigVH;
                                 mat4_view_from_xr_pose(eyeViews[eye].view_matrix, sv.pose);
                                 mat4_from_xr_fov(eyeViews[eye].projection_matrix, sv.fov, near_z, far_z);
@@ -2096,14 +2106,18 @@ int main() {
                             // selected-but-unprepared (persistent skips =
                             // upload starvation = visible holes).
                             if (g_frameCount % 120 == 0) {
-                                LOG_INFO("tiles: drawn=%zu skipped_staging=%d live=%d gpu=%.0fMB "
-                                         "fov=%.0fx%.0fdeg dist=%.0fm",
+                                double s = geo::stereoScaleForDistance(
+                                    g_geoNav.targetDist, std::max((double)viewerPos.z, 0.1));
+                                LOG_INFO("tiles: drawn=%zu skip=%d live=%d gpu=%.0fMB "
+                                         "fov=%.0fx%.0f dist=%.0fm s=%.6f orbit=%d alt=%.0fm",
                                          g_drawList.size(),
                                          g_tileRenderer.lastStagingSkipped(),
                                          g_tileRenderer.liveTileCount(),
                                          g_tileRenderer.gpuResidentMB(),
                                          hfov * 57.2958, vfov * 57.2958,
-                                         g_geoNav.targetDist);
+                                         g_geoNav.targetDist, s,
+                                         g_geoNav.orbitAcquired ? 1 : 0,
+                                         geo::heightAboveEllipsoid(selCam.pos));
                             }
                         } else {
                             g_drawList.clear();
@@ -2152,6 +2166,10 @@ int main() {
                             if (g_tilesActive) {
                                 glm::dvec3 pickAccum(0.0);
                                 int pickHits = 0;
+                                // DXR_DUMP=N: one-shot mono PNG of eye 0 at
+                                // frame N (self-verification on vk_native).
+                                static long dumpFrame =
+                                    getenv("DXR_DUMP") ? atol(getenv("DXR_DUMP")) : 0;
                                 for (int eye = 0; eye < eyeCount; eye++) {
                                     g_tileRenderer.renderEye(
                                         targetImage, swapFormat,
@@ -2188,6 +2206,13 @@ int main() {
                                                 pickHits++;
                                             }
                                         }
+                                    }
+
+                                    if (eye == 0 && dumpFrame > 0 &&
+                                        (long)g_frameCount >= dumpFrame) {
+                                        dumpFrame = 0; // one-shot
+                                        g_tileRenderer.dumpColorTarget(
+                                            "/tmp/earthview_dump.png", renderW, renderH);
                                     }
                                 }
                                 // Finalize the center-eye pick once all sampled

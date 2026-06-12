@@ -65,8 +65,23 @@ third_party/cesium-native/  # v0.61.0 clone (gitignored; see README)
 Lint before calling work done:
 `python3 ~/Documents/GitHub/displayxr-runtime/scripts/check_displayxr_app.py .`
 
-Atlas capture for parallax checks: the **I key** (`xrCaptureAtlasEXT`) — the
-macOS vk_native compositor has no `/tmp/dxr_atlas_trigger`.
+### Self-capture for autonomous verification (macOS vk_native)
+`xrCaptureAtlasEXT` (the **I** key) is unreliable on the macOS vk_native
+runtime and `screencapture` needs TCC the agent lacks. Use the built-in
+**in-app PNG dump** instead:
+```bash
+rm -f /tmp/earthview_dump.png
+DXR_DUMP=400 ./scripts/run_macos_dev.sh > /tmp/log 2>&1 &   # dump eye 0 at frame N
+until [ -f /tmp/earthview_dump.png ] || ! pgrep -qf earthview_handle; do sleep 1; done
+pkill -f earthview_handle      # then read /tmp/earthview_dump.png
+```
+`TileRenderer::dumpColorTarget()` (`tiles_common/tile_renderer.cpp`) copies the
+internal color target → `stbi_write_png` (impl comes from displayxr-common —
+forward-declare, never re-`#define`). The dump is **mono eye 0** (no anaglyph
+overlay → clearer for geometry/coverage debugging). Pair with the per-frame
+`tiles:` LOG_INFO (scale `s`, `targetDist`, near/far, alt, drawn/skip counts).
+Frame 400 ≈ 10 s (cold); use larger N for a warmed view. `EV_ELEV` / `EV_DIST`
+env vars force a bookmark framing to reproduce a reported pose.
 
 ## Conventions
 

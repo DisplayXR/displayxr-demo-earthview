@@ -17,6 +17,12 @@
 
 #include <glm/gtc/type_ptr.hpp>
 
+// stb_image_write implementation is already linked from displayxr-common
+// (atlas_capture); forward-declare the one entry point we use.
+extern "C" int stbi_write_png(const char *filename, int w, int h, int comp, const void *data,
+                              int stride_bytes);
+
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1095,6 +1101,57 @@ TileRenderer::readDepth(uint32_t px, uint32_t py)
 	vkUnmapMemory(device_, readback.memory);
 	modelDestroyBuffer(device_, readback);
 	return depth;
+}
+
+void
+TileRenderer::dumpColorTarget(const char *path, uint32_t w, uint32_t h)
+{
+	if (!initialized_ || colorImage_.image == VK_NULL_HANDLE) {
+		return;
+	}
+	w = std::min(w, width_);
+	h = std::min(h, height_);
+	const VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
+	ModelBuffer rb = modelCreateBuffer(device_, physDevice_, bytes,
+	                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	if (rb.buffer == VK_NULL_HANDLE) {
+		return;
+	}
+
+	VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+	ai.commandPool = cmdPool_;
+	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	ai.commandBufferCount = 1;
+	VkCommandBuffer cmd;
+	vkAllocateCommandBuffers(device_, &ai, &cmd);
+	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkBeginCommandBuffer(cmd, &bi);
+
+	// colorImage_ rests in TRANSFER_SRC after a render pass; copy its top-left
+	// w×h directly.
+	VkBufferImageCopy region = {};
+	region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	region.imageExtent = {w, h, 1};
+	vkCmdCopyImageToBuffer(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.buffer,
+	                       1, &region);
+
+	vkEndCommandBuffer(cmd);
+	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &cmd;
+	vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+	vkQueueWaitIdle(queue_);
+	vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+
+	void *mapped = nullptr;
+	vkMapMemory(device_, rb.memory, 0, bytes, 0, &mapped);
+	stbi_write_png(path, (int)w, (int)h, 4, mapped, (int)w * 4);
+	vkUnmapMemory(device_, rb.memory);
+	modelDestroyBuffer(device_, rb);
+	std::fprintf(stderr, "TileRenderer: dumped %ux%u -> %s\n", w, h, path);
 }
 
 // ── Teardown ─────────────────────────────────────────────────────────────

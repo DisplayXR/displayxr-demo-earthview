@@ -143,6 +143,12 @@ public:
 	float
 	readDepth(uint32_t px, uint32_t py);
 
+	// Dump the internal color target (the LAST renderEye's mono content, the
+	// top-left w×h region) to a PNG. Self-verification on vk_native, where the
+	// runtime atlas capture is unreliable. Submit+wait; dev/diagnostic only.
+	void
+	dumpColorTarget(const char *path, uint32_t w, uint32_t h);
+
 	// HUD stats.
 	double
 	gpuResidentMB() const
