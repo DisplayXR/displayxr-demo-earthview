@@ -51,6 +51,13 @@ jobs:
           else
             BASE=${{ github.event.before }}
           fi
+          # First push to a new repo/branch: before is all-zeros (no parent) →
+          # there's nothing to diff, so build (not docs-only).
+          if [ "$BASE" = "0000000000000000000000000000000000000000" ] || \
+             ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
           NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
           if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
