@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -43,6 +44,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 namespace {
 
@@ -56,6 +61,7 @@ constexpr double kCamDistance = 2500.0; // m from target
 constexpr double kCamElevDeg = 35.0;    // above horizon
 constexpr int kSettleFrames = 5;
 constexpr int kTimeoutSec = 120;
+constexpr double kDioramaScale = 1.0 / 3000.0; // PRD §6.1 default tabletop scale
 
 class ThreadTaskProcessor : public CesiumAsync::ITaskProcessor
 {
@@ -360,13 +366,333 @@ rasterizePrimitive(Framebuffer &fb,
 	}
 }
 
+// glTF Y-up -> ECEF Z-up: (x,y,z) -> (x,-z,y). cesium-native's tile transform
+// does not bake this in; premultiply it onto Tile::getTransform().
+glm::dmat4
+yUpToZUp()
+{
+	glm::dmat4 m(1.0);
+	m[1] = glm::dvec4(0, 0, 1, 0);
+	m[2] = glm::dvec4(0, -1, 0, 0);
+	return m;
+}
+
+struct Camera
+{
+	glm::dvec3 pos, dir, up;
+	double hfov, vfov;
+};
+
+// Orbit camera around `target`: azimuth (0 = due north, +east), elevation above
+// the local horizon, at `dist` metres.
+Camera
+buildCamera(const CesiumGeospatial::Ellipsoid &ell,
+            const CesiumGeospatial::Cartographic &targetCarto, glm::dvec3 target, double azDeg,
+            double elevDeg, double dist)
+{
+	glm::dvec3 up = ell.geodeticSurfaceNormal(targetCarto);
+	glm::dvec3 east = glm::normalize(glm::cross(glm::dvec3(0, 0, 1), up));
+	glm::dvec3 north = glm::normalize(glm::cross(up, east));
+	double az = glm::radians(azDeg), el = glm::radians(elevDeg);
+	glm::dvec3 horiz = glm::normalize(std::cos(az) * north + std::sin(az) * east);
+	Camera c;
+	c.pos = target + horiz * (dist * std::cos(el)) + up * (dist * std::sin(el));
+	c.dir = glm::normalize(target - c.pos);
+	c.up = up;
+	c.hfov = glm::radians(kHFovDeg);
+	c.vfov = 2.0 * std::atan(std::tan(c.hfov / 2.0) * double(kHeight) / double(kWidth));
+	return c;
+}
+
+// Drive updateView until the selection is quiet AND carries render content.
+const Cesium3DTilesSelection::ViewUpdateResult *
+settle(Cesium3DTilesSelection::Tileset &tileset, CesiumAsync::AsyncSystem &asyncSystem,
+       const Cesium3DTilesSelection::ViewState &view, int timeoutSec, bool verbose)
+{
+	auto start = std::chrono::steady_clock::now();
+	const Cesium3DTilesSelection::ViewUpdateResult *result = nullptr;
+	int settledFrames = 0, frame = 0;
+	while (true) {
+		result = &tileset.updateView({view});
+		asyncSystem.dispatchMainThreadTasks();
+
+		int renderTiles = 0;
+		for (const auto &pTile : result->tilesToRenderThisFrame) {
+			if (pTile->getContent().isRenderContent()) {
+				++renderTiles;
+			}
+		}
+		bool quiet = result->workerThreadTileLoadQueueLength == 0 &&
+		             result->mainThreadTileLoadQueueLength == 0 && renderTiles > 0;
+		settledFrames = quiet ? settledFrames + 1 : 0;
+		if (settledFrames >= kSettleFrames) {
+			break;
+		}
+		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+		    std::chrono::steady_clock::now() - start);
+		if (elapsed.count() > timeoutSec) {
+			if (verbose) {
+				std::fprintf(stderr, "WARN: settle timeout after %ds\n", timeoutSec);
+			}
+			break;
+		}
+		if (verbose && ++frame % 50 == 0) {
+			std::printf("  ... %.1f%% loaded, %zu selected\n",
+			            double(tileset.computeLoadProgress()),
+			            result->tilesToRenderThisFrame.size());
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(15));
+	}
+	return result;
+}
+
+struct SceneOut
+{
+	RasterStats stats;
+	int renderTiles = 0;
+};
+
+// Rasterize the selected tiles for `cam` into `fb`. Returns per-frame stats.
+SceneOut
+renderScene(const Cesium3DTilesSelection::ViewUpdateResult &result, const Camera &cam,
+            Framebuffer &fb)
+{
+	glm::dmat4 viewMat = glm::lookAt(cam.pos, cam.pos + cam.dir, cam.up);
+	glm::dmat4 projMat = glm::perspective(cam.vfov, double(kWidth) / double(kHeight), 10.0, 1.0e7);
+	glm::dmat4 viewProj = projMat * viewMat;
+	glm::dmat4 yz = yUpToZUp();
+
+	SceneOut out;
+	for (const auto &pTile : result.tilesToRenderThisFrame) {
+		const auto &content = pTile->getContent();
+		if (!content.isRenderContent()) {
+			continue;
+		}
+		++out.renderTiles;
+		const CesiumGltf::Model &model = content.getRenderContent()->getModel();
+		const glm::dmat4 tileTransform = yz * pTile->getTransform();
+		model.forEachPrimitiveInScene(
+		    -1, [&](const CesiumGltf::Model &m, const CesiumGltf::Node &, const CesiumGltf::Mesh &,
+		            const CesiumGltf::MeshPrimitive &prim, const glm::dmat4 &nodeTransform) {
+			    rasterizePrimitive(fb, viewProj, tileTransform * nodeTransform, m, prim, out.stats);
+		    });
+	}
+	return out;
+}
+
+// Resident-set size in MB (current footprint), for leak/churn checks.
+double
+currentRssMB()
+{
+#ifdef __APPLE__
+	mach_task_basic_info info{};
+	mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+	if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info),
+	              &count) == KERN_SUCCESS) {
+		return double(info.resident_size) / (1024.0 * 1024.0);
+	}
+#endif
+	return 0.0;
+}
+
+// Test that M1's GPU precision approach holds: project every sampled vertex two
+// ways — full double (P*V*world) vs RTC (subtract the anchor in double, cast the
+// small remainder to float32, multiply by a float32 anchor-relative matrix) —
+// and report the worst screen-space divergence. Also report the diorama-space
+// extent at `kDioramaScale`. Anchor is the camera target.
+void
+measureRtcAndDiorama(const Cesium3DTilesSelection::ViewUpdateResult &result, const Camera &cam,
+                     glm::dvec3 anchor)
+{
+	glm::dmat4 viewMat = glm::lookAt(cam.pos, cam.pos + cam.dir, cam.up);
+	glm::dmat4 projMat = glm::perspective(cam.vfov, double(kWidth) / double(kHeight), 10.0, 1.0e7);
+	glm::dmat4 viewProj = projMat * viewMat;
+	glm::dmat4 yz = yUpToZUp();
+
+	// M1 GPU upload mirror: positions arrive as float anchor-relative, MVP as a
+	// float matrix with the big anchor translation folded in (built in double,
+	// cast once).
+	glm::mat4 viewProjRelF = glm::mat4(viewProj * glm::translate(glm::dmat4(1.0), anchor));
+
+	double maxDivPx = 0.0;
+	glm::dvec3 bbMin(1e308), bbMax(-1e308);
+	size_t samples = 0;
+
+	for (const auto &pTile : result.tilesToRenderThisFrame) {
+		const auto &content = pTile->getContent();
+		if (!content.isRenderContent()) {
+			continue;
+		}
+		const CesiumGltf::Model &model = content.getRenderContent()->getModel();
+		const glm::dmat4 tileTransform = yz * pTile->getTransform();
+		model.forEachPrimitiveInScene(
+		    -1, [&](const CesiumGltf::Model &m, const CesiumGltf::Node &, const CesiumGltf::Mesh &,
+		            const CesiumGltf::MeshPrimitive &prim, const glm::dmat4 &nodeTransform) {
+			    auto it = prim.attributes.find("POSITION");
+			    if (it == prim.attributes.end()) {
+				    return;
+			    }
+			    CesiumGltf::AccessorView<glm::vec3> pos(m, it->second);
+			    if (pos.status() != CesiumGltf::AccessorViewStatus::Valid) {
+				    return;
+			    }
+			    glm::dmat4 world = tileTransform * nodeTransform;
+			    for (int64_t i = 0; i < pos.size(); i += 50) { // sample every 50th vertex
+				    glm::vec3 lp = pos[i];
+				    glm::dvec4 wp = world * glm::dvec4(lp.x, lp.y, lp.z, 1.0);
+
+				    bbMin = glm::min(bbMin, glm::dvec3(wp) - anchor);
+				    bbMax = glm::max(bbMax, glm::dvec3(wp) - anchor);
+
+				    glm::dvec4 clipD = viewProj * wp;
+				    if (clipD.w < 1.0) {
+					    continue;
+				    }
+				    glm::dvec3 nd = glm::dvec3(clipD) / clipD.w;
+				    glm::dvec2 sD((nd.x * 0.5 + 0.5) * kWidth, (0.5 - nd.y * 0.5) * kHeight);
+
+				    glm::vec3 relF = glm::vec3(wp.x - anchor.x, wp.y - anchor.y, wp.z - anchor.z);
+				    glm::vec4 clipF = viewProjRelF * glm::vec4(relF, 1.0f);
+				    glm::vec3 nf = glm::vec3(clipF) / clipF.w;
+				    glm::dvec2 sF((nf.x * 0.5f + 0.5f) * kWidth, (0.5f - nf.y * 0.5f) * kHeight);
+
+				    maxDivPx = std::max(maxDivPx, glm::length(sD - sF));
+				    ++samples;
+			    }
+		    });
+	}
+
+	glm::dvec3 extent = bbMax - bbMin;
+	std::printf("--- RTC precision (M1 GPU pipeline proxy) ---\n");
+	std::printf("  sampled %zu verts; max double-vs-RTCfloat screen divergence = %.4f px\n", samples,
+	            maxDivPx);
+	std::printf("  verdict: %s (threshold 0.5px)\n", maxDivPx < 0.5 ? "PASS — float32 RTC is safe"
+	                                                                 : "FAIL — needs tighter scheme");
+	std::printf("--- Diorama transform (scale 1:%.0f) ---\n", 1.0 / kDioramaScale);
+	std::printf("  anchor-relative extent: %.0f x %.0f x %.0f m\n", extent.x, extent.y, extent.z);
+	std::printf("  at diorama scale:      %.3f x %.3f x %.3f m (display-volume sized)\n",
+	            extent.x * kDioramaScale, extent.y * kDioramaScale, extent.z * kDioramaScale);
+}
+
+int
+runStatic(Cesium3DTilesSelection::Tileset &tileset, CesiumAsync::AsyncSystem &asyncSystem,
+          const CesiumGeospatial::Ellipsoid &ell,
+          const CesiumGeospatial::Cartographic &targetCarto, glm::dvec3 target,
+          std::shared_ptr<CesiumUtility::CreditSystem> pCredits)
+{
+	using namespace Cesium3DTilesSelection;
+	Camera cam = buildCamera(ell, targetCarto, target, /*az*/ 158.0, kCamElevDeg, kCamDistance);
+	ViewState view(cam.pos, cam.dir, cam.up, glm::dvec2(kWidth, kHeight), cam.hfov, cam.vfov, ell);
+
+	std::printf("EarthView M0: streaming Paris (%.4f, %.4f) ...\n", kTargetLatDeg, kTargetLonDeg);
+	auto t0 = std::chrono::steady_clock::now();
+	const ViewUpdateResult *result = settle(tileset, asyncSystem, view, kTimeoutSec, true);
+	double secs = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                  std::chrono::steady_clock::now() - t0)
+	                  .count() /
+	              1000.0;
+
+	Framebuffer fb;
+	SceneOut scene = renderScene(*result, cam, fb);
+	std::printf("Selection settled: %d render tiles in %.1fs\n", scene.renderTiles, secs);
+
+	const char *outPath = "/tmp/earthview_m0.png";
+	stbi_write_png(outPath, kWidth, kHeight, 4, fb.color.data(), kWidth * 4);
+	std::printf("Wrote %s\n", outPath);
+	std::printf("Stats: %zu primitives (%zu textured), %zu tris, %zu drawn "
+	            "(behind=%zu degen=%zu offscreen=%zu)\n",
+	            scene.stats.primitives, scene.stats.texturedPrimitives, scene.stats.triangles,
+	            scene.stats.trianglesDrawn, scene.stats.behind, scene.stats.degenerate,
+	            scene.stats.offscreen);
+
+	measureRtcAndDiorama(*result, cam, target);
+
+	std::printf("--- Data attribution ---\n");
+	for (const auto &credit : pCredits->getSnapshot().currentCredits) {
+		std::printf("  %s\n", stripHtml(pCredits->getHtml(credit)).c_str());
+	}
+
+	bool ok = scene.stats.trianglesDrawn > 0;
+	std::printf(ok ? "M0 PASS\n" : "M0 FAIL: nothing rasterized\n");
+	return ok ? 0 : 1;
+}
+
+// Orbit the camera around Paris over a full revolution, settling + rendering
+// each step, to exercise continuous tile load/unload churn (the M1 navigation
+// case). Reports tile count + RSS per step to check for crashes / unbounded
+// memory, and dumps a few frames.
+int
+runOrbit(Cesium3DTilesSelection::Tileset &tileset, CesiumAsync::AsyncSystem &asyncSystem,
+         const CesiumGeospatial::Ellipsoid &ell,
+         const CesiumGeospatial::Cartographic &targetCarto, glm::dvec3 target)
+{
+	using namespace Cesium3DTilesSelection;
+	constexpr int kPerRev = 12; // 30 deg apart
+	constexpr int kRevs = 3;    // revisit viewpoints to distinguish cache-cap from leak
+	constexpr int kSteps = kPerRev * kRevs;
+	std::printf("EarthView M0 orbit: %d revolutions (%d frames) around Paris "
+	            "(tile-churn + memory)\n",
+	            kRevs, kSteps);
+	std::printf(" step  rev   az   renderTiles   RSS(MB)\n");
+
+	double rssStart = currentRssMB(), rssMax = rssStart, rssAfterRev1 = 0;
+	int minTiles = 1 << 30, maxTiles = 0;
+	for (int s = 0; s < kSteps; ++s) {
+		double az = 360.0 * (s % kPerRev) / kPerRev;
+		Camera cam = buildCamera(ell, targetCarto, target, az, kCamElevDeg, kCamDistance);
+		ViewState view(cam.pos, cam.dir, cam.up, glm::dvec2(kWidth, kHeight), cam.hfov, cam.vfov,
+		               ell);
+		// Per-step settle budget is short: most tiles are already resident from
+		// neighbouring views, so this measures incremental churn, not cold load.
+		const ViewUpdateResult *result = settle(tileset, asyncSystem, view, 20, false);
+
+		Framebuffer fb;
+		SceneOut scene = renderScene(*result, cam, fb);
+		double rss = currentRssMB();
+		rssMax = std::max(rssMax, rss);
+		minTiles = std::min(minTiles, scene.renderTiles);
+		maxTiles = std::max(maxTiles, scene.renderTiles);
+		if (s == kPerRev - 1) {
+			rssAfterRev1 = rss;
+		}
+		std::printf("  %3d  %3d  %4.0f      %5d       %6.1f\n", s, s / kPerRev, az,
+		            scene.renderTiles, rss);
+
+		if (s == 0 || s == kPerRev / 2) {
+			char path[64];
+			std::snprintf(path, sizeof(path), "/tmp/earthview_orbit_%02d.png", s);
+			stbi_write_png(path, kWidth, kHeight, 4, fb.color.data(), kWidth * 4);
+			std::printf("        wrote %s\n", path);
+		}
+	}
+
+	// After rev 1 the camera revisits viewpoints, so any further climb is new
+	// allocation, not re-traversal. Plateau across revs 2-3 = cache-cap (healthy);
+	// continued linear climb = leak.
+	double rssEnd = currentRssMB();
+	double laterGrowth = rssEnd - rssAfterRev1;
+	std::printf("Churn: render tiles ranged %d..%d across the orbit\n", minTiles, maxTiles);
+	std::printf("Memory: start %.1f, end-of-rev1 %.1f, peak %.1f, final %.1f MB\n", rssStart,
+	            rssAfterRev1, rssMax, rssEnd);
+	std::printf("Memory growth after rev 1 (revisiting views): %.1f MB\n", laterGrowth);
+	bool plateaued = laterGrowth < 80.0; // re-seen views shouldn't keep allocating
+	std::printf(plateaued ? "  -> plateaued: cache-capped, no leak\n"
+	                      : "  -> still climbing: investigate cache cap / leak\n");
+	bool ok = maxTiles > 0 && plateaued;
+	std::printf(ok ? "ORBIT PASS — no crash, memory bounded by cache cap\n"
+	               : "ORBIT FAIL — memory not bounded\n");
+	return ok ? 0 : 1;
+}
+
 } // namespace
 
 int
-main()
+main(int argc, char **argv)
 {
 	using namespace Cesium3DTilesSelection;
 	using namespace CesiumGeospatial;
+
+	const bool orbitMode = argc > 1 && std::string(argv[1]) == "orbit";
 
 	const std::string key = getApiKey();
 	if (key.empty()) {
@@ -397,123 +723,10 @@ main()
 	const std::string url = "https://tile.googleapis.com/v1/3dtiles/root.json?key=" + key;
 	Tileset tileset(externals, url, options);
 
-	// Camera: SE of the Eiffel Tower, elevated, looking at it.
 	const Ellipsoid &ell = Ellipsoid::WGS84;
 	Cartographic targetCarto = Cartographic::fromDegrees(kTargetLonDeg, kTargetLatDeg, 60.0);
 	glm::dvec3 target = ell.cartographicToCartesian(targetCarto);
-	glm::dvec3 up = ell.geodeticSurfaceNormal(targetCarto);
-	// local ENU at target
-	glm::dvec3 east = glm::normalize(glm::cross(glm::dvec3(0, 0, 1), up));
-	glm::dvec3 north = glm::normalize(glm::cross(up, east));
-	glm::dvec3 horiz = glm::normalize(-north + east * 0.4); // approach from SSW-ish
-	double elev = glm::radians(kCamElevDeg);
-	glm::dvec3 camPos =
-	    target + horiz * (kCamDistance * std::cos(elev)) + up * (kCamDistance * std::sin(elev));
-	glm::dvec3 dir = glm::normalize(target - camPos);
 
-	double hfov = glm::radians(kHFovDeg);
-	double vfov = 2.0 * std::atan(std::tan(hfov / 2.0) * double(kHeight) / double(kWidth));
-	ViewState view(camPos, dir, up, glm::dvec2(kWidth, kHeight), hfov, vfov, ell);
-
-	std::printf("EarthView M0: streaming Paris (%.4f, %.4f) ...\n", kTargetLatDeg, kTargetLonDeg);
-
-	auto start = std::chrono::steady_clock::now();
-	const ViewUpdateResult *result = nullptr;
-	int settled = 0;
-	int frame = 0;
-	while (true) {
-		result = &tileset.updateView({view});
-		asyncSystem.dispatchMainThreadTasks();
-
-		// Count tiles that actually carry renderable glTF this frame — Google
-		// P3DT's upper tiles are external-tileset pointers with no geometry, so
-		// "queues empty" alone fires before any mesh has loaded.
-		int renderTiles = 0;
-		for (const auto &pTile : result->tilesToRenderThisFrame) {
-			if (pTile->getContent().isRenderContent()) {
-				++renderTiles;
-			}
-		}
-		bool quiet = result->workerThreadTileLoadQueueLength == 0 &&
-		             result->mainThreadTileLoadQueueLength == 0 && renderTiles > 0;
-		settled = quiet ? settled + 1 : 0;
-		if (settled >= kSettleFrames) {
-			break;
-		}
-
-		auto elapsed =
-		    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start);
-		if (elapsed.count() > kTimeoutSec) {
-			std::fprintf(stderr, "WARN: timeout after %ds — rendering what we have\n", kTimeoutSec);
-			break;
-		}
-		if (++frame % 50 == 0) {
-			std::printf("  ... %.1f%% loaded, %zu tiles selected, queues w=%d m=%d\n",
-			            double(tileset.computeLoadProgress()),
-			            result->tilesToRenderThisFrame.size(),
-			            int(result->workerThreadTileLoadQueueLength),
-			            int(result->mainThreadTileLoadQueueLength));
-		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(15));
-	}
-
-	auto loadSecs = std::chrono::duration_cast<std::chrono::milliseconds>(
-	                    std::chrono::steady_clock::now() - start)
-	                    .count() /
-	                1000.0;
-	std::printf("Selection settled: %zu tiles in %.1fs\n", result->tilesToRenderThisFrame.size(),
-	            loadSecs);
-
-	// Rasterize
-	glm::dmat4 viewMat = glm::lookAt(camPos, camPos + dir, up);
-	glm::dmat4 projMat = glm::perspective(vfov, double(kWidth) / double(kHeight), 10.0, 1.0e7);
-	glm::dmat4 viewProj = projMat * viewMat;
-
-	// 3D Tiles content is glTF (Y-up); the ellipsoid/ECEF frame the camera uses
-	// is Z-up. cesium-native's tile transform does not bake in the conversion,
-	// so premultiply the Y-up -> Z-up rotation: (x,y,z) -> (x,-z,y).
-	glm::dmat4 yUpToZUp(1.0);
-	yUpToZUp[1] = glm::dvec4(0, 0, 1, 0);
-	yUpToZUp[2] = glm::dvec4(0, -1, 0, 0);
-
-	Framebuffer fb;
-	RasterStats stats;
-	int nRender = 0, nMeshes = 0, nCallback = 0;
-	for (const auto &pTile : result->tilesToRenderThisFrame) {
-		const TileContent &content = pTile->getContent();
-		if (!content.isRenderContent()) {
-			continue;
-		}
-		++nRender;
-		const CesiumGltf::Model &model = content.getRenderContent()->getModel();
-		nMeshes += int(model.meshes.size());
-		const glm::dmat4 tileTransform = yUpToZUp * pTile->getTransform();
-		model.forEachPrimitiveInScene(
-		    -1, [&](const CesiumGltf::Model &m, const CesiumGltf::Node &, const CesiumGltf::Mesh &,
-		            const CesiumGltf::MeshPrimitive &prim, const glm::dmat4 &nodeTransform) {
-			    ++nCallback;
-			    rasterizePrimitive(fb, viewProj, tileTransform * nodeTransform, m, prim, stats);
-		    });
-	}
-	std::printf("Diag: %d render-content tiles, %d meshes, %d primitive-callbacks fired\n", nRender,
-	            nMeshes, nCallback);
-
-	const char *outPath = "/tmp/earthview_m0.png";
-	stbi_write_png(outPath, kWidth, kHeight, 4, fb.color.data(), kWidth * 4);
-	std::printf("Wrote %s\n", outPath);
-	std::printf("Stats: %zu primitives (%zu textured), %zu tris, %zu drawn "
-	            "(behind=%zu degen=%zu offscreen=%zu)\n",
-	            stats.primitives, stats.texturedPrimitives, stats.triangles, stats.trianglesDrawn,
-	            stats.behind, stats.degenerate, stats.offscreen);
-
-	// Attribution (mandatory display in the real app — printed here)
-	std::printf("--- Data attribution ---\n");
-	const auto &snapshot = pCredits->getSnapshot();
-	for (const auto &credit : snapshot.currentCredits) {
-		std::printf("  %s\n", stripHtml(pCredits->getHtml(credit)).c_str());
-	}
-
-	const bool ok = stats.trianglesDrawn > 0;
-	std::printf(ok ? "M0 PASS\n" : "M0 FAIL: nothing rasterized\n");
-	return ok ? 0 : 1;
+	return orbitMode ? runOrbit(tileset, asyncSystem, ell, targetCarto, target)
+	                 : runStatic(tileset, asyncSystem, ell, targetCarto, target, pCredits);
 }
