@@ -55,7 +55,12 @@
 #include "display3d_view.h"
 #include "camera3d_view.h"
 #include "projection_depth.h"
-#include "model_renderer.h"
+#include "tile_engine.h"
+#include "tile_renderer.h"
+#include "geo_math.h"
+
+#include <glm/glm.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include "atlas_capture.h"
 
 // ============================================================================
@@ -100,30 +105,21 @@ struct InputState {
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
     bool eyeTrackingModeToggleRequested = false;
-    bool loadRequested = false;
     bool teleportRequested = false;
     float teleportMouseX = 0.0f, teleportMouseY = 0.0f; // logical points
 
-    // Smooth display-pose transition (double-click focus)
-    bool transitioning = false;
-    XrPosef transitionFrom = {{0,0,0,1}, {0,0,0}};
-    XrPosef transitionTo   = {{0,0,0,1}, {0,0,0}};
-    float transitionT = 0.0f;
-    float transitionDuration = 0.45f;
+    // Geo-navigation deltas, accumulated by the Cocoa event handlers and
+    // consumed once per frame by UpdateGeoNav (doubles live in geo_math).
+    float lookDX = 0.0f, lookDY = 0.0f;   // radians (left-drag)
+    float dollySteps = 0.0f;              // scroll steps (exponential zoom)
+    bool cycleBookmarkRequested = false;  // 'B'
+    bool releaseOrbitRequested = false;   // Esc-like release (Space shares reset)
 
     // Auto-orbit (turntable) mode
     bool animateEnabled = true;  // Always on; auto-orbit kicks in after 10 s idle.
     double lastInputTimeSec = 0.0;
     bool animationActive = false;
     bool animateToggleRequested = false;     // set by UI button
-
-    // glTF clip playback (Phase 4): one-shot, set by 'N' / 'K', cleared by the
-    // render loop after it drives ModelRenderer::cycleAnimation()/togglePaused().
-    bool cycleClipRequested = false;         // 'N' → next animation clip
-    bool playPauseRequested = false;         // 'K' → toggle play/pause
-
-    // Drag-and-drop / pending file load
-    std::string pendingLoadPath;
 
     // 'I' key: capture the rendered atlas region (cols × rows × renderW × renderH)
     // of the swapchain to <scene>_<cols>x<rows>.png in the working directory.
@@ -137,23 +133,14 @@ struct InputState {
     bool renderingModeChangeRequested = false;
 };
 
-// Fallback virtual-display height in meters when no scene is loaded
-// (or auto-fit fails). On scene load we replace this with a robust
-// percentile-based extent — see ApplyAutoFitForLoadedScene().
+// Virtual-display height in meters (the rig's display plane). The world is
+// scaled into XR space by geo_math's stereo-scale knob, so a fixed display
+// works at every altitude.
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
-// Initial virtual-display height as a multiple of the model's height: the
-// display-centric rig frames the (centered) model with 1.4× its height, i.e.
-// ~20% headroom top and bottom — enough that the window title bar doesn't
-// clip the subject.
-static constexpr float kAutoFitVerticalComfort = 1.4f;
-
-// Cached auto-fit result for the currently loaded scene. Reused by Reset
-// so 'Space' returns to the framed pose rather than world origin.
-static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};
-static float g_fitVHeight   = kDefaultVirtualDisplayHeightM;
-static float g_fitYaw       = 0.0f;
-static bool  g_fitValid     = false;
+// Diorama (orbit-acquired) tabletop scale, PRD §6.1: 1:3000 default; knob
+// territory down to ~1:8000 to fit deep scenes into the display volume.
+static constexpr double kDioramaScale = 1.0 / 3000.0;
 
 // ============================================================================
 // Globals
@@ -172,9 +159,30 @@ static bool g_fullscreen = false;
 static NSRect g_savedWindowFrame = {};
 static NSUInteger g_savedWindowStyle = 0;
 
-// Model-viewer state
-static ModelRenderer g_modelRenderer;
-static std::string g_loadedFileName;
+// EarthView state. Teardown order matters: g_tileEngine.shutdown() (Tileset
+// dtor free()s every tile through the renderer) BEFORE g_tileRenderer.cleanup().
+static TileRenderer g_tileRenderer;
+static TileEngine g_tileEngine;
+static geo::GeoNav g_geoNav;
+static bool g_tilesActive = false; // engine init'd (API key found)
+
+// Per-frame tile state shared between the update and render sections of the
+// frame loop. xrFromEcef is the double world mapping (camera or diorama).
+static std::vector<TileRenderer::DrawItem> g_drawList;
+static glm::dmat4 g_xrFromEcef(1.0);
+
+// Double-click pick, deferred until after eye 0 renders this frame (the
+// depth-readback unproject needs eye 0's depth buffer + matrices).
+static bool g_pendingPick = false;
+static float g_pickNdcX = 0.0f, g_pickNdcY = 0.0f;
+static glm::dvec3 g_viewerPosXr(0.0, 0.1, 0.6); // center-eye, updated per frame
+
+// Smooth double-click transition: the diorama starts centered on the picked
+// point's CURRENT on-screen XR position (yaw/tilt/scale are seeded from the
+// camera pose, so the switch is visually continuous), then the center glides
+// exponentially to the display origin.
+static glm::dvec3 g_dioramaCenterXr(0.0);
+static constexpr double kDioramaGlideTau = 0.35; // s
 
 static double g_avgFrameTime = 0.0;
 static uint64_t g_frameCount = 0;
@@ -295,8 +303,6 @@ static float RigLocalEyeZ(const XrPosef& rig, const XrVector3f& eyeWorld) {
 
 struct AppXrSession;
 static void UpdateTopBarButtonTitles(AppXrSession& xr);
-static void ApplyAutoFitForLoadedScene();
-static void UpdateMcpAnimationTools();
 
 // ============================================================================
 // Input timestamp helper
@@ -312,104 +318,63 @@ static void MarkUserInput(InputState& input) {
     input.animationActive = false;
 }
 
-// Extract yaw/pitch from a quaternion (XYZ order, matches quat_from_yaw_pitch).
-// Only used after a smooth pose transition completes so subsequent drag rotation
-// feels natural. Ambiguous near the poles — acceptable for this demo.
-static void yaw_pitch_from_quat(XrQuaternionf q, float* yaw, float* pitch) {
-    // Forward vector in local is (0, 0, -1); rotate it by q to get world forward.
-    float fx = 2.0f * (q.x * q.z + q.y * q.w) * -1.0f + 0.0f;
-    // Reuse the cross-product form for clarity.
-    float vx = 0, vy = 0, vz = -1.0f;
-    float tx = 2.0f * (q.y * vz - q.z * vy);
-    float ty = 2.0f * (q.z * vx - q.x * vz);
-    float tz = 2.0f * (q.x * vy - q.y * vx);
-    float fwdX = vx + q.w * tx + (q.y * tz - q.z * ty);
-    float fwdY = vy + q.w * ty + (q.z * tx - q.x * tz);
-    float fwdZ = vz + q.w * tz + (q.x * ty - q.y * tx);
-    (void)fx;
-    // quat_from_yaw_pitch(y,p) rotates (0,0,-1) to (-cos(p)sin(y), sin(p), -cos(p)cos(y)).
-    // Inverting:  p = asin(fwdY),  y = atan2(-fwdX, -fwdZ).
-    *yaw = atan2f(-fwdX, -fwdZ);
-    float clampedY = fwdY;
-    if (clampedY > 1.0f) clampedY = 1.0f;
-    if (clampedY < -1.0f) clampedY = -1.0f;
-    *pitch = asinf(clampedY);
-}
-
 // ============================================================================
-// Camera movement (ported from common/input_handler)
+// Geo navigation (PRD §7.1) — consumes the per-frame input deltas and drives
+// the double-precision GeoNav in geo_math. The XR rig pose stays FIXED; only
+// the geo camera moves (camera-centric model, §6.1).
 // ============================================================================
 
-static void UpdateCameraMovement(InputState& input, float dt, float displayHeightM) {
-    if (input.resetViewRequested) {
-        input.pitch = 0;
-        input.viewParams = ViewParams();
-        if (g_fitValid) {
-            input.cameraPosX = g_fitCenter[0];
-            input.cameraPosY = g_fitCenter[1];
-            input.cameraPosZ = g_fitCenter[2];
-            input.yaw = g_fitYaw;
-            input.viewParams.virtualDisplayHeight = g_fitVHeight;
-        } else {
-            input.cameraPosX = input.cameraPosY = input.cameraPosZ = 0;
-            input.yaw = 0;
-            input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
-        }
+static void UpdateGeoNav(InputState& input, float dt) {
+    if (input.resetViewRequested || input.releaseOrbitRequested) {
         input.resetViewRequested = false;
-        input.transitioning = false;
-        // Auto-orbit always on; resetting just resets the idle timer below.
+        input.releaseOrbitRequested = false;
+        input.viewParams = ViewParams();
+        input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
+        g_geoNav.releaseOrbit();   // back to camera-centric, reframe bookmark
+        input.lookDX = input.lookDY = input.dollySteps = 0.0f;
         input.animationActive = false;
         input.lastInputTimeSec = NowSec();
         return;
     }
-
-    // Smooth pose transition (double-click focus). Overrides WASD while active.
-    if (input.transitioning) {
-        input.transitionT += dt;
-        float u = input.transitionT / input.transitionDuration;
-        if (u >= 1.0f) u = 1.0f;
-        // Ease-out cubic
-        float invU = 1.0f - u;
-        float eased = 1.0f - invU * invU * invU;
-        XrPosef cur;
-        display3d_pose_slerp(&input.transitionFrom, &input.transitionTo, eased, &cur);
-        input.cameraPosX = cur.position.x;
-        input.cameraPosY = cur.position.y;
-        input.cameraPosZ = cur.position.z;
-        float yaw, pitch;
-        yaw_pitch_from_quat(cur.orientation, &yaw, &pitch);
-        input.yaw = yaw;
-        input.pitch = pitch;
-        if (u >= 1.0f) input.transitioning = false;
-        return;
+    if (input.cycleBookmarkRequested) {
+        input.cycleBookmarkRequested = false;
+        g_geoNav.cycleBookmark();  // instant jump (fly-over interp = M1.x)
+        size_t n = 0;
+        const geo::Bookmark* bm = geo::bookmarks(&n);
+        LOG_INFO("Bookmark: %s", bm[g_geoNav.bookmarkIndex].name);
     }
 
-    float speed = 0.15f;
-    if (displayHeightM > 0.0f) speed *= displayHeightM / 0.1f;
+    // Left-drag look / orbit.
+    if (input.lookDX != 0.0f || input.lookDY != 0.0f) {
+        g_geoNav.look((double)input.lookDX, (double)input.lookDY);
+        input.lookDX = input.lookDY = 0.0f;
+    }
+    // Scroll dolly (exponential).
+    if (input.dollySteps != 0.0f) {
+        g_geoNav.dolly((double)input.dollySteps);
+        input.dollySteps = 0.0f;
+    }
+    // WASD pan in the ground tangent plane, E/Q climb. Speeds scale with
+    // targetDist inside GeoNav, so dt is the only factor here (~half the
+    // target distance per second of held key).
+    const double k = 0.5 * (double)dt;
+    double panX = 0.0, panY = 0.0, climb = 0.0;
+    if (input.keyW) panY += k;
+    if (input.keyS) panY -= k;
+    if (input.keyD) panX += k;
+    if (input.keyA) panX -= k;
+    if (input.keyE) climb += k;
+    if (input.keyQ) climb -= k;
+    if (panX != 0.0 || panY != 0.0) g_geoNav.pan(panX, panY);
+    if (climb != 0.0) g_geoNav.elevate(climb);
 
-    // Build orientation quaternion and derive basis vectors
-    XrQuaternionf ori;
-    quat_from_yaw_pitch(input.yaw, input.pitch, &ori);
-
-    float fwdX, fwdY, fwdZ, rtX, rtY, rtZ, upX, upY, upZ;
-    quat_rotate_vec3(ori, 0, 0, -1, &fwdX, &fwdY, &fwdZ);
-    quat_rotate_vec3(ori, 1, 0, 0, &rtX, &rtY, &rtZ);
-    quat_rotate_vec3(ori, 0, 1, 0, &upX, &upY, &upZ);
-
-    float d = speed * dt;
-    if (input.keyW) { input.cameraPosX += fwdX*d; input.cameraPosY += fwdY*d; input.cameraPosZ += fwdZ*d; }
-    if (input.keyS) { input.cameraPosX -= fwdX*d; input.cameraPosY -= fwdY*d; input.cameraPosZ -= fwdZ*d; }
-    if (input.keyD) { input.cameraPosX += rtX*d;  input.cameraPosY += rtY*d;  input.cameraPosZ += rtZ*d; }
-    if (input.keyA) { input.cameraPosX -= rtX*d;  input.cameraPosY -= rtY*d;  input.cameraPosZ -= rtZ*d; }
-    if (input.keyE) { input.cameraPosX += upX*d;  input.cameraPosY += upY*d;  input.cameraPosZ += upZ*d; }
-    if (input.keyQ) { input.cameraPosX -= upX*d;  input.cameraPosY -= upY*d;  input.cameraPosZ -= upZ*d; }
-
-    // Auto-orbit: if enabled and user has been idle > 10s, slowly yaw the display.
+    // Auto-orbit: idle > 10 s → slow turntable (spins the diorama when an
+    // orbit center is acquired, pans the view when free).
     double idleFor = NowSec() - input.lastInputTimeSec;
     input.animationActive = (input.animateEnabled && idleFor > 10.0);
     if (input.animationActive) {
-        float rate = 6.2831853f / 20.0f; // one revolution per 20 seconds
-        input.yaw += rate * dt;
+        double rate = 6.2831853 / 60.0; // one revolution per 60 seconds
+        g_geoNav.look(rate * dt, 0.0);
     }
 }
 
@@ -447,11 +412,12 @@ static NSVisualEffectView *g_hudBackdrop = nil;  // frosted wrapper sized to hud
 // ============================================================================
 
 static NSView   *g_topBar = nil;
-static NSButton *g_openButton = nil;
 static NSButton *g_modeButton = nil;
-static NSButton *g_animButton = nil;   // right-justified clip button; hidden w/o clips
+static NSButton *g_animButton = nil;   // repurposed: bookmark-cycle button
 static NSView   *g_animButtonBackdrop = nil;
 static NSView   *g_reticleView = nil;
+static NSVisualEffectView *g_attributionBar = nil;  // ALWAYS visible (policy)
+static NSTextField *g_attributionText = nil;
 
 // Translucent dark background view used behind the top bar.
 @interface TopBarBackdropView : NSView
@@ -488,52 +454,6 @@ static NSView   *g_reticleView = nil;
     NSRectFill(NSMakeRect(cx, cy - 4.5, 1, 9));
 }
 @end
-
-static void OpenLoadDialog() {
-    @autoreleasepool {
-        NSOpenPanel *panel = [NSOpenPanel openPanel];
-        [panel setCanChooseFiles:YES];
-        [panel setCanChooseDirectories:NO];
-        [panel setAllowsMultipleSelection:NO];
-        [panel setTitle:@"Load 3D Model"];
-        [panel setMessage:@"Select a 3D model (glTF / STL / OBJ / FBX / USD)"];
-
-        if (@available(macOS 11.0, *)) {
-            NSMutableArray<UTType *> *types = [NSMutableArray array];
-            for (NSString *ext in @[@"glb", @"gltf", @"stl", @"obj", @"fbx",
-                                    @"usdz", @"usd", @"usda", @"usdc"]) {
-                UTType *t = [UTType typeWithFilenameExtension:ext];
-                if (t) [types addObject:t];
-            }
-            if (types.count > 0) {
-                [panel setAllowedContentTypes:types];
-            }
-        }
-
-        if ([panel runModal] == NSModalResponseOK) {
-            NSURL *url = [[panel URLs] firstObject];
-            if (url) {
-                const char *path = [[url path] UTF8String];
-                std::string pathStr(path);
-                if (model_validate_file(pathStr)) {
-                    LOG_INFO("Loading model: %s", path);
-                    if (g_modelRenderer.loadModel(path)) {
-                        g_loadedFileName = model_basename(pathStr);
-                        LOG_INFO("Model loaded: %s (%s)", g_loadedFileName.c_str(),
-                            model_filesize_str(pathStr).c_str());
-                        ApplyAutoFitForLoadedScene();
-                    } else {
-                        LOG_ERROR("Failed to load model: %s", path);
-                        NSAlert *alert = [[NSAlert alloc] init];
-                        [alert setMessageText:@"Failed to load model file"];
-                        [alert setInformativeText:@"The file may be corrupt or unsupported."];
-                        [alert runModal];
-                    }
-                }
-            }
-        }
-    }
-}
 
 // ============================================================================
 // macOS Window + Metal Layer
@@ -574,23 +494,16 @@ static void OpenLoadDialog() {
 
 - (void)mouseDragged:(NSEvent *)event {
     MarkUserInput(g_input);
-    g_input.yaw -= (float)[event deltaX] * 0.005f;
-    // pitch -= deltaY: since W7 (#396) model_renderer flips Vulkan-Y at the
-    // RASTER stage (negative VkViewport.height), NOT by reflecting the view
-    // matrix. A view-stage reflection would invert rotational handedness
-    // (needing += here); the raster flip does not, so we use the same -=
-    // convention as the cube_handle apps.
-    g_input.pitch -= (float)[event deltaY] * 0.005f;
-    float maxPitch = 1.5f;
-    if (g_input.pitch > maxPitch) g_input.pitch = maxPitch;
-    if (g_input.pitch < -maxPitch) g_input.pitch = -maxPitch;
+    // Accumulate look deltas; UpdateGeoNav consumes them once per frame and
+    // drives the double-precision geo camera (free-look or diorama orbit).
+    g_input.lookDX += (float)[event deltaX] * 0.005f;
+    g_input.lookDY += (float)[event deltaY] * 0.005f;
 }
 
 - (void)scrollWheel:(NSEvent *)event {
     MarkUserInput(g_input);
-    float delta = (float)[event scrollingDeltaY] * 0.02f;
-    g_input.viewParams.scaleFactor += delta * 0.5f;
-    if (g_input.viewParams.scaleFactor < 0.1f) g_input.viewParams.scaleFactor = 0.1f;
+    // Dolly toward/away from the view target (stereo scale follows distance).
+    g_input.dollySteps += (float)[event scrollingDeltaY] * 0.05f;
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -615,11 +528,8 @@ static void OpenLoadDialog() {
         case 'm': case 'M':
             g_input.animateToggleRequested = true;
             break;
-        case 'n': case 'N':   // next glTF animation clip
-            g_input.cycleClipRequested = true;
-            break;
-        case 'k': case 'K':   // play/pause the active clip
-            g_input.playPauseRequested = true;
+        case 'b': case 'B':   // cycle city bookmarks (Paris default)
+            g_input.cycleBookmarkRequested = true;
             break;
         case 'c': case 'C':
             g_input.cameraMode = !g_input.cameraMode;
@@ -629,9 +539,6 @@ static void OpenLoadDialog() {
             break;
         case 't': case 'T':
             g_input.eyeTrackingModeToggleRequested = true;
-            break;
-        case 'l': case 'L':
-            g_input.loadRequested = true;
             break;
         case '-': case '_': {
             float v = g_input.viewParams.ipdFactor - 0.1f;
@@ -669,8 +576,12 @@ static void OpenLoadDialog() {
         case '\t':
             g_input.hudVisible = !g_input.hudVisible;
             break;
-        case 27: // ESC
-            g_running = false;
+        case 27: // ESC: first press releases an acquired orbit, second quits
+            if (g_geoNav.orbitAcquired) {
+                g_input.releaseOrbitRequested = true;
+            } else {
+                g_running = false;
+            }
             break;
     }
 }
@@ -688,30 +599,6 @@ static void OpenLoadDialog() {
         case 'e': case 'E': g_input.keyE = false; break;
         case 'q': case 'Q': g_input.keyQ = false; break;
     }
-}
-
-// Drag-and-drop: accept .glb and .gltf files
-- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
-    NSPasteboard *pb = [sender draggingPasteboard];
-    if ([[pb types] containsObject:NSPasteboardTypeFileURL]) {
-        return NSDragOperationCopy;
-    }
-    return NSDragOperationNone;
-}
-
-- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
-    NSPasteboard *pb = [sender draggingPasteboard];
-    NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[[NSURL class]] options:nil];
-    for (NSURL *url in urls) {
-        if (![url isFileURL]) continue;
-        NSString *path = [url path];
-        NSString *ext = [[path pathExtension] lowercaseString];
-        if ([ext isEqualToString:@"glb"] || [ext isEqualToString:@"gltf"]) {
-            g_input.pendingLoadPath = std::string([path UTF8String]);
-            return YES;
-        }
-    }
-    return NO;
 }
 
 - (void)flagsChanged:(NSEvent *)event {
@@ -738,7 +625,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
                        NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
     g_window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
-    [g_window setTitle:@"DisplayXR 3D Model Viewer"];
+    [g_window setTitle:@"DisplayXR EarthView"];
     [g_window setDelegate:delegate];
     [g_window center];
 
@@ -746,9 +633,6 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [g_window setContentView:g_metalView];
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:g_metalView];
-
-    // Accept drag-and-drop of .glb / .gltf files
-    [g_metalView registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
 
     // Add HUD overlay — frosted backdrop + text view inside
     NSRect hudFrame = NSMakeRect(8, 8, 320, 520);
@@ -804,28 +688,66 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         return bd;
     };
 
-    NSView *openBd = makeGlassyButton(NSMakeRect(x, btnY, openW, btnH),
-                                       @"Open…", @selector(openButtonClicked:),
-                                       &g_openButton);
-    [g_topBar addSubview:openBd];
-    x += openW + gap;
-
+    (void)openW; (void)gap;
     NSView *modeBd = makeGlassyButton(NSMakeRect(x, btnY, modeW, btnH),
                                        @"Mode: —", @selector(modeButtonClicked:),
                                        &g_modeButton);
     [g_topBar addSubview:modeBd];
+    x += modeW + gap;
 
-    // Animation button — right-justified (pinned to the right edge via
-    // NSViewMinXMargin so it stays put on resize). Hidden until a model with
-    // clips loads (see UpdateTopBarButtonTitles). Click = next clip (N-key).
-    const CGFloat animW = 160.0;
-    NSView *animBd = makeGlassyButton(NSMakeRect(width - animW - 12.0, btnY, animW, btnH),
-                                       @"", @selector(animationButtonClicked:),
-                                       &g_animButton);
-    [animBd setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
-    [animBd setHidden:YES];
-    g_animButtonBackdrop = animBd;
-    [g_topBar addSubview:animBd];
+    // Bookmark button — cycles the city table ('B' key equivalent).
+    const CGFloat bmW = 150.0;
+    NSView *bmBd = makeGlassyButton(NSMakeRect(x, btnY, bmW, btnH),
+                                     @"City: Paris", @selector(bookmarkButtonClicked:),
+                                     &g_animButton);
+    g_animButtonBackdrop = bmBd;
+    [g_topBar addSubview:bmBd];
+
+    // --- Attribution strip (ALWAYS visible — Map Tiles API policy, PRD §7.3):
+    // Google logo + frequency-sorted data credits + loading indicator.
+    const CGFloat attrH = 26.0;
+    NSVisualEffectView *attrBd =
+        [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, width, attrH)];
+    [attrBd setMaterial:NSVisualEffectMaterialHUDWindow];
+    [attrBd setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
+    [attrBd setState:NSVisualEffectStateActive];
+    [attrBd setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
+    g_attributionBar = attrBd;
+
+    NSImage *logo = nil;
+    {
+        // google_logo.png is copied next to the exe by CMake (policy asset).
+        NSString *exePath = [[NSBundle mainBundle] executablePath];
+        NSString *logoPath = [[exePath stringByDeletingLastPathComponent]
+            stringByAppendingPathComponent:@"google_logo.png"];
+        logo = [[NSImage alloc] initWithContentsOfFile:logoPath];
+    }
+    CGFloat textX = 8.0;
+    if (logo) {
+        const CGFloat logoH = attrH - 8.0;
+        CGFloat logoW = logoH * (logo.size.height > 0 ? logo.size.width / logo.size.height : 3.0);
+        NSImageView *logoView =
+            [[NSImageView alloc] initWithFrame:NSMakeRect(8, 4, logoW, logoH)];
+        [logoView setImage:logo];
+        [logoView setImageScaling:NSImageScaleProportionallyUpOrDown];
+        [attrBd addSubview:logoView];
+        textX = 8.0 + logoW + 10.0;
+    }
+    NSTextField *attrText = [[NSTextField alloc]
+        initWithFrame:NSMakeRect(textX, 0, width - textX - 8.0, attrH)];
+    [attrText setEditable:NO];
+    [attrText setBordered:NO];
+    [attrText setDrawsBackground:NO];
+    [attrText setFont:[NSFont systemFontOfSize:10]];
+    [attrText setTextColor:[NSColor labelColor]];
+    [attrText setLineBreakMode:NSLineBreakByTruncatingTail];
+    [attrText setAutoresizingMask:NSViewWidthSizable];
+    // Vertically center single-line text in the strip.
+    [attrText setFrame:NSMakeRect(textX, (attrH - 14.0) * 0.5, width - textX - 8.0, 14.0)];
+    [attrText setStringValue:logo ? @"" : @"Google"];
+    g_attributionText = attrText;
+    [attrBd addSubview:attrText];
+    [g_metalView addSubview:attrBd];
 
     // --- Reticle (non-interactive center crosshair) ---
     const CGFloat retSize = 20.0;
@@ -841,17 +763,11 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
 
 // Button action handlers (added as category on NSApplication)
 @interface NSApplication (TopBarActions)
-- (void)openButtonClicked:(id)sender;
 - (void)modeButtonClicked:(id)sender;
-- (void)animationButtonClicked:(id)sender;
+- (void)bookmarkButtonClicked:(id)sender;
 @end
 
 @implementation NSApplication (TopBarActions)
-- (void)openButtonClicked:(id)sender {
-    (void)sender;
-    MarkUserInput(g_input);
-    g_input.loadRequested = true;
-}
 - (void)modeButtonClicked:(id)sender {
     (void)sender;
     MarkUserInput(g_input);
@@ -860,10 +776,10 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     }
     g_input.renderingModeChangeRequested = true;
 }
-- (void)animationButtonClicked:(id)sender {
+- (void)bookmarkButtonClicked:(id)sender {
     (void)sender;
     MarkUserInput(g_input);
-    g_input.cycleClipRequested = true;   // next clip (N-key equivalent)
+    g_input.cycleBookmarkRequested = true;   // 'B'-key equivalent
 }
 @end
 
@@ -977,9 +893,8 @@ struct AppXrSession {
     void* windowHandle = nullptr;  // unused on macOS, kept for compatibility
 };
 
-// Session reachable from the model-load paths (they all funnel through
-// ApplyAutoFitForLoadedScene, which is xr-free) so they can flip the
-// animation-tool registration. Set in main() right after CreateSession.
+// Session reachable from xr-free helpers (MCP tool dispatch). Set in main()
+// right after CreateSession.
 static AppXrSession* g_xrForMcp = nullptr;
 
 static void UpdateTopBarButtonTitles(AppXrSession& xr) {
@@ -994,74 +909,13 @@ static void UpdateTopBarButtonTitles(AppXrSession& xr) {
     }
 }
 
-// Refresh the right-justified animation button: shown only when the model has
-// clips; label = current clip name, or "Paused". Called on load + N/K events.
-// xr-free so the load hook (ApplyAutoFitForLoadedScene) can call it.
-static void UpdateAnimButton() {
-    if (!g_animButton || !g_animButtonBackdrop) return;
-    std::string clip; int ci, cn; float ct, cd; bool playing;
-    if (g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing)) {
-        [g_animButtonBackdrop setHidden:NO];
-        [g_animButton setTitle:playing ? [NSString stringWithUTF8String:clip.c_str()] : @"Paused"];
-    } else {
-        [g_animButtonBackdrop setHidden:YES];
-    }
-}
-
-// ★ XR_EXT_mcp_tools late registration (#22): the animation tools exist only
-// while a model with clips is loaded; they are unregistered when the model is
-// replaced by one without. Each transition makes the runtime broadcast the MCP
-// tools/list_changed notification, so agents connected BEFORE a load see the
-// tools appear/disappear live. Called from every successful load path (they
-// all funnel through ApplyAutoFitForLoadedScene).
-static void UpdateMcpAnimationTools() {
-    AppXrSession* xr = g_xrForMcp;
-    if (!xr || !xr->mcpToolsReady || !xr->pfnRegisterMCPTool || !xr->pfnUnregisterMCPTool)
-        return;
-    const bool want = g_modelRenderer.hasAnimations();
-    if (want == xr->mcpAnimToolsRegistered) return;
-
-    if (want) {
-        XrMCPToolInfoEXT listTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
-        listTool.name = "list_animations";
-        listTool.description =
-            "List the loaded model's animation clips: index, name and duration in "
-            "seconds, plus the active clip index and whether playback is running. "
-            "Only available while a model with animation clips is loaded.";
-        listTool.inputSchemaJson = "{\"type\":\"object\"}";
-        XrResult r1 = xr->pfnRegisterMCPTool(xr->session, &listTool);
-
-        XrMCPToolInfoEXT playTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
-        playTool.name = "play_animation";
-        playTool.description =
-            "Play an animation clip, selected by 'index' or 'name' (see "
-            "list_animations). Omit both to resume the active clip. Selecting a "
-            "different clip restarts it from t=0. Returns the now-playing clip; "
-            "verify visually with capture_frame.";
-        playTool.inputSchemaJson =
-            "{\"type\":\"object\",\"properties\":{"
-            "\"index\":{\"type\":\"integer\",\"description\":\"Clip index from list_animations.\"},"
-            "\"name\":{\"type\":\"string\",\"description\":\"Clip name from list_animations.\"}}}";
-        XrResult r2 = xr->pfnRegisterMCPTool(xr->session, &playTool);
-
-        XrMCPToolInfoEXT stopTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
-        stopTool.name = "stop_animation";
-        stopTool.description =
-            "Pause animation playback, freezing the model at its current pose. "
-            "Resume with play_animation.";
-        stopTool.inputSchemaJson = "{\"type\":\"object\"}";
-        XrResult r3 = xr->pfnRegisterMCPTool(xr->session, &stopTool);
-
-        xr->mcpAnimToolsRegistered = XR_SUCCEEDED(r1) || XR_SUCCEEDED(r2) || XR_SUCCEEDED(r3);
-        LOG_INFO("XR_EXT_mcp_tools: animation tools registered (%d clip(s)) [%d %d %d]",
-                 g_modelRenderer.animationCount(), r1, r2, r3);
-    } else {
-        xr->pfnUnregisterMCPTool(xr->session, "list_animations");
-        xr->pfnUnregisterMCPTool(xr->session, "play_animation");
-        xr->pfnUnregisterMCPTool(xr->session, "stop_animation");
-        xr->mcpAnimToolsRegistered = false;
-        LOG_INFO("XR_EXT_mcp_tools: animation tools unregistered (model has no clips)");
-    }
+// Refresh the bookmark button label with the active city.
+static void UpdateBookmarkButton() {
+    if (!g_animButton) return;
+    size_t n = 0;
+    const geo::Bookmark* bm = geo::bookmarks(&n);
+    [g_animButton setTitle:[NSString stringWithFormat:@"City: %s",
+                            bm[g_geoNav.bookmarkIndex].name]];
 }
 
 // Forward declarations for OpenXR functions (same as cube_handle_vk_macos)
@@ -1312,71 +1166,40 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
 
     // XR_EXT_mcp_tools (#22): declare identity + register the base agent
     // tools. The appId MUST match `id` in
-    // displayxr/model_viewer_handle_vk_macos.displayxr.json (INV-10.1).
+    // displayxr/earthview_handle_vk_macos.displayxr.json (INV-10.1).
     // Failure is non-fatal by design — the MCP capability gate may simply be
-    // off on this machine; the viewer runs identically without an agent
-    // surface. The animation tools are NOT registered here: they appear only
-    // once a model with clips loads (UpdateMcpAnimationTools).
+    // off on this machine; EarthView runs identically without an agent surface.
     if (xr.hasMcpToolsExt && xr.pfnSetMCPAppInfo && xr.pfnRegisterMCPTool) {
         XrMCPAppInfoEXT mcpAppInfo = {XR_TYPE_MCP_APP_INFO_EXT};
-        strncpy(mcpAppInfo.appId, "modelviewer", sizeof(mcpAppInfo.appId) - 1);
+        strncpy(mcpAppInfo.appId, "earthview", sizeof(mcpAppInfo.appId) - 1);
         XrResult ar = xr.pfnSetMCPAppInfo(xr.session, &mcpAppInfo);
         if (XR_SUCCEEDED(ar)) {
-            XrMCPToolInfoEXT loadTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
-            loadTool.name = "load_model";
-            loadTool.description =
-                "Load a 3D model file into the viewer, replacing the current model. "
-                "Supported formats: glTF (.glb/.gltf), STL, OBJ, FBX, USD "
-                "(.usdz/.usd/.usda/.usdc). The path must be absolute and readable by "
-                "the viewer process. On success the camera re-frames the model "
-                "automatically, and the animation tools (list_animations / "
-                "play_animation / stop_animation) appear or disappear depending on "
-                "whether the new model has animation clips.";
-            loadTool.inputSchemaJson =
-                "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\","
-                "\"description\":\"Absolute filesystem path of the model file to load.\"}},"
-                "\"required\":[\"path\"]}";
-            XrResult t1 = xr.pfnRegisterMCPTool(xr.session, &loadTool);
-
             XrMCPToolInfoEXT statusTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
             statusTool.name = "get_status";
             statusTool.description =
-                "Read the viewer's live state: loaded model file and primitive count, "
-                "animation clip count + active clip + playing flag, camera orbit "
-                "(azimuth/elevation in degrees, world position, zoom factor), active "
+                "Read EarthView's live state: active city bookmark, whether an "
+                "orbit center is acquired (diorama mode), camera target distance "
+                "in meters, render-tile count + GPU-resident MB, active "
                 "rendering-mode index, and whether the XR session is running.";
             statusTool.inputSchemaJson = "{\"type\":\"object\"}";
-            XrResult t2 = xr.pfnRegisterMCPTool(xr.session, &statusTool);
+            XrResult t1 = xr.pfnRegisterMCPTool(xr.session, &statusTool);
 
-            XrMCPToolInfoEXT orbitTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
-            orbitTool.name = "set_orbit";
-            orbitTool.description =
-                "Orbit the camera around the model. azimuth_deg rotates around the "
-                "vertical axis (0 = the model's authored front, increasing turns the "
-                "model to the right), elevation_deg tilts the view up/down (clamped to "
-                "±85), zoom scales the model on screen (>1 = larger, clamped 0.1–10, "
-                "default 1). All fields are optional; omitted ones keep their current "
-                "value. Also resets the idle auto-orbit timer, like any user input. "
-                "Verify the result visually with capture_frame.";
-            orbitTool.inputSchemaJson =
+            XrMCPToolInfoEXT bookmarkTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            bookmarkTool.name = "set_bookmark";
+            bookmarkTool.description =
+                "Fly to a city bookmark by 'index' or 'name' (Paris, San "
+                "Francisco, New York, Tokyo, Sydney). Omit both to cycle to the "
+                "next city. Releases any acquired orbit center. Verify visually "
+                "with capture_frame.";
+            bookmarkTool.inputSchemaJson =
                 "{\"type\":\"object\",\"properties\":{"
-                "\"azimuth_deg\":{\"type\":\"number\",\"description\":\"Orbit angle around the vertical axis, degrees.\"},"
-                "\"elevation_deg\":{\"type\":\"number\",\"description\":\"Tilt above (+) / below (−) the horizon, degrees, clamped to ±85.\"},"
-                "\"zoom\":{\"type\":\"number\",\"description\":\"View scale factor, 0.1–10; 1 = the auto-fit framing.\"}}}";
-            XrResult t3 = xr.pfnRegisterMCPTool(xr.session, &orbitTool);
-
-            XrMCPToolInfoEXT frameTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
-            frameTool.name = "frame_model";
-            frameTool.description =
-                "Reset the camera to the loaded model's auto-fit framed pose (same as "
-                "pressing Space): centers the model with comfortable headroom and "
-                "restores zoom to 1. Requires a model to be loaded.";
-            frameTool.inputSchemaJson = "{\"type\":\"object\"}";
-            XrResult t4 = xr.pfnRegisterMCPTool(xr.session, &frameTool);
+                "\"index\":{\"type\":\"integer\",\"description\":\"Bookmark index, 0-based.\"},"
+                "\"name\":{\"type\":\"string\",\"description\":\"Bookmark city name.\"}}}";
+            XrResult t2 = xr.pfnRegisterMCPTool(xr.session, &bookmarkTool);
 
             xr.mcpToolsReady = true;
-            LOG_INFO("XR_EXT_mcp_tools: appId=modelviewer load_model=%d get_status=%d "
-                     "set_orbit=%d frame_model=%d", t1, t2, t3, t4);
+            LOG_INFO("XR_EXT_mcp_tools: appId=earthview get_status=%d set_bookmark=%d",
+                     t1, t2);
         } else {
             LOG_INFO("XR_EXT_mcp_tools: appId not accepted (%d) — no agent surface", ar);
         }
@@ -1617,163 +1440,55 @@ static void HandleMcpToolCall(AppXrSession& xr, const XrEventDataMCPToolCallEXT*
     XrBool32 ok = XR_TRUE;
     char buf[1024];
 
-    if (strcmp(call->toolName, "load_model") == 0) {
-        std::string path;
-        if (!JsonGetString(a, "path", path) || path.empty()) {
-            ok = XR_FALSE;
-            result = "{\"error\":\"missing required string argument 'path'\"}";
-        } else if (!model_validate_file(path)) {
-            ok = XR_FALSE;
-            result = "{\"error\":\"not a readable supported model file: " +
-                     JsonEscape(path) + "\"}";
-        } else if (!g_modelRenderer.loadModel(path.c_str())) {
-            ok = XR_FALSE;
-            result = "{\"error\":\"failed to load (corrupt or unsupported): " +
-                     JsonEscape(path) + "\"}";
-        } else {
-            g_loadedFileName = model_basename(path);
-            LOG_INFO("Model loaded via MCP: %s (%s)", g_loadedFileName.c_str(),
-                     model_filesize_str(path).c_str());
-            // Re-frames the camera, refreshes the clip button, and registers/
-            // unregisters the agent animation tools for the new model.
-            ApplyAutoFitForLoadedScene();
-            snprintf(buf, sizeof(buf),
-                     "{\"file\":\"%s\",\"primitives\":%u,\"animation_count\":%d}",
-                     JsonEscape(g_loadedFileName).c_str(),
-                     g_modelRenderer.primitiveCount(), g_modelRenderer.animationCount());
-            result = buf;
-        }
-    } else if (strcmp(call->toolName, "get_status") == 0) {
-        std::string clip; int ci = -1, cn = 0; float ct = 0, cd = 0; bool playing = false;
-        const bool hasClip = g_modelRenderer.getPlaybackInfo(clip, ci, cn, ct, cd, playing);
-        const float azDeg = fmodf(g_input.yaw * 57.29578f, 360.0f);
-        const float elDeg = g_input.pitch * 57.29578f;
-        std::string clipJson = hasClip ? "\"" + JsonEscape(clip) + "\"" : "null";
+    size_t bmCount = 0;
+    const geo::Bookmark* bm = geo::bookmarks(&bmCount);
+
+    if (strcmp(call->toolName, "get_status") == 0) {
         snprintf(buf, sizeof(buf),
-                 "{\"file\":\"%s\",\"loaded\":%s,\"primitives\":%u,"
-                 "\"animation_count\":%d,\"active_animation\":%d,"
-                 "\"active_animation_name\":%s,\"animation_playing\":%s,"
-                 "\"camera\":{\"azimuth_deg\":%.1f,\"elevation_deg\":%.1f,"
-                 "\"position\":[%.3f,%.3f,%.3f],\"zoom\":%.2f},"
+                 "{\"bookmark\":\"%s\",\"bookmark_index\":%d,"
+                 "\"orbit_acquired\":%s,\"target_distance_m\":%.1f,"
+                 "\"tiles_active\":%s,\"render_tiles\":%s,"
+                 "\"gpu_resident_mb\":%.1f,"
                  "\"rendering_mode\":%u,\"session_running\":%s}",
-                 JsonEscape(g_loadedFileName).c_str(),
-                 g_modelRenderer.hasModel() ? "true" : "false",
-                 g_modelRenderer.primitiveCount(),
-                 g_modelRenderer.animationCount(),
-                 hasClip ? ci : -1, clipJson.c_str(),
-                 (hasClip && playing) ? "true" : "false",
-                 azDeg, elDeg,
-                 g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
-                 g_input.viewParams.scaleFactor,
+                 bm[g_geoNav.bookmarkIndex].name, g_geoNav.bookmarkIndex,
+                 g_geoNav.orbitAcquired ? "true" : "false",
+                 g_geoNav.targetDist,
+                 g_tilesActive ? "true" : "false",
+                 g_tileEngine.hasRenderableContent() ? "true" : "false",
+                 g_tileRenderer.gpuResidentMB(),
                  g_input.currentRenderingMode,
                  xr.sessionRunning ? "true" : "false");
         result = buf;
-    } else if (strcmp(call->toolName, "set_orbit") == 0) {
-        double az, el, zm;
-        bool any = false;
-        if (JsonGetNumber(a, "azimuth_deg", az)) {
-            g_input.yaw = (float)(az * 0.0174532925);
-            any = true;
-        }
-        if (JsonGetNumber(a, "elevation_deg", el)) {
-            if (el > 85.0) el = 85.0;
-            if (el < -85.0) el = -85.0;
-            g_input.pitch = (float)(el * 0.0174532925);
-            any = true;
-        }
-        if (JsonGetNumber(a, "zoom", zm)) {
-            if (zm < 0.1) zm = 0.1;
-            if (zm > 10.0) zm = 10.0;
-            g_input.viewParams.scaleFactor = (float)zm;
-            any = true;
-        }
-        if (!any) {
-            ok = XR_FALSE;
-            result = "{\"error\":\"provide at least one of azimuth_deg, elevation_deg, zoom\"}";
-        } else {
-            MarkUserInput(g_input);  // agent input is input: reset the auto-orbit idle timer
-            snprintf(buf, sizeof(buf),
-                     "{\"azimuth_deg\":%.1f,\"elevation_deg\":%.1f,\"zoom\":%.2f}",
-                     g_input.yaw * 57.29578f, g_input.pitch * 57.29578f,
-                     g_input.viewParams.scaleFactor);
-            result = buf;
-        }
-    } else if (strcmp(call->toolName, "frame_model") == 0) {
-        if (!g_modelRenderer.hasModel()) {
-            ok = XR_FALSE;
-            result = "{\"error\":\"no model loaded — call load_model first\"}";
-        } else {
-            g_input.resetViewRequested = true;  // applied by UpdateCameraMovement next frame
-            result = "{\"framed\":true}";
-        }
-    } else if (strcmp(call->toolName, "list_animations") == 0) {
-        const int n = g_modelRenderer.animationCount();
-        std::string clips = "[";
-        for (int i = 0; i < n; i++) {
-            std::string nm; float dur = 0;
-            g_modelRenderer.getAnimationInfo(i, nm, dur);
-            snprintf(buf, sizeof(buf), "%s{\"index\":%d,\"name\":\"%s\",\"duration_s\":%.2f}",
-                     i ? "," : "", i, JsonEscape(nm).c_str(), dur);
-            clips += buf;
-        }
-        clips += "]";
-        snprintf(buf, sizeof(buf), ",\"active_index\":%d,\"playing\":%s}",
-                 g_modelRenderer.activeAnimation(),
-                 (g_modelRenderer.hasAnimations() && !g_modelRenderer.isPaused()) ? "true" : "false");
-        result = "{\"animations\":" + clips + buf;
-    } else if (strcmp(call->toolName, "play_animation") == 0) {
-        const int n = g_modelRenderer.animationCount();
+    } else if (strcmp(call->toolName, "set_bookmark") == 0) {
         int target = -1;
         double idx; std::string nm;
         if (JsonGetNumber(a, "index", idx)) {
             target = (int)idx;
-            if (target < 0 || target >= n) {
+            if (target < 0 || target >= (int)bmCount) {
                 ok = XR_FALSE;
-                snprintf(buf, sizeof(buf), "{\"error\":\"index out of range (0..%d)\"}", n - 1);
+                snprintf(buf, sizeof(buf), "{\"error\":\"index out of range (0..%d)\"}",
+                         (int)bmCount - 1);
                 result = buf;
             }
         } else if (JsonGetString(a, "name", nm)) {
-            for (int i = 0; i < n && target < 0; i++) {
-                std::string c; float d;
-                g_modelRenderer.getAnimationInfo(i, c, d);
-                if (c == nm) target = i;
+            for (int i = 0; i < (int)bmCount && target < 0; i++) {
+                if (nm == bm[i].name) target = i;
             }
             if (target < 0) {
                 ok = XR_FALSE;
-                result = "{\"error\":\"no clip named '" + JsonEscape(nm) +
-                         "' — see list_animations\"}";
+                result = "{\"error\":\"no bookmark named '" + JsonEscape(nm) + "'\"}";
             }
         } else {
-            target = g_modelRenderer.activeAnimation();  // resume the active clip
-            if (target < 0) target = 0;
+            target = (g_geoNav.bookmarkIndex + 1) % (int)bmCount;  // cycle
         }
         if (ok == XR_TRUE) {
-            if (n == 0) {
-                ok = XR_FALSE;
-                result = "{\"error\":\"the loaded model has no animation clips\"}";
-            } else {
-                if (target != g_modelRenderer.activeAnimation())
-                    g_modelRenderer.setActiveAnimation(target);
-                g_modelRenderer.setPaused(false);
-                UpdateAnimButton();
-                std::string c; float d = 0;
-                g_modelRenderer.getAnimationInfo(target, c, d);
-                snprintf(buf, sizeof(buf),
-                         "{\"playing\":\"%s\",\"index\":%d,\"duration_s\":%.2f}",
-                         JsonEscape(c).c_str(), target, d);
-                result = buf;
-            }
+            g_geoNav.frameBookmark(target);
+            UpdateBookmarkButton();
+            MarkUserInput(g_input);  // agent input is input: reset the idle timer
+            snprintf(buf, sizeof(buf), "{\"bookmark\":\"%s\",\"index\":%d}",
+                     bm[target].name, target);
+            result = buf;
         }
-    } else if (strcmp(call->toolName, "stop_animation") == 0) {
-        g_modelRenderer.setPaused(true);
-        UpdateAnimButton();
-        std::string c; float d = 0;
-        const int active = g_modelRenderer.activeAnimation();
-        if (active >= 0) g_modelRenderer.getAnimationInfo(active, c, d);
-        snprintf(buf, sizeof(buf), "{\"playing\":false,\"paused_clip\":%s%s%s}",
-                 active >= 0 ? "\"" : "", active >= 0 ? JsonEscape(c).c_str() : "null",
-                 active >= 0 ? "\"" : "");
-        result = buf;
     } else {
         ok = XR_FALSE;
         result = "{\"error\":\"unhandled tool\"}";
@@ -1922,74 +1637,6 @@ static bool FileExists(const std::string& p) {
     return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
-// Compute robust scene bounds (5th–95th percentile per axis) and set the
-// display rig pose + vHeight to frame the model. Display orientation is
-// kept identity (forward = world −Z): a model's canonical front is its
-// authored +Z, which glTF places facing the viewer; the user can rotate
-// with mouse drag from a predictable starting pose.
-static void ApplyAutoFitForLoadedScene() {
-    UpdateAnimButton();        // show/hide + label the clip button for the new model
-    UpdateMcpAnimationTools(); // (un)register the agent animation tools (#22)
-    float center[3], extent[3];
-    // Robust AABB (5th–95th percentile per axis): center for the rig position,
-    // extent[1] for the height fit. Percentile trim rejects stray outlier
-    // vertices that would otherwise inflate the frame.
-    if (g_modelRenderer.getRobustSceneBounds(0.05f, 0.95f, center, extent)) {
-        g_fitCenter[0] = center[0];
-        g_fitCenter[1] = center[1];
-        g_fitCenter[2] = center[2];
-        float vh = extent[1] * kAutoFitVerticalComfort;
-        if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
-        g_fitVHeight = vh;
-
-        // glTF models are authored front-facing (+Z toward the viewer), so a
-        // yaw scan isn't needed — start at yaw=0 and let the user rotate.
-        g_fitYaw = 0.0f;
-
-        g_fitValid = true;
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
-                 center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
-    } else {
-        g_fitValid = false;
-    }
-
-    g_input.cameraPosX = g_fitValid ? g_fitCenter[0] : 0.0f;
-    g_input.cameraPosY = g_fitValid ? g_fitCenter[1] : 0.0f;
-    g_input.cameraPosZ = g_fitValid ? g_fitCenter[2] : 0.0f;
-    g_input.yaw = g_fitValid ? g_fitYaw : 0.0f;
-    g_input.pitch = 0.0f;
-    g_input.viewParams.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kDefaultVirtualDisplayHeightM;
-    g_input.viewParams.scaleFactor = 1.0f;
-    // Treat scene load as a fresh user interaction so the auto-orbit idle
-    // timer restarts. Without this, an asset loaded after the 10s idle
-    // threshold starts rotating immediately on first display.
-    MarkUserInput(g_input);
-
-    // glTF uses a +Y-up, right-handed coordinate system natively.
-    // ModelRenderer::updateUniforms negates the Y row of proj_mat to match the
-    // +Y-up convention. No runtime view-stage flips needed.
-}
-
-static void TryAutoLoadBundledScene() {
-    std::string dir = ExeDir();
-    if (dir.empty()) return;
-    std::string path = dir + "/sample.glb";
-    if (!FileExists(path)) {
-        LOG_INFO("No bundled model at %s (skipping auto-load)", path.c_str());
-        return;
-    }
-    if (!model_validate_file(path)) return;
-    LOG_INFO("Auto-loading bundled model: %s", path.c_str());
-    if (g_modelRenderer.loadModel(path.c_str())) {
-        g_loadedFileName = model_basename(path);
-        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), model_filesize_str(path).c_str());
-        ApplyAutoFitForLoadedScene();
-    } else {
-        LOG_WARN("Auto-load failed for %s", path.c_str());
-    }
-}
-
 // ============================================================================
 // Main
 // ============================================================================
@@ -2086,11 +1733,18 @@ int main() {
       xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
           (XrSwapchainImageBaseHeader*)swapchainImages.data()); }
 
-    // Initialize model renderer
+    // Initialize the tile renderer + cesium engine. Keyless (no API key) is a
+    // supported state: the app stays up on the placeholder and the attribution
+    // strip explains how to supply a key (PRD §7.4).
     { uint32_t rw = xr.swapchain.width;   // Full width — mono uses entire swapchain
       uint32_t rh = xr.swapchain.height;
-      if (!g_modelRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex, rw, rh))
-          LOG_WARN("model renderer init failed");
+      if (!g_tileRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex, rw, rh)) {
+          LOG_WARN("tile renderer init failed");
+      } else {
+          g_tilesActive = g_tileEngine.init(&g_tileRenderer);
+          if (!g_tilesActive)
+              LOG_WARN("No Google Map Tiles API key — set GOOGLE_MAPS_API_KEY or put key=... in earthview.ini");
+      }
     }
 
     // Command pool for placeholder rendering
@@ -2114,13 +1768,14 @@ int main() {
     // Reflect initial state in top-bar buttons.
     UpdateTopBarButtonTitles(xr);
 
-    // Try loading the bundled sample.glb model (copied next to the exe by CMake).
-    TryAutoLoadBundledScene();
+    // Frame the default bookmark (Paris / Eiffel Tower).
+    g_geoNav.frameBookmark(0);
+    UpdateBookmarkButton();
 
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: WASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom  DblClick=Focus");
-    LOG_INFO("          -/= Depth  Space=Reset  M=Auto-Orbit  V=Mode");
-    LOG_INFO("          L/Open=Load  Tab=HUD  ESC=Quit  (.glb/.gltf also accept drag-and-drop)");
+    LOG_INFO("Controls: WASD=Pan  E/Q=Climb  LMB-drag=Look  Scroll=Dolly  DblClick=Orbit-acquire");
+    LOG_INFO("          B=City  Esc/Space=Release/Reset  -/= Depth  M=Auto-Orbit  V=Mode");
+    LOG_INFO("          I=Capture  T=EyeTracking  Tab=HUD  ESC=Quit");
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -2133,25 +1788,6 @@ int main() {
         g_frameCount++;
         g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
 
-        // Handle load request (from L key or Open button)
-        if (g_input.loadRequested) {
-            g_input.loadRequested = false;
-            OpenLoadDialog();
-        }
-
-        // Handle drag-and-drop load
-        if (!g_input.pendingLoadPath.empty()) {
-            std::string p = g_input.pendingLoadPath;
-            g_input.pendingLoadPath.clear();
-            if (model_validate_file(p)) {
-                LOG_INFO("Loading dropped model: %s", p.c_str());
-                if (g_modelRenderer.loadModel(p.c_str())) {
-                    g_loadedFileName = model_basename(p);
-                    ApplyAutoFitForLoadedScene();
-                }
-            }
-        }
-
         // Handle Auto-Orbit toggle (M key or button)
         if (g_input.animateToggleRequested) {
             g_input.animateToggleRequested = false;
@@ -2160,16 +1796,9 @@ int main() {
             UpdateTopBarButtonTitles(xr);
         }
 
-        UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
-        // Clip playback (N=next, K=play/pause), applied before the per-frame
-        // advance so this frame reflects it.
-        if (g_input.cycleClipRequested || g_input.playPauseRequested) {
-            if (g_input.cycleClipRequested) { g_input.cycleClipRequested = false; g_modelRenderer.cycleAnimation(); }
-            if (g_input.playPauseRequested) { g_input.playPauseRequested = false; g_modelRenderer.togglePaused(); }
-            UpdateAnimButton();   // refresh label (clip name ↔ "Paused")
-        }
-        // Advance node/TRS animation once per frame (no-op for static models).
-        g_modelRenderer.updateAnimation(deltaTime);
+        const bool hadBookmarkCycle = g_input.cycleBookmarkRequested;
+        UpdateGeoNav(g_input, deltaTime);
+        if (hadBookmarkCycle) UpdateBookmarkButton();
 
         // Handle rendering mode change (V=cycle, 0-3=direct, Mode button, or the
         // startup default-mode request). Held until the session is running so the
@@ -2214,7 +1843,7 @@ int main() {
 
                     // Clean +Y-up world camera pose (no Y negation — the ModelRenderer
                     // now flips Vulkan-Y via a negative viewport, not a view/world
-                    // reflection; see model_renderer.cpp).
+                    // reflection; see tile_renderer.cpp).
                     XrPosef cameraPose;
                     quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
                     cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
@@ -2358,74 +1987,105 @@ int main() {
                         // physical mouse location on the display surface, pick nearest surface,
                         // then smoothly move & re-orient the virtual display to face back
                         // along the ray.
+                        // Double-click: defer the orbit-acquire pick until eye 0
+                        // has rendered (depth-readback unproject, PRD §6.1 diorama).
                         if (g_input.teleportRequested && useRig) {
                             g_input.teleportRequested = false;
                             NSSize viewSize = [[g_window contentView] bounds].size;
-                            float ndcX = 2.0f * g_input.teleportMouseX / (float)viewSize.width - 1.0f;
-                            // Cocoa locationInWindow has y=0 at the BOTTOM of the window.
-                            // OpenGL/+Y-up NDC also has y=-1 at the bottom, so this maps
-                            // directly with no negation. (The Windows demo negates because
-                            // Win32 mouse y=0 is at the TOP.)
-                            float ndcY = 2.0f * g_input.teleportMouseY / (float)viewSize.height - 1.0f;
-
-                            // Center-eye pick view reconstructed from the render-ready rig
-                            // views: average the active eye poses + fovs into a symmetric
-                            // center frustum in the clean +Y-up world frame the model lives in
-                            // (no Y flip — the pick ray must match the world, not the Vulkan
-                            // raster). GL projection (no [0,1] remap) since the ray is a full
-                            // line.
-                            XrVector3f cpos = {0, 0, 0};
-                            XrFovf cfov = {0, 0, 0, 0};
-                            for (int e = 0; e < eyeCount; e++) {
-                                cpos.x += eyeViews[e].eye_world.x;
-                                cpos.y += eyeViews[e].eye_world.y;
-                                cpos.z += eyeViews[e].eye_world.z;
-                                cfov.angleLeft  += eyeViews[e].fov.angleLeft;
-                                cfov.angleRight += eyeViews[e].fov.angleRight;
-                                cfov.angleUp    += eyeViews[e].fov.angleUp;
-                                cfov.angleDown  += eyeViews[e].fov.angleDown;
-                            }
-                            float invE = 1.0f / (float)eyeCount;
-                            XrPosef cpose;
-                            cpose.position = {cpos.x * invE, cpos.y * invE, cpos.z * invE};
-                            cpose.orientation = cameraPose.orientation;
-                            cfov = {cfov.angleLeft * invE, cfov.angleRight * invE,
-                                    cfov.angleUp * invE, cfov.angleDown * invE};
-                            float ez = RigLocalEyeZ(cameraPose, cpose.position);
-                            float pickNear = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
-                            float pickFar = ez + 1000.0f * rigVH;
-                            float pickView[16], pickProj[16];
-                            mat4_view_from_xr_pose(pickView, cpose);
-                            mat4_from_xr_fov(pickProj, cfov, pickNear, pickFar);
-
-                            XrVector3f rayOriginV, rayDirV;
-                            display3d_unproject_ndc_to_ray(ndcX, ndcY,
-                                pickView, pickProj, &rayOriginV, &rayDirV);
-
-                            float rayOrigin[3] = {rayOriginV.x, rayOriginV.y, rayOriginV.z};
-                            float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
-                            float hitPos[3];
-                            if (g_modelRenderer.pickSurface(rayOrigin, rayDir, hitPos)) {
-                                // Both endpoints stored in the clean +Y-up WORLD frame
-                                // (the same frame as g_input.cameraPosX/Y/Z and the model)
-                                // so the slerp interpolates consistently. (#396 W7: cameraPose
-                                // is no longer Y-negated — the renderer flips at the raster
-                                // stage — so this is just the world camera position.)
-                                XrPosef fromWorld;
-                                fromWorld.orientation = cameraPose.orientation;
-                                fromWorld.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
-                                XrPosef target;
-                                target.position = {hitPos[0], hitPos[1], hitPos[2]};
-                                target.orientation = cameraPose.orientation;
-                                g_input.transitionFrom = fromWorld;
-                                g_input.transitionTo = target;
-                                g_input.transitionT = 0.0f;
-                                g_input.transitioning = true;
-                                LOG_INFO("Focus on surface (%.3f, %.3f, %.3f)",
-                                    hitPos[0], hitPos[1], hitPos[2]);
-                            }
+                            g_pickNdcX = 2.0f * g_input.teleportMouseX / (float)viewSize.width - 1.0f;
+                            // Cocoa locationInWindow has y=0 at the BOTTOM of the window,
+                            // matching +Y-up NDC directly (no negation).
+                            g_pickNdcY = 2.0f * g_input.teleportMouseY / (float)viewSize.height - 1.0f;
+                            g_pendingPick = true;
                         } else if (g_input.teleportRequested) {
                             g_input.teleportRequested = false; // consume without Kooima
+                        }
+
+                        // --- Tile streaming update (once per frame, PRD §6.2) ---
+                        // Center-eye selection camera: ONE updateView with the
+                        // geo camera + a single view tile's resolution + the
+                        // union FOV across eyes; both eyes draw the same set.
+                        // The world mapping (g_xrFromEcef) is double; the draw
+                        // list carries per-tile float matrices (RTC, M0 fact 5).
+                        if (g_tilesActive && useRig && eyeCount > 0) {
+                            glm::dvec3 viewerPos(0.0);
+                            XrFovf ufov = eyeViews[0].fov;
+                            for (int e = 0; e < eyeCount; e++) {
+                                viewerPos += glm::dvec3(eyeViews[e].eye_world.x,
+                                                        eyeViews[e].eye_world.y,
+                                                        eyeViews[e].eye_world.z);
+                                ufov.angleLeft = std::min(ufov.angleLeft, eyeViews[e].fov.angleLeft);
+                                ufov.angleRight = std::max(ufov.angleRight, eyeViews[e].fov.angleRight);
+                                ufov.angleDown = std::min(ufov.angleDown, eyeViews[e].fov.angleDown);
+                                ufov.angleUp = std::max(ufov.angleUp, eyeViews[e].fov.angleUp);
+                            }
+                            viewerPos /= (double)eyeCount;
+
+                            // The rig frustums are OFF-AXIS (Kooima): a
+                            // symmetric selection frustum around cam.dir
+                            // misses tiles on the fat side (seen as unloaded
+                            // bottom-of-window). Tilt the selection direction
+                            // to the frustum center and cover the full
+                            // angular extent, with margin.
+                            // Base selection camera per view model: the geo
+                            // camera (camera-centric) or a synthetic camera
+                            // matching the diorama footprint (orbit-acquired).
+                            geo::GeoCamera selCam = g_geoNav.orbitAcquired
+                                ? geo::dioramaSelectionCamera(
+                                      g_geoNav.orbitCenter, g_geoNav.dioramaScale,
+                                      g_geoNav.dioramaYaw, g_geoNav.dioramaTilt, viewerPos)
+                                : g_geoNav.cam;
+                            g_viewerPosXr = viewerPos;
+                            {
+                                double cx = 0.5 * (double)(ufov.angleRight + ufov.angleLeft);
+                                double cy = 0.5 * (double)(ufov.angleUp + ufov.angleDown);
+                                glm::dvec3 r = glm::normalize(glm::cross(selCam.dir, selCam.up));
+                                glm::dvec3 u = glm::normalize(glm::cross(r, selCam.dir));
+                                glm::dmat4 yawR = glm::rotate(glm::dmat4(1.0), -cx, u);
+                                glm::dmat4 pitR = glm::rotate(glm::dmat4(1.0), cy, r);
+                                selCam.dir = glm::normalize(
+                                    glm::dvec3(pitR * yawR * glm::dvec4(selCam.dir, 0.0)));
+                            }
+                            double hfov = (double)(ufov.angleRight - ufov.angleLeft) * 1.15;
+                            double vfov = (double)(ufov.angleUp - ufov.angleDown) * 1.15;
+
+                            if (g_geoNav.orbitAcquired) {
+                                // Display-centric diorama around the acquired
+                                // center; the center glides to the display
+                                // origin after a double-click (exp filter).
+                                g_dioramaCenterXr *= std::exp(-(double)deltaTime / kDioramaGlideTau);
+                                g_xrFromEcef = geo::xrFromEcefDiorama(
+                                    g_geoNav.orbitCenter, g_dioramaCenterXr,
+                                    g_geoNav.dioramaScale, g_geoNav.dioramaYaw,
+                                    g_geoNav.dioramaTilt);
+                            } else {
+                                // Camera-centric: viewer flies the full-scale world;
+                                // stereo scale follows the target distance so the
+                                // content of interest sits at the display plane.
+                                double zdp = std::max((double)viewerPos.z, 0.1);
+                                double s = geo::stereoScaleForDistance(g_geoNav.targetDist, zdp);
+                                g_xrFromEcef = geo::xrFromEcefCamera(g_geoNav.cam, viewerPos, s);
+                            }
+
+                            const auto& tiles = g_tileEngine.update(
+                                selCam, (double)renderW, (double)renderH, hfov, vfov);
+                            g_drawList = g_tileRenderer.buildDrawList(tiles, g_xrFromEcef);
+
+                            // Streaming diagnostics every ~2 s: drawn vs
+                            // selected-but-unprepared (persistent skips =
+                            // upload starvation = visible holes).
+                            if (g_frameCount % 120 == 0) {
+                                LOG_INFO("tiles: drawn=%zu skipped_staging=%d live=%d gpu=%.0fMB "
+                                         "fov=%.0fx%.0fdeg dist=%.0fm",
+                                         g_drawList.size(),
+                                         g_tileRenderer.lastStagingSkipped(),
+                                         g_tileRenderer.liveTileCount(),
+                                         g_tileRenderer.gpuResidentMB(),
+                                         hfov * 57.2958, vfov * 57.2958,
+                                         g_geoNav.targetDist);
+                            }
+                        } else {
+                            g_drawList.clear();
                         }
 
                         rendered = true;
@@ -2468,14 +2128,50 @@ int main() {
                             VkImage targetImage = swapchainImages[imageIndex].image;
                             VkFormat swapFormat = (VkFormat)xr.swapchain.format;
 
-                            if (g_modelRenderer.hasModel()) {
+                            if (g_tilesActive) {
                                 for (int eye = 0; eye < eyeCount; eye++) {
-                                    g_modelRenderer.renderEye(
+                                    g_tileRenderer.renderEye(
                                         targetImage, swapFormat,
                                         xr.swapchain.width, xr.swapchain.height,
                                         tileOffsets[eye].first, tileOffsets[eye].second,
                                         renderW, renderH,
-                                        viewMat[eye].data(), projMat[eye].data());
+                                        viewMat[eye].data(), projMat[eye].data(),
+                                        g_drawList);
+
+                                    // Deferred double-click pick: eye 0's depth is
+                                    // current — read the clicked texel, unproject
+                                    // through the double inverse MVP, map XR->ECEF,
+                                    // acquire as the diorama orbit center.
+                                    if (eye == 0 && g_pendingPick) {
+                                        g_pendingPick = false;
+                                        // Negative-height viewport: ndcY=+1 -> row 0.
+                                        uint32_t px = (uint32_t)std::min(std::max(
+                                            (g_pickNdcX + 1.0f) * 0.5f * (float)renderW, 0.0f),
+                                            (float)(renderW - 1));
+                                        uint32_t py = (uint32_t)std::min(std::max(
+                                            (1.0f - g_pickNdcY) * 0.5f * (float)renderH, 0.0f),
+                                            (float)(renderH - 1));
+                                        float d = g_tileRenderer.readDepth(px, py);
+                                        if (d < 1.0f && !g_drawList.empty()) {
+                                            glm::dmat4 V = glm::dmat4(glm::make_mat4(viewMat[0].data()));
+                                            glm::dmat4 P = glm::dmat4(glm::make_mat4(projMat[0].data()));
+                                            glm::dvec4 clip((double)g_pickNdcX, (double)g_pickNdcY,
+                                                            (double)d, 1.0);
+                                            glm::dvec4 w = glm::inverse(P * V) * clip;
+                                            if (std::abs(w.w) > 1e-12) {
+                                                glm::dvec3 xrPos = glm::dvec3(w) / w.w;
+                                                glm::dvec3 ecef = glm::dvec3(
+                                                    glm::inverse(g_xrFromEcef) * glm::dvec4(xrPos, 1.0));
+                                                g_geoNav.acquireOrbit(
+                                                    ecef, std::max(g_viewerPosXr.z, 0.1));
+                                                g_dioramaCenterXr = xrPos; // glide from here
+                                                LOG_INFO("Orbit acquired (diorama): ECEF (%.1f, %.1f, %.1f)",
+                                                         ecef.x, ecef.y, ecef.z);
+                                            }
+                                        } else {
+                                            LOG_INFO("Pick missed (sky) — staying camera-centric");
+                                        }
+                                    }
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
@@ -2489,23 +2185,29 @@ int main() {
                             // the readback — no app-side staging texture. Skipped
                             // for mono (1×1). The prefix has no ".png"; the runtime
                             // appends "_atlas.png".
+                            // DXR_AUTOCAP=N: fire one atlas capture at frame N
+                            // (autonomous verification — no keyboard needed).
+                            static long autocapFrame =
+                                getenv("DXR_AUTOCAP") ? atol(getenv("DXR_AUTOCAP")) : 0;
+                            if (autocapFrame > 0 && (long)g_frameCount == autocapFrame) {
+                                g_input.captureAtlasRequested = true;
+                            }
                             if (g_input.captureAtlasRequested) {
                                 g_input.captureAtlasRequested = false;
                                 uint32_t cols = tileColumns > 0 ? tileColumns : 1u;
                                 uint32_t rows = tileRows > 0 ? tileRows : 1u;
-                                if (!g_modelRenderer.hasModel()) {
-                                    LOG_WARN("Capture skipped: no model loaded");
+                                if (!g_tilesActive) {
+                                    LOG_WARN("Capture skipped: tiles inactive (no API key)");
                                 } else if (cols <= 1 && rows <= 1) {
                                     LOG_WARN("Capture skipped: mono (1×1) layout");
                                 } else if (xr.pfnCaptureAtlasEXT &&
                                            xr.session != XR_NULL_HANDLE) {
-                                    // Strip extension from model filename
-                                    // (e.g. "sample.glb" → "sample").
-                                    auto dot = g_loadedFileName.find_last_of('.');
-                                    std::string stem = (dot == std::string::npos)
-                                        ? g_loadedFileName
-                                        : g_loadedFileName.substr(0, dot);
-                                    if (stem.empty()) stem = "scene";
+                                    // Stem = active bookmark, lowercased.
+                                    size_t bmCount = 0;
+                                    const geo::Bookmark* bm = geo::bookmarks(&bmCount);
+                                    std::string stem = bm[g_geoNav.bookmarkIndex].name;
+                                    for (auto& c : stem) c = (char)tolower((unsigned char)c);
+                                    for (auto& c : stem) if (c == ' ') c = '_';
                                     std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                                         stem, cols, rows);
                                     XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
@@ -2549,16 +2251,44 @@ int main() {
             usleep(100000);
         }
 
-        // Update HUD
+        // Update HUD + attribution strip (~2 Hz)
         g_hudUpdateTimer += deltaTime;
         if (g_hudUpdateTimer >= 0.5f) {
             g_hudUpdateTimer = 0.0f;
             @autoreleasepool {
+                if (g_attributionText != nil) {
+                    if (g_tilesActive) {
+                        const AttributionInfo& attr = g_tileEngine.attribution();
+                        std::string line;
+                        for (const auto& c : attr.credits) {
+                            if (!line.empty()) line += " · ";
+                            line += c;
+                        }
+                        if (line.empty()) line = "Google";
+                        char tail[96];
+                        snprintf(tail, sizeof(tail), "   —  %d tiles in flight / %.0f MB",
+                                 attr.tilesInFlight, g_tileRenderer.gpuResidentMB());
+                        line += tail;
+                        [g_attributionText setStringValue:
+                            [NSString stringWithUTF8String:line.c_str()]];
+                    } else {
+                        [g_attributionText setStringValue:
+                            @"EarthView needs a Google Map Tiles API key — set "
+                             "GOOGLE_MAPS_API_KEY or put key=... in earthview.ini, then relaunch."];
+                    }
+                }
                 if (g_input.hudVisible && g_hudView != nil) {
                     double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
-                    NSString *sceneInfo = g_modelRenderer.hasModel()
-                        ? [NSString stringWithFormat:@"Model: %s", g_loadedFileName.c_str()]
-                        : @"No model loaded (press L)";
+                    size_t bmCount = 0;
+                    const geo::Bookmark* bm = geo::bookmarks(&bmCount);
+                    NSString *sceneInfo = g_tilesActive
+                        ? [NSString stringWithFormat:@"City: %s%s  Tiles: %d  GPU: %.0f MB  Dist: %.0f m",
+                            bm[g_geoNav.bookmarkIndex].name,
+                            g_geoNav.orbitAcquired ? " (diorama)" : "",
+                            g_tileRenderer.liveTileCount(),
+                            g_tileRenderer.gpuResidentMB(),
+                            g_geoNav.targetDist]
+                        : @"No API key (GOOGLE_MAPS_API_KEY or earthview.ini)";
 
                     int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
                     const char *orbitLabel = g_input.animateEnabled
@@ -2581,9 +2311,9 @@ int main() {
                         "Display: %.3f x %.3f m\n"
                         "%@"
                         "Vdisplay: (%.2f, %.2f, %.2f)\n"
-                        "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
-                        "DblClick=Focus  -/= Depth  Space=Reset  N=Clip  K=Play/Pause\n"
-                        "M=Auto-Orbit  V=Mode  L=Load  Tab=HUD  ESC=Quit",
+                        "\nWASD=Pan  E/Q=Climb  LMB-drag=Look  Scroll=Dolly\n"
+                        "DblClick=Orbit  B=City  Esc/Space=Release  -/= Depth\n"
+                        "M=Auto-Orbit  V=Mode  I=Capture  Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         (xr.renderingModeCount > 0 && xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') ? xr.renderingModeNames[g_input.currentRenderingMode] : "Unknown",
                         (xr.renderingModeCount > 0 ? (xr.renderingModeDisplay3D[g_input.currentRenderingMode] ? "3D" : "2D") : "3D"),
@@ -2627,7 +2357,9 @@ int main() {
 
     LOG_INFO("=== Shutting down ===");
     g_xrForMcp = nullptr;  // session is going away; stop touching MCP tools
-    g_modelRenderer.cleanup();
+    g_drawList.clear();
+    g_tileEngine.shutdown();   // Tileset dtor free()s every tile via the renderer
+    g_tileRenderer.cleanup();  // then the renderer's own Vulkan objects
     if (cmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, cmdPool, nullptr);
     CleanupOpenXR(xr);
     // MoltenVK may throw std::system_error ("mutex lock failed") during device/instance
