@@ -26,3 +26,6 @@ docs_m0_paris.png
 # orbit-mode render artifacts (Google imagery)
 /tmp earthview_orbit
 earthview_orbit_*.png
+
+# clangd index cache
+.cache/

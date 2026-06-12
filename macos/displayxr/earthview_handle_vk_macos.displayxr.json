@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "earthview",
+  "name": "EarthView",
+  "type": "3d",
+  "category": "demo",
+  "display_mode": "auto",
+  "description": "Streaming 3D city viewer on Google Photorealistic 3D Tiles. Fly the full-scale world camera-style, or double-click to frame a neighborhood as a tabletop diorama. Requires a Google Map Tiles API key.",
+  "icon": "earthview_icon.png",
+  "icon_3d": "earthview_icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}
