@@ -291,6 +291,28 @@ M0 is deliberately tiny because it retires the only existential risk
    (upper P3DT tiles are external-tileset pointers). Wait until
    `tilesToRenderThisFrame` contains tiles with `isRenderContent()`.
 
+### M0 follow-up tests (RTC precision + moving camera) — both PASS
+
+Run via `earthview_m0` (static + RTC/diorama report) and `earthview_m0 orbit`
+(3× revolution churn + memory).
+
+6. **Float32 RTC is safe at city scale — the §6.1 risk is retired.** Projecting
+   each vertex via full-double vs the M1 GPU path (subtract anchor in double →
+   cast remainder to `float32` → multiply by a `float32` anchor-relative MVP)
+   diverges by **max 0.0009 px** over 8.5k samples (threshold 0.5). So M1 can
+   upload anchor-relative float positions + a float anchor-folded MVP with no
+   jitter. Anchor = camera target; rebuild the relative MVP per frame in double,
+   cast once.
+7. **Diorama scale sanity:** at 1:3000 the loaded Paris extent
+   (~5.1×8.0×4.5 km) maps to ~**1.7×2.7×1.5 m**. That's the *full loaded set*;
+   M1 will crop to a framed neighborhood and/or use a deeper ratio (~1:8000) to
+   fit a ~0.3 m display depth budget. Knob, not blocker.
+8. **No leak under continuous navigation.** Orbiting Paris for 3 revolutions
+   (36 frames) churns 55–72 render tiles/frame with no crash; RSS climbs during
+   rev 1 as the cache fills, then **plateaus exactly at 517 MB** and stays flat
+   while revisiting viewpoints (0.0 MB growth). cesium's cache is self-capping —
+   M1 can tune the cap via `TilesetOptions` for the NP02J budget (M3).
+
 ---
 
 ## 10. Risks
