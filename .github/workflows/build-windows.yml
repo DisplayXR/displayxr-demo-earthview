@@ -1,0 +1,235 @@
+name: Build Windows
+
+# Windows installer build for the EarthView demo (M2). Mirrors
+# displayxr-demo-modelviewer's build-windows.yml, plus the cesium-native clone
+# from this repo's build-macos.yml. On a v* tag this workflow builds
+# DisplayXREarthViewSetup-<version>.exe and attaches it to the GitHub Release.
+# workflow_dispatch lets the build be exercised without cutting a tag.
+#
+# PR + push-to-main runs are validation only: they compile the app + installer
+# to catch breakage before a release; the release-attach step stays gated on a
+# v* ref.
+#
+# IMPORTANT — versions.json bump ownership: build-macos.yml owns the
+# `earthview_demo` DispatchVersionsBump (EarthView shipped macOS-first at M1).
+# This Windows workflow deliberately does NOT dispatch a bump, so a v* tag fires
+# the bump exactly once. If EarthView ever drops the macOS leg, move the
+# DispatchVersionsBump job here.
+#
+# The DetectChanges job + docs_only step gating let this workflow be a required
+# status check (reports success in ~30s on doc-only PRs, skipping the heavy
+# build) without blocking doc PRs.
+
+on:
+  pull_request: {}
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          # First push to a new repo/branch: before is all-zeros (no parent) →
+          # there's nothing to diff, so build (not docs-only).
+          if [ "$BASE" = "0000000000000000000000000000000000000000" ] || \
+             ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  BuildInstaller:
+    name: Build Windows
+    needs: DetectChanges
+    runs-on: windows-2022
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Doc-only PR — skipping heavy build steps
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "docs_only=true; build steps will skip and report success."
+
+      # cesium-native is consumed via add_subdirectory(third_party/cesium-native)
+      # and bootstraps its own deps through ezvcpkg on first configure (~11 min
+      # cold). Mirrors build-macos.yml's clone step.
+      - name: Clone cesium-native (v0.61.0)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          git clone --branch v0.61.0 --depth 1 --recurse-submodules `
+            https://github.com/CesiumGS/cesium-native.git third_party/cesium-native
+
+      - name: Install Vulkan SDK
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.283.0
+          cache: true
+
+      - if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Add Vulkan SDK tools to PATH
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: '"$env:VULKAN_SDK\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
+
+      - name: Install OpenXR loader
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          # The demo links the OpenXR loader. Mirror the runtime repo: grab the
+          # prebuilt Khronos loader and point CMake at it via OpenXR_ROOT.
+          $openxrVersion = "1.1.43"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
+      - name: Derive installer version
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: version
+        shell: pwsh
+        run: |
+          # `v1.2.3` -> `1.2.3` for the installer version + filename. Untagged
+          # builds use a numeric placeholder so the NSIS VIProductVersion stays
+          # valid; they never publish a release.
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF -replace '^refs/tags/v',''
+          } else {
+            $version = "0.0.0"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Building installer with VERSION=$version"
+
+      - name: Build demo
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Stage OpenXR loader next to demo binary
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          # An OpenXR app must ship its own openxr_loader.dll next to the exe.
+          # CMake POST_BUILD already attempts this, but guarantee it here so the
+          # installer's File "${BIN_DIR}\openxr_loader.dll" can't silently miss.
+          #
+          # The Khronos zip ships THREE loaders — x64, Win32 (x86), AND arm64.
+          # Select x64 explicitly: a naive recursive first-match can grab arm64
+          # (it sorts first), which the x64 demo exe then fails to load with a
+          # "bad image" error at startup (exit 0xC000007B).
+          $dll = Get-ChildItem -Path openxr_sdk -Recurse -Filter openxr_loader.dll |
+                 Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          if (-not $dll) { Write-Host "::error::x64 openxr_loader.dll not found under openxr_sdk"; exit 1 }
+          # Defense in depth: verify the PE machine is actually x64 (0x8664).
+          $bytes = [System.IO.File]::ReadAllBytes($dll.FullName)
+          $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
+          if ($machine -ne 0x8664) { Write-Host ("::error::staged openxr_loader.dll is not x64 (PE machine=0x{0:X})" -f $machine); exit 1 }
+          New-Item -ItemType Directory -Force build\windows | Out-Null
+          Copy-Item $dll.FullName build\windows\openxr_loader.dll -Force
+          Write-Host "Staged x64 $($dll.FullName) -> build\windows\openxr_loader.dll"
+
+      - name: Build installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: cmd
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: call installer\windows\build-installer.bat
+
+      - name: Assert installer payload (regression guards)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem installer\windows\DisplayXREarthViewSetup-*.exe | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::installer .exe not produced"; exit 1 }
+          Write-Host "Installer: $($exe.FullName)"
+          # NSIS payloads are listable by 7-Zip (preinstalled on the runner).
+          $listing = & 7z l "$($exe.FullName)" 2>&1 | Out-String
+
+          # SimulatedRealityVulkanBeta.dll is a Leia SDK binary owned by the
+          # Leia plug-in — it must never appear in this vendor-neutral demo.
+          if ($listing -match 'SimulatedReality') {
+            Write-Host "::error::installer bundles a SimulatedReality* DLL — that's a Leia plug-in concern, not demo content."
+            exit 1
+          }
+          Write-Host "PASS: installer contains no SimulatedReality* binary."
+
+          # The demo must ship the OpenXR loader next to its exe.
+          if ($listing -notmatch 'openxr_loader\.dll') {
+            Write-Host "::error::installer is missing openxr_loader.dll — OpenXR apps must bundle the loader."
+            exit 1
+          }
+          Write-Host "PASS: installer bundles openxr_loader.dll."
+
+          # SECURITY (docs/api-key.md): the installer must NEVER stage a Google
+          # Map Tiles API key. No earthview.ini / *.key in the payload.
+          if ($listing -match '(?i)earthview\.ini' -or $listing -match '(?i)\.key\b') {
+            Write-Host "::error::installer payload contains a key/ini file — the API key must be user-supplied, never bundled."
+            exit 1
+          }
+          Write-Host "PASS: installer carries no API-key file."
+
+          # The Google attribution logo is a policy asset and must ship.
+          if ($listing -notmatch 'google_logo\.png') {
+            Write-Host "::error::installer is missing google_logo.png — Map Tiles API attribution is mandatory."
+            exit 1
+          }
+          Write-Host "PASS: installer bundles google_logo.png."
+
+      - name: Upload installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: DisplayXREarthView-Windows
+          if-no-files-found: error
+          path: installer/windows/DisplayXREarthViewSetup-*.exe
+
+      - name: Attach installer to GitHub release on tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/windows/DisplayXREarthViewSetup-*.exe
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

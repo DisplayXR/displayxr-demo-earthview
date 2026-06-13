@@ -3,8 +3,8 @@
 #
 # Top-level CMakeLists.txt for the displayxr-demo-earthview standalone repo.
 # Orchestrates the shared `common` and `tiles_common` libraries plus the
-# cesium-native streaming engine, then dispatches to macos/ for the
-# platform-specific executable. (windows/ is M2, android/ is M3.)
+# cesium-native streaming engine, then dispatches to macos/ or windows/ for
+# the platform-specific executable. (android/ is M3.)
 #
 # The headless M0 spike (spike/) is a standalone project and is deliberately
 # NOT added here — build it from spike/ directly (see spike/CMakeLists.txt).
@@ -33,6 +33,8 @@ add_subdirectory(tiles_common)
 # Platform-specific executable.
 if(APPLE)
     add_subdirectory(macos)
+elseif(WIN32)
+    add_subdirectory(windows)
 else()
-    message(FATAL_ERROR "displayxr-demo-earthview M1 supports macOS only (Windows = M2, Android = M3).")
+    message(FATAL_ERROR "displayxr-demo-earthview supports macOS and Windows only (Android = M3).")
 endif()
