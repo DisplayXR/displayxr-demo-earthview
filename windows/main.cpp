@@ -20,6 +20,7 @@
 #include <commdlg.h>
 #include <shlwapi.h>
 #include <shlobj.h>
+#include <shellapi.h>   // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it from windows.h)
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -286,6 +287,15 @@ static float g_dollySteps = 0.0f;                // scroll steps (exponential zo
 static bool  g_cycleBookmarkRequested = false;   // 'B'
 static bool  g_releaseOrbitRequested = false;    // Esc / Space (release acquired orbit)
 static bool  g_releaseToFlyRequested = false;    // 'C': orbit -> fly, continuous
+
+// API-key entry (mirrors the macOS card; see docs/api-key.md). The modal Win32
+// dialog runs on the UI thread; on a validated Save it persists the key +
+// _putenv_s and sets this flag, which the RENDER thread consumes to late-init
+// the engine (cesium's prepareInMainThread/free must stay on the updateView
+// thread). Shown via WM_APP_SHOWKEY (Ctrl+K or first-run keyless).
+static std::atomic<bool> g_keySubmitRequested{false};
+#define WM_APP_SHOWKEY (WM_APP + 1)
+
 // Left-drag origin tracking (Win32 has no Cocoa-style per-event deltaX).
 static int   g_lastDragX = 0, g_lastDragY = 0;
 static bool  g_dragValid = false;
@@ -474,6 +484,143 @@ static bool IsClickOnCityButton(int mouseX, int mouseY, int windowW, int windowH
 // resolved inside TileEngine::init() (GOOGLE_MAPS_API_KEY env or earthview.ini);
 // keyless is a supported state (placeholder + how-to HUD card).
 
+// ===========================================================================
+// API-key entry dialog (Win32) — mirrors the macOS card (docs/api-key.md).
+// A small modal top-level window with an edit box + 4 buttons. Save validates
+// the key against Google (TileEngine::probeKey — independent of the live
+// engine, safe to call off the render thread) BEFORE persisting (app-support
+// config, mode is N/A on Windows) + _putenv_s; the render thread then
+// late-inits. Remove deletes the saved key ("clean box after use").
+// ===========================================================================
+namespace {
+HWND g_dlgEdit = nullptr;
+HWND g_dlgStatus = nullptr;
+bool g_dlgSaved = false;
+bool g_dlgDone = false;
+
+// API keys are ASCII — narrow the edit text directly.
+static std::string DlgGetKey() {
+    wchar_t buf[512] = {0};
+    GetWindowTextW(g_dlgEdit, buf, 511);
+    std::string s;
+    for (wchar_t *p = buf; *p; ++p) s.push_back((char)(*p & 0x7f));
+    size_t a = s.find_first_not_of(" \t\r\n");
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
+}
+
+LRESULT CALLBACK KeyDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case 1: { // Save & Start
+            std::string key = DlgGetKey();
+            SetWindowTextW(g_dlgStatus, L"Checking your key with Google…");
+            UpdateWindow(g_dlgStatus);
+            std::string err;
+            if (g_tileEngine.probeKey(key, err)) {
+                earthviewSaveApiKey(key);
+                _putenv_s("GOOGLE_MAPS_API_KEY", key.c_str());
+                g_dlgSaved = true;
+                g_dlgDone = true;
+                DestroyWindow(h);
+            } else {
+                std::wstring werr(err.begin(), err.end());
+                SetWindowTextW(g_dlgStatus, werr.c_str());
+            }
+            return 0;
+        }
+        case 2: // Get a Key…
+            ShellExecuteW(nullptr, L"open",
+                L"https://console.cloud.google.com/google/maps-apis/api-list",
+                nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
+        case 3: // Remove key
+            earthviewClearApiKey();
+            SetWindowTextW(g_dlgEdit, L"");
+            SetWindowTextW(g_dlgStatus,
+                L"Saved key removed — it won't persist to the next launch.");
+            SetFocus(g_dlgEdit);
+            return 0;
+        case 4: // Close
+            g_dlgDone = true;
+            DestroyWindow(h);
+            return 0;
+        }
+        return 0;
+    case WM_CLOSE:
+        g_dlgDone = true;
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+} // namespace
+
+// Show the modal key dialog. Returns true if a validated key was saved (the
+// caller sets g_keySubmitRequested so the render thread re-inits). Runs a local
+// message loop; the render thread keeps drawing the placeholder meanwhile.
+static bool ShowApiKeyDialog(HWND parent) {
+    static bool registered = false;
+    HINSTANCE hi = GetModuleHandle(nullptr);
+    if (!registered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = KeyDlgProc;
+        wc.hInstance = hi;
+        wc.lpszClassName = L"EarthViewKeyDlg";
+        wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassW(&wc);
+        registered = true;
+    }
+    g_dlgSaved = false;
+    g_dlgDone = false;
+
+    const int W = 470, H = 250;
+    RECT pr;
+    GetWindowRect(parent ? parent : GetDesktopWindow(), &pr);
+    int x = pr.left + ((pr.right - pr.left) - W) / 2;
+    int y = pr.top + ((pr.bottom - pr.top) - H) / 2;
+    HWND dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, L"EarthViewKeyDlg",
+        L"Google Map Tiles API key", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        x, y, W, H, parent, nullptr, hi, nullptr);
+    if (!dlg) return false;
+
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    auto mk = [&](const wchar_t *cls, const wchar_t *txt, DWORD style,
+                  int cx, int cy, int cw, int ch, int id) -> HWND {
+        HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
+            cx, cy, cw, ch, dlg, (HMENU)(INT_PTR)id, hi, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
+        return c;
+    };
+    mk(L"STATIC",
+       L"EarthView needs your own Google Map Tiles API key. Paste it below, or get "
+       L"one from the Google Cloud Console (enable the “Map Tiles API”).",
+       0, 16, 12, W - 40, 52, 0);
+    g_dlgEdit = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 16, 72, W - 40, 24, 100);
+    g_dlgStatus = mk(L"STATIC", L"", 0, 16, 104, W - 40, 18, 0);
+    mk(L"BUTTON", L"Get a Key…", BS_PUSHBUTTON, 16, 160, 96, 30, 2);
+    mk(L"BUTTON", L"Remove key", BS_PUSHBUTTON, 118, 160, 96, 30, 3);
+    mk(L"BUTTON", L"Close", BS_PUSHBUTTON, 220, 160, 64, 30, 4);
+    mk(L"BUTTON", L"Save && Start", BS_DEFPUSHBUTTON, W - 134, 160, 114, 30, 1);
+    SetFocus(g_dlgEdit);
+
+    if (parent) EnableWindow(parent, FALSE);
+    MSG msg;
+    while (!g_dlgDone && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    if (parent) {
+        EnableWindow(parent, TRUE);
+        SetForegroundWindow(parent);
+    }
+    return g_dlgSaved;
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -558,6 +705,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
 
+    // Open the API-key dialog (first-run keyless, or Ctrl+K). Modal; on a saved
+    // key the render thread late-inits via g_keySubmitRequested.
+    case WM_APP_SHOWKEY:
+        if (ShowApiKeyDialog(hwnd)) {
+            g_keySubmitRequested.store(true);
+        }
+        return 0;
+
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
             // ESC: first press releases an acquired orbit (back to fly), second
@@ -573,6 +728,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (wParam == VK_F11) {
             ToggleFullscreen(hwnd);
+            return 0;
+        }
+        if (wParam == 'K' && (GetKeyState(VK_CONTROL) & 0x8000)) {  // Ctrl+K: API key panel
+            PostMessage(hwnd, WM_APP_SHOWKEY, 0, 0);
             return 0;
         }
         if (wParam == 'B') {   // cycle city bookmarks (Paris default)
@@ -817,6 +976,15 @@ static void RenderThreadFunc(
             g_releaseOrbitRequested = false;
             windowW = g_windowWidth;
             windowH = g_windowHeight;
+        }
+
+        // API key just entered via the dialog (UI thread persisted it +
+        // _putenv_s'd it): late-init the engine HERE on the render thread so
+        // cesium's prepareInMainThread/free stay on the updateView thread.
+        if (g_keySubmitRequested.exchange(false)) {
+            g_tilesActive.store(g_tileEngine.init(&g_tileRenderer));
+            LOG_INFO("API key entered — engine %s",
+                     g_tilesActive.load() ? "started" : "init failed");
         }
 
         // Rendering mode requests (V/mode-button=cycle, 0-8=absolute). Single
@@ -1516,8 +1684,7 @@ static void RenderThreadFunc(
                                     sceneText += L"\nGoogle  " + wcred;
                                 } else {
                                     sceneText += L"\nNo Google Map Tiles API key.\n"
-                                                 L"Set GOOGLE_MAPS_API_KEY or put key=... in\n"
-                                                 L"earthview.ini next to the exe, then relaunch.";
+                                                 L"Enter it in the dialog, or press Ctrl+K.";
                                 }
                                 modeText += sceneText;
 
@@ -2012,8 +2179,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             LOG_WARN("tile renderer init failed - scene rendering will not be available");
         } else {
             g_tilesActive.store(g_tileEngine.init(&g_tileRenderer));
-            if (!g_tilesActive.load())
-                LOG_WARN("No Google Map Tiles API key — set GOOGLE_MAPS_API_KEY or put key=... in earthview.ini");
+            if (!g_tilesActive.load()) {
+                LOG_WARN("No Google Map Tiles API key — opening the in-app entry dialog "
+                         "(or set GOOGLE_MAPS_API_KEY / earthview.ini, or press Ctrl+K)");
+                // Queue the first-run key dialog; the main message loop (started
+                // below) shows it. Ctrl+K reopens it any time.
+                PostMessage(hwnd, WM_APP_SHOWKEY, 0, 0);
+            }
         }
     }
     // Frame the default bookmark (Paris / Eiffel Tower).
