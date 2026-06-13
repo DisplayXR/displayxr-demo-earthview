@@ -2016,6 +2016,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // EarthView takes no CLI scene path — it streams tiles. lpCmdLine is ignored.
     (void)lpCmdLine;
 
+    // EV_PROBE=<key>: validate a Map Tiles API key against Google and exit
+    // (0 = valid). Support/diagnostic tool — no window, runtime, or GPU needed.
+    // Parity with macOS main(); a GUI-subsystem exe has no stdio, so attach the
+    // parent console (if any) to surface the result, and signal via exit code
+    // (use `start /wait` or Start-Process -Wait -PassThru to read it).
+    if (const char *pk = std::getenv("EV_PROBE")) {
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            FILE *fe = nullptr; freopen_s(&fe, "CONOUT$", "w", stderr);
+        }
+        std::string err;
+        bool ok = g_tileEngine.probeKey(pk, err);
+        fprintf(stderr, "\nEV_PROBE: %s%s%s\n", ok ? "VALID" : "INVALID",
+                ok ? "" : " — ", ok ? "" : err.c_str());
+        return ok ? 0 : 1;
+    }
+
     SetUnhandledExceptionFilter(CrashHandler);
 
     if (!InitializeLogging(APP_NAME)) {
