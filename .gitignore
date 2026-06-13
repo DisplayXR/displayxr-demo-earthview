@@ -36,3 +36,6 @@ earthview_orbit_*.png
 # Build / installer staging outputs
 _artifact/
 _package/
+
+# Built installers (built by CI / build-installer.bat)
+installer/**/*.exe
