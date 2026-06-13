@@ -419,6 +419,9 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     VkPhysicalDeviceFeatures features = {};
     features.shaderInt64 = supportedFeatures2.features.shaderInt64;
     features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    // Anisotropic texture filtering for the tile renderer (oblique terrain
+    // anti-aliasing). Only enable if the device advertises it.
+    features.samplerAnisotropy = supportedFeatures2.features.samplerAnisotropy;
 
     VkPhysicalDeviceVulkan12Features features12 = {};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;

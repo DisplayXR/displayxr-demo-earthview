@@ -265,6 +265,18 @@ static glm::dvec3 g_viewerPosXr(0.0, 0.1, 0.6); // center-eye, updated per frame
 static glm::dvec3 g_dioramaCenterXr(0.0);
 static constexpr double kDioramaGlideTau = 0.35; // s
 
+// Camera-rig (fly mode) state. The runtime owns the off-axis eyes; the app
+// hands it a plain perspective camera (pose + verticalFov + convergence) and
+// eye-tracking perturbs the frustum. Convergence auto-focuses on the terrain
+// under the centre crosshair: invd = 1/(XR distance the centre ray hits the
+// ground), exponentially smoothed across frames (one-frame lag — fed from the
+// previous frame's centre depth read).
+static constexpr float kCameraVFovRad = 0.6498f;  // ~37.2° full vertical FOV (2*atan(0.3249))
+// 1/m to the convergence plane. Default = 1/kTargetXrDist (the geo target sits
+// 1 XR-m in front of the camera), refined per frame by the centre-ray depth.
+static float g_convDiopters = 1.0f;
+static constexpr double kConvSmoothTau = 0.15;    // s — exp filter time constant
+
 // Geo-navigation input deltas. The shared InputState (displayxr-common's
 // input_handler.h) can't carry EarthView-specific fields, so the geo deltas
 // live here, accumulated by the WndProc and consumed once per frame by
@@ -281,6 +293,10 @@ static bool  g_dragValid = false;
 // 'I' key: capture the multi-view atlas region via xrCaptureAtlasEXT. Skipped
 // for 1×1 (mono) layouts. Helper lives in common/atlas_capture*.
 static std::atomic<bool> g_captureAtlasRequested{false};
+// 'X' key cycles tile-renderer supersampling 1→2→4→1 for live A/B (default 1 =
+// off). Applied to g_tileRenderer each frame on the render thread. Temporary
+// dev control — to be exposed via the options panel later.
+static std::atomic<uint32_t> g_ssaa{1};
 // Ctrl+T transparent-bg toggle is inherited from the scaffold but inert for
 // EarthView (opaque streaming) — kept so the window/session transparency setup
 // stays identical to the runtime test apps.
@@ -569,6 +585,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             g_releaseToFlyRequested = true;
             MarkUserInput(g_inputState);
+            return 0;
+        }
+        if (wParam == 'X' && !(lParam & 0x40000000)) {  // initial press only (no auto-repeat)
+            // Cycle tile supersampling 1 -> 2 -> 4 -> 1 for live A/B. ('X' is
+            // free — 'S' is WASD pan-back.)
+            uint32_t n = g_ssaa.load();
+            n = (n == 1) ? 2u : (n == 2) ? 4u : 1u;
+            g_ssaa.store(n);
+            LOG_INFO("Supersampling: %ux", n);
             return 0;
         }
         // I key = capture multi-view atlas
@@ -893,36 +918,51 @@ static void RenderThreadFunc(
 
                         XrViewState viewState = {XR_TYPE_VIEW_STATE};
 
-                        // Clean +Y-up world camera pose (no Y negation — the ModelRenderer
-                        // now flips Vulkan-Y via a negative viewport, not a view/world
-                        // reflection; see model_renderer.cpp).
-                        XrPosef cameraPose;
-                        {
-                            XMVECTOR camOri = XMQuaternionRotationRollPitchYaw(
-                                inputSnapshot.pitch, inputSnapshot.yaw, 0);
-                            XMFLOAT4 cq;
-                            XMStoreFloat4(&cq, camOri);
-                            cameraPose.orientation = {cq.x, cq.y, cq.z, cq.w};
-                        }
-                        cameraPose.position = {inputSnapshot.cameraPosX,
-                            inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
+                        // EarthView rig pose is ALWAYS identity: ALL view rotation lives
+                        // in the geo world mapping (g_xrFromEcef via g_geoNav), NOT in the
+                        // rig. The shared UpdateInputState() spuriously writes
+                        // g_inputState.yaw/pitch on mouse-drag (modelviewer convention) — if
+                        // those fed cameraPose, the rotation would be applied TWICE (world +
+                        // rig) and the content would counter-rotate as you drag (the
+                        // tile-lag bug). So pin the rig pose to identity and ignore the
+                        // contaminated yaw/pitch/cameraPos entirely.
+                        XrPosef cameraPose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
                         const float rigVH = inputSnapshot.viewParams.virtualDisplayHeight
                             / inputSnapshot.viewParams.scaleFactor;
 
-                        // XR_EXT_view_rig (#396 W7): chain the display rig so the runtime
-                        // owns the off-axis Kooima + window resolve, returning render-ready
-                        // XrView{pose, fov}. The raw channel carries display-space eyes for HUD.
+                        // XR_EXT_view_rig (#396 W7): chain a rig so the runtime owns the
+                        // off-axis eyes + window resolve, returning render-ready
+                        // XrView{pose, fov}. FLY (camera-centric) uses the CAMERA rig: a
+                        // plain perspective camera the runtime perturbs with eye tracking,
+                        // converging at convergenceDiopters — the runtime does all the
+                        // off-axis math, so the app never anchors content to the tracked
+                        // eye (that was the off-centre / zoom-on-rotate bug). ORBIT uses the
+                        // DISPLAY rig (portal model). The raw channel carries display-space
+                        // eyes for the HUD.
                         const bool useRig =
                             g_hasViewRigExt && xr->displayWidthM > 0 && xr->displayHeightM > 0;
+                        const bool rigCamera = useRig && !g_geoNav.orbitAcquired;
+                        XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
                         XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
                         XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
                         if (useRig) {
-                            displayRig.pose = cameraPose;
-                            displayRig.virtualDisplayHeight = rigVH;
-                            displayRig.ipdFactor = inputSnapshot.viewParams.ipdFactor;
-                            displayRig.parallaxFactor = inputSnapshot.viewParams.parallaxFactor;
-                            displayRig.perspectiveFactor = inputSnapshot.viewParams.perspectiveFactor;
-                            locateInfo.next = &displayRig;
+                            if (rigCamera) {
+                                // Camera at the XR origin looking -Z; the geo world is
+                                // mapped in front of it via g_xrFromEcef (anchor = origin).
+                                cameraRig.pose = cameraPose;  // identity (cameraPos=0, yaw=pitch=0)
+                                cameraRig.ipdFactor = inputSnapshot.viewParams.ipdFactor;
+                                cameraRig.parallaxFactor = inputSnapshot.viewParams.parallaxFactor;
+                                cameraRig.convergenceDiopters = g_convDiopters;  // 1/m, auto-focused
+                                cameraRig.verticalFov = kCameraVFovRad;
+                                locateInfo.next = &cameraRig;
+                            } else {
+                                displayRig.pose = cameraPose;
+                                displayRig.virtualDisplayHeight = rigVH;
+                                displayRig.ipdFactor = inputSnapshot.viewParams.ipdFactor;
+                                displayRig.parallaxFactor = inputSnapshot.viewParams.parallaxFactor;
+                                displayRig.perspectiveFactor = inputSnapshot.viewParams.perspectiveFactor;
+                                locateInfo.next = &displayRig;
+                            }
                             viewState.next = &viewRigRaw;
                         }
 
@@ -1030,16 +1070,27 @@ static void RenderThreadFunc(
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 const XrView& sv = srcViews[eye];
                                 float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
-                                // EarthView's streamed ground pops out close to the
-                                // eye (foreground at the window bottom can sit at a
-                                // small fraction of ez), so the modelviewer near =
-                                // ez - rigVH clipped it to the sky (the 'clipped
-                                // looking down / missing bottom strip' bug). Put the
-                                // near plane just in front of the eye, scaled to ez so
-                                // it's robust to the world scale s. See
-                                // docs/rendering-notes.md §3.
-                                float near_z = (ez * 0.01f > 1.0e-4f) ? (ez * 0.01f) : 1.0e-4f;
-                                float far_z  = ez + 1000.0f * rigVH;
+                                float near_z, far_z;
+                                if (rigCamera) {
+                                    // Camera rig: a plain perspective camera. The geo target
+                                    // is fixed at kTargetXrDist (1 XR-m) regardless of
+                                    // altitude (s = kTargetXrDist/targetDist), so a FIXED tight
+                                    // near/far around that scene scale keeps depth precision
+                                    // (~4000:1, vs the z-fighting 200000:1 of a 0.01/2000
+                                    // range). IMPORTANT: near/far are decoupled from the
+                                    // convergence — the convergence auto-focus tracks the
+                                    // crosshair (which can be at the horizon), and tying near
+                                    // to it would clip the foreground.
+                                    near_z = 0.05f;
+                                    far_z  = 200.0f;
+                                } else {
+                                    // Display rig: EarthView's streamed ground pops out close
+                                    // to the eye, so the modelviewer near = ez - rigVH clipped
+                                    // it to sky. Put the near plane just in front of the eye,
+                                    // scaled to ez. See docs/rendering-notes.md §3.
+                                    near_z = (ez * 0.01f > 1.0e-4f) ? (ez * 0.01f) : 1.0e-4f;
+                                    far_z  = ez + 1000.0f * rigVH;
+                                }
                                 mat4_view_from_xr_pose(stereoViews[eye].view_matrix, sv.pose);
                                 mat4_from_xr_fov(stereoViews[eye].projection_matrix, sv.fov, near_z, far_z);
                                 // GL ([-1,1] clip-z) → Vulkan [0,1] depth for the mesh's depth buffer.
@@ -1083,6 +1134,13 @@ static void RenderThreadFunc(
                             viewerPos /= (double)eyeCount;
                             g_viewerPosXr = viewerPos;
 
+                            // The world is anchored to this XR point. FLY (camera rig)
+                            // anchors at the CAMERA (origin) — the runtime owns the eyes,
+                            // so the geo camera maps to the origin and the look pivot is the
+                            // camera (no off-centre, no zoom-on-rotate). ORBIT keeps the
+                            // viewer anchor (diorama, display rig).
+                            glm::dvec3 anchorXr = viewerPos;
+                            double vfov, hfov;
                             if (g_geoNav.orbitAcquired) {
                                 // Display-centric diorama around the acquired center;
                                 // the center glides to the display origin after a
@@ -1092,37 +1150,61 @@ static void RenderThreadFunc(
                                     g_geoNav.orbitCenter, g_dioramaCenterXr,
                                     g_geoNav.dioramaScale, g_geoNav.dioramaYaw,
                                     g_geoNav.dioramaTilt);
+                                // Display-rig selection frustum: smallest symmetric cone that
+                                // CONTAINS the off-axis per-eye frustums (+15% margin).
+                                double vHalf = std::max(std::fabs((double)ufov.angleUp),
+                                                        std::fabs((double)ufov.angleDown));
+                                double hHalf = std::max(std::fabs((double)ufov.angleLeft),
+                                                        std::fabs((double)ufov.angleRight));
+                                vfov = 2.0 * vHalf * 1.15;
+                                hfov = 2.0 * hHalf * 1.15;
                             } else {
-                                // Camera-centric: viewer flies the full-scale world;
-                                // stereo scale follows the target distance so the
-                                // content of interest sits at the display plane.
-                                double zdp = std::max((double)viewerPos.z, 0.1);
-                                double s = geo::stereoScaleForDistance(g_geoNav.targetDist, zdp);
-                                g_xrFromEcef = geo::xrFromEcefCamera(g_geoNav.cam, viewerPos, s);
+                                // Camera-centric FLY: anchor the geo camera at the XR origin
+                                // and place the target a fixed kTargetXrDist in front (scale
+                                // s = kTargetXrDist/targetDist). The camera rig's verticalFov
+                                // + convergenceDiopters own the stereo; selection just needs
+                                // to match the camera frustum.
+                                const double kTargetXrDist = 1.0;  // XR metres to the geo target
+                                anchorXr = glm::dvec3(0.0, 0.0, 0.0);
+                                double s = kTargetXrDist / std::max(g_geoNav.targetDist, 1.0);
+                                g_xrFromEcef = geo::xrFromEcefCamera(g_geoNav.cam, anchorXr, s);
+                                // Selection frustum = the camera rig frustum (verticalFov)
+                                // widened to the atlas tile aspect, +15% margin.
+                                double aspect = (renderH > 0) ? (double)renderW / (double)renderH : 1.0;
+                                vfov = (double)kCameraVFovRad * 1.15;
+                                double vHalfTan = std::tan(0.5 * (double)kCameraVFovRad);
+                                hfov = 2.0 * std::atan(vHalfTan * aspect) * 1.15;
+
+                                // Convergence auto-focus: forward ray → GROUND distance
+                                // (geo metres), scaled to XR metres (× s) = the convergence
+                                // plane. Using the ground (not a depth read) keeps it smooth —
+                                // buildings don't snag it. convergenceDiopters = 1/(XR metres),
+                                // clamped to [0.2, 50] XR-m, exp-smoothed; fed to the rig next
+                                // frame.
+                                double groundM = geo::rayGroundDistanceM(g_geoNav.cam.pos,
+                                                                         g_geoNav.cam.dir);
+                                if (groundM > 0.0) {
+                                    double xrDist = groundM * s;
+                                    if (xrDist < 0.2) xrDist = 0.2;
+                                    if (xrDist > 50.0) xrDist = 50.0;
+                                    float tgt = (float)(1.0 / xrDist);
+                                    double a = 1.0 - std::exp(
+                                        -(double)perfStats.deltaTime / kConvSmoothTau);
+                                    g_convDiopters += (tgt - g_convDiopters) * (float)a;
+                                }
                             }
 
-                            // Selection camera = the viewer's HEAD camera looking
-                            // through the display, mapped to geo via inverse(g_xrFromEcef).
-                            // cesium-unity's mono "main camera" approach: off-axis stereo
-                            // is render-only; selection uses a plain symmetric frustum.
+                            // Selection camera = the viewer's HEAD camera in ECEF, from
+                            // inverse(g_xrFromEcef). selCam.pos uses the SAME anchor the
+                            // world was built from (maps to the geo camera origin).
                             geo::GeoCamera selCam;
                             {
                                 glm::dmat4 invWorld = glm::inverse(g_xrFromEcef);
                                 glm::dmat3 invRot = glm::dmat3(invWorld); // incl. 1/s — normalize after
-                                selCam.pos = glm::dvec3(invWorld * glm::dvec4(viewerPos, 1.0));
+                                selCam.pos = glm::dvec3(invWorld * glm::dvec4(anchorXr, 1.0));
                                 selCam.dir = glm::normalize(invRot * glm::dvec3(0.0, 0.0, -1.0));
                                 selCam.up = glm::normalize(invRot * glm::dvec3(0.0, 1.0, 0.0));
                             }
-                            // The eye is off-centre, so the display subtends an
-                            // ASYMMETRIC angle; the smallest symmetric frustum that
-                            // CONTAINS it uses half-angle = max(|down|,|up|) vertically
-                            // and max(|left|,|right|) horizontally (+15% margin).
-                            double vHalf = std::max(std::fabs((double)ufov.angleUp),
-                                                    std::fabs((double)ufov.angleDown));
-                            double hHalf = std::max(std::fabs((double)ufov.angleLeft),
-                                                    std::fabs((double)ufov.angleRight));
-                            double vfov = 2.0 * vHalf * 1.15;
-                            double hfov = 2.0 * hHalf * 1.15;
 
                             const auto& tiles = g_tileEngine.update(
                                 selCam, (double)renderW, (double)renderH, hfov, vfov);
@@ -1229,6 +1311,9 @@ static void RenderThreadFunc(
                         if (AcquireSwapchainImage(*xr, imageIndex)) {
                             VkFormat colorFormat = (VkFormat)xr->swapchain.format;
 
+                            // Apply the live supersample setting ('S' key cycle).
+                            g_tileRenderer.setSupersample(g_ssaa.load());
+
                             const bool tilesActive = g_tilesActive.load();
 
                             if (tilesActive) {
@@ -1279,6 +1364,10 @@ static void RenderThreadFunc(
                                             }
                                         }
                                     }
+
+                                    // [Convergence auto-focus is computed geometrically in the
+                                    // selCam block (forward ray → ground), not from the depth
+                                    // buffer — the latter snagged on buildings and spiked.]
 
                                     if (eye == 0 && dumpFrame > 0 &&
                                         (long)thisFrame >= dumpFrame) {

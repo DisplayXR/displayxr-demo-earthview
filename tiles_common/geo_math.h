@@ -72,6 +72,13 @@ enuFromEcef(const glm::dvec3 &pEcef);
 double
 heightAboveEllipsoid(const glm::dvec3 &pEcef);
 
+// Distance (metres) from posEcef along dirEcef (unit) to the first WGS84
+// ellipsoid (ground) intersection, or -1 if the ray misses / points away. Used
+// to auto-focus the stereo convergence on the GROUND under the crosshair — a
+// smooth surface, unlike a depth-buffer read which snags on buildings.
+double
+rayGroundDistanceM(const glm::dvec3 &posEcef, const glm::dvec3 &dirEcef);
+
 // ── Camera-centric XR mapping (default view model, PRD §6.1) ─────────────
 //
 // Maps the full-scale ECEF world into XR space so the geo camera sits at the

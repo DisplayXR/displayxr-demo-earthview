@@ -131,6 +131,31 @@ heightAboveEllipsoid(const glm::dvec3 &pEcef)
 	return carto ? carto->height : 0.0;
 }
 
+double
+rayGroundDistanceM(const glm::dvec3 &posEcef, const glm::dvec3 &dirEcef)
+{
+	// Ray vs WGS84 ellipsoid. Scale each axis by 1/radius so the ellipsoid
+	// becomes the unit sphere; the ray parameter t is unchanged (it stays the
+	// ECEF distance since dirEcef is unit-length). Return the nearest positive
+	// root.
+	const glm::dvec3 r = wgs84().getRadii();
+	const glm::dvec3 o(posEcef.x / r.x, posEcef.y / r.y, posEcef.z / r.z);
+	const glm::dvec3 d(dirEcef.x / r.x, dirEcef.y / r.y, dirEcef.z / r.z);
+	const double A = glm::dot(d, d);
+	const double B = 2.0 * glm::dot(o, d);
+	const double C = glm::dot(o, o) - 1.0;
+	const double disc = B * B - 4.0 * A * C;
+	if (disc < 0.0 || A < 1e-30) {
+		return -1.0;
+	}
+	const double sq = std::sqrt(disc);
+	double t = (-B - sq) / (2.0 * A);
+	if (t < 0.0) {
+		t = (-B + sq) / (2.0 * A); // camera below the surface — use the far root
+	}
+	return (t > 0.0) ? t : -1.0;
+}
+
 glm::dmat4
 xrFromEcefCamera(const GeoCamera &cam, const glm::dvec3 &viewerPosXr, double s)
 {
