@@ -20,10 +20,15 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <regex>
 #include <thread>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 namespace {
 
@@ -102,27 +107,78 @@ stripHtml(const std::string &html)
 
 } // namespace
 
+namespace {
+// Parse a `key=...` line from an ini file. Returns "" if absent/unreadable.
 std::string
-earthviewGetApiKey()
+readKeyFromIni(const std::string &path)
 {
-	if (const char *env = std::getenv("GOOGLE_MAPS_API_KEY"); env && *env) {
-		return env;
-	}
-	for (const char *path : {"earthview.ini", "../earthview.ini", "../../earthview.ini"}) {
-		std::ifstream f(path);
-		std::string line;
-		while (std::getline(f, line)) {
-			if (line.rfind("key=", 0) == 0 && line.size() > 4) {
-				std::string key = line.substr(4);
-				while (!key.empty() &&
-				       (key.back() == '\r' || key.back() == ' ' || key.back() == '\n')) {
-					key.pop_back();
-				}
-				return key;
+	std::ifstream f(path);
+	std::string line;
+	while (std::getline(f, line)) {
+		if (line.rfind("key=", 0) == 0 && line.size() > 4) {
+			std::string key = line.substr(4);
+			while (!key.empty() &&
+			       (key.back() == '\r' || key.back() == ' ' || key.back() == '\n')) {
+				key.pop_back();
 			}
+			return key;
 		}
 	}
 	return {};
+}
+} // namespace
+
+std::string
+earthviewKeyConfigPath()
+{
+#ifdef _WIN32
+	const char *base = std::getenv("APPDATA");
+	std::string dir = (base && *base) ? base : ".";
+	return dir + "\\DisplayXR\\EarthView\\earthview.ini";
+#else
+	const char *home = std::getenv("HOME");
+	std::string dir = (home && *home) ? home : ".";
+	return dir + "/Library/Application Support/DisplayXR/EarthView/earthview.ini";
+#endif
+}
+
+std::string
+earthviewGetApiKey()
+{
+	// Resolution order (never a baked-in default): env override → per-user
+	// app-support config (where in-app entry persists) → cwd earthview.ini
+	// (dev convenience). See docs/api-key.md.
+	if (const char *env = std::getenv("GOOGLE_MAPS_API_KEY"); env && *env) {
+		return env;
+	}
+	if (std::string k = readKeyFromIni(earthviewKeyConfigPath()); !k.empty()) {
+		return k;
+	}
+	for (const char *path : {"earthview.ini", "../earthview.ini", "../../earthview.ini"}) {
+		if (std::string k = readKeyFromIni(path); !k.empty()) {
+			return k;
+		}
+	}
+	return {};
+}
+
+bool
+earthviewSaveApiKey(const std::string &key)
+{
+	const std::string path = earthviewKeyConfigPath();
+	std::error_code ec;
+	std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+	std::ofstream f(path, std::ios::trunc);
+	if (!f) {
+		return false;
+	}
+	f << "key=" << key << "\n";
+	f.close();
+#ifndef _WIN32
+	// Per-user secret: rw------- (the user's OWN key, not Leia's).
+	chmod(path.c_str(), S_IRUSR | S_IWUSR);
+#endif
+	return f.good();
 }
 
 struct TileEngine::Impl

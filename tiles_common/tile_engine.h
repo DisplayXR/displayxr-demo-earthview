@@ -92,6 +92,19 @@ private:
 	AttributionInfo attribution_;
 };
 
-// Key lookup helper (shared with the first-run HUD card).
+// Key lookup helper (shared with the first-run entry card). Resolution order:
+// GOOGLE_MAPS_API_KEY env → per-user app-support config → cwd earthview.ini.
 std::string
 earthviewGetApiKey();
+
+// Per-user config path where the in-app key entry persists (created on demand;
+// outside the repo and the .app bundle). macOS:
+// ~/Library/Application Support/DisplayXR/EarthView/earthview.ini.
+std::string
+earthviewKeyConfigPath();
+
+// Persist `key` to the per-user config (mode 600 on POSIX). Returns false on
+// IO error. A subsequent TileEngine::init() then picks it up. The key is the
+// END USER's own — never Leia's, never bundled. See docs/api-key.md.
+bool
+earthviewSaveApiKey(const std::string &key);
