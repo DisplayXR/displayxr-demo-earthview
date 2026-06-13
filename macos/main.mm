@@ -1783,6 +1783,16 @@ int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    // EV_PROBE=<key>: validate a Map Tiles API key against Google and exit
+    // (0 = valid). Support/diagnostic tool — no window, runtime, or GPU needed.
+    if (const char *pk = getenv("EV_PROBE")) {
+        std::string err;
+        bool ok = g_tileEngine.probeKey(pk, err);
+        fprintf(stderr, "EV_PROBE: %s%s%s\n", ok ? "VALID" : "INVALID",
+                ok ? "" : " — ", ok ? "" : err.c_str());
+        return ok ? 0 : 1;
+    }
+
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
@@ -1935,17 +1945,31 @@ int main() {
         // across relaunches.
         if (g_keySubmitRequested) {
             g_keySubmitRequested = false;
-            if (!earthviewSaveApiKey(g_pendingKey))
-                LOG_WARN("Could not persist key to %s (will still try this session)",
-                         earthviewKeyConfigPath().c_str());
-            setenv("GOOGLE_MAPS_API_KEY", g_pendingKey.c_str(), 1);
-            g_tilesActive = g_tileEngine.init(&g_tileRenderer);
-            if (g_tilesActive) {
-                [g_keyCard setHidden:YES];
-                LOG_INFO("API key accepted — streaming started");
-            } else {
+            // Show progress + force a repaint before the blocking network probe.
+            [g_keyStatus setTextColor:[NSColor secondaryLabelColor]];
+            [g_keyStatus setStringValue:@"Checking your key with Google…"];
+            [g_keyCard display];
+
+            std::string err;
+            if (!g_tileEngine.probeKey(g_pendingKey, err)) {
+                // Reject — do NOT persist a bad key.
                 [g_keyStatus setTextColor:[NSColor systemRedColor]];
-                [g_keyStatus setStringValue:@"That key didn't work. Check it and try again."];
+                [g_keyStatus setStringValue:[NSString stringWithUTF8String:err.c_str()]];
+                LOG_WARN("API key rejected: %s", err.c_str());
+            } else {
+                // Validated → persist (mode 600) + activate the engine.
+                if (!earthviewSaveApiKey(g_pendingKey))
+                    LOG_WARN("Could not persist key to %s (using it this session only)",
+                             earthviewKeyConfigPath().c_str());
+                setenv("GOOGLE_MAPS_API_KEY", g_pendingKey.c_str(), 1);
+                g_tilesActive = g_tileEngine.init(&g_tileRenderer);
+                if (g_tilesActive) {
+                    [g_keyCard setHidden:YES];
+                    LOG_INFO("API key validated — streaming started");
+                } else {
+                    [g_keyStatus setTextColor:[NSColor systemRedColor]];
+                    [g_keyStatus setStringValue:@"Key validated but the engine failed to start."];
+                }
             }
             g_pendingKey.clear();
         }

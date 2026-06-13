@@ -11,6 +11,7 @@
 #include <CesiumAsync/AsyncSystem.h>
 #include <CesiumAsync/IAssetAccessor.h>
 #include <CesiumAsync/IAssetRequest.h>
+#include <CesiumAsync/IAssetResponse.h>
 #include <CesiumAsync/ITaskProcessor.h>
 #include <CesiumCurl/CurlAssetAccessor.h>
 #include <CesiumGeospatial/Ellipsoid.h>
@@ -179,6 +180,49 @@ earthviewSaveApiKey(const std::string &key)
 	chmod(path.c_str(), S_IRUSR | S_IWUSR);
 #endif
 	return f.good();
+}
+
+bool
+TileEngine::probeKey(const std::string &key, std::string &errOut)
+{
+	// Validate a key by fetching root.json and checking the HTTP status. Blocks
+	// the calling (main) thread via waitInMainThread until the request resolves
+	// — used before ACCEPTING a pasted key, so an invalid one is rejected with a
+	// clear reason instead of silently failing to stream. Own AsyncSystem +
+	// accessor so the live engine state is untouched.
+	if (key.empty()) {
+		errOut = "Paste a key first.";
+		return false;
+	}
+	try {
+		CesiumAsync::AsyncSystem async(std::make_shared<ThreadTaskProcessor>());
+		auto accessor = std::make_shared<CesiumCurl::CurlAssetAccessor>();
+		const std::string url =
+		    "https://tile.googleapis.com/v1/3dtiles/root.json?key=" + key;
+		std::shared_ptr<CesiumAsync::IAssetRequest> req =
+		    accessor->get(async, url, {}).waitInMainThread();
+		const CesiumAsync::IAssetResponse *resp = req ? req->response() : nullptr;
+		if (!resp) {
+			errOut = "Could not reach Google — check your network.";
+			return false;
+		}
+		const uint16_t s = resp->statusCode();
+		if (s == 200) {
+			return true;
+		}
+		if (s == 400 || s == 401 || s == 403) {
+			errOut = "Key rejected by Google. Check the key and that the "
+			         "“Map Tiles API” is enabled for it.";
+		} else if (s == 429) {
+			errOut = "Quota exceeded for this key (HTTP 429).";
+		} else {
+			errOut = "Google returned HTTP " + std::to_string(s) + ".";
+		}
+		return false;
+	} catch (const std::exception &e) {
+		errOut = std::string("Validation error: ") + e.what();
+		return false;
+	}
 }
 
 struct TileEngine::Impl

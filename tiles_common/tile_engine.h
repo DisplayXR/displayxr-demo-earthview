@@ -64,6 +64,14 @@ public:
 		return !key_.empty();
 	}
 
+	// Network-validate a key by fetching root.json (HTTP 200 = good). BLOCKS the
+	// calling (main) thread until the request resolves; errOut carries a
+	// user-facing reason on failure. Call before accepting a pasted key so an
+	// invalid one is rejected instead of silently failing to stream. Static-ish:
+	// uses its own accessor, independent of init() state.
+	bool
+	probeKey(const std::string &key, std::string &errOut);
+
 	// Once per frame from the render thread. One ViewState from the
 	// center-eye camera (PRD §6.2): viewport = ONE view tile's pixels,
 	// fovs = union across views. Both eyes draw the same selected set.
