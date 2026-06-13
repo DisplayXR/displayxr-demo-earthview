@@ -438,6 +438,19 @@ static NSView   *g_reticleView = nil;
 static NSVisualEffectView *g_attributionBar = nil;  // ALWAYS visible (policy)
 static NSTextField *g_attributionText = nil;
 
+// First-run API-key entry card (shown when keyless; see docs/api-key.md).
+static NSView      *g_keyCard = nil;
+static NSTextField *g_keyField = nil;
+static NSTextField *g_keyStatus = nil;
+// Cross-thread requests from the card's buttons → consumed on the frame loop
+// (the render/updateView thread) so the late TileEngine::init is on the right
+// thread. std::string guarded trivially: writes happen on the main/Cocoa
+// thread, which is the same thread that runs the loop in this app.
+static bool g_keySubmitRequested = false;
+static std::string g_pendingKey;
+static const char *kMapTilesConsoleURL =
+    "https://console.cloud.google.com/google/maps-apis/api-list";
+
 // Translucent dark background view used behind the top bar.
 @interface TopBarBackdropView : NSView
 @end
@@ -775,6 +788,74 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [g_reticleView setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin];
     [g_metalView addSubview:g_reticleView];
 
+    // --- First-run API-key entry card (centered; hidden until keyless) ---
+    {
+        const CGFloat cw = 460.0, ch = 240.0;
+        NSVisualEffectView *card = [[NSVisualEffectView alloc]
+            initWithFrame:NSMakeRect((width - cw) * 0.5, (height - ch) * 0.5, cw, ch)];
+        [card setMaterial:NSVisualEffectMaterialHUDWindow];
+        [card setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
+        [card setState:NSVisualEffectStateActive];
+        [card setWantsLayer:YES];
+        card.layer.cornerRadius = 12.0;
+        card.layer.masksToBounds = YES;
+        [card setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin |
+                                  NSViewMinYMargin | NSViewMaxYMargin];
+        [card setHidden:YES];
+        g_keyCard = card;
+
+        NSTextField *title = [NSTextField labelWithString:@"Google Map Tiles API key required"];
+        [title setFont:[NSFont boldSystemFontOfSize:15]];
+        [title setFrame:NSMakeRect(20, ch - 44, cw - 40, 22)];
+        [card addSubview:title];
+
+        NSTextField *body = [NSTextField wrappingLabelWithString:
+            @"EarthView streams Google Photorealistic 3D Tiles, which needs your own "
+             "Map Tiles API key. Paste it below, or get one from the Google Cloud "
+             "Console (enable the “Map Tiles API”, then create an API key)."];
+        [body setFont:[NSFont systemFontOfSize:11]];
+        [body setTextColor:[NSColor secondaryLabelColor]];
+        [body setSelectable:NO];
+        [body setFrame:NSMakeRect(20, ch - 110, cw - 40, 58)];
+        [card addSubview:body];
+
+        NSTextField *field = [[NSTextField alloc]
+            initWithFrame:NSMakeRect(20, ch - 146, cw - 40, 24)];
+        [field setPlaceholderString:@"AIza…  (paste your Map Tiles API key)"];
+        [field setFont:[NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular]];
+        [[field cell] setUsesSingleLineMode:YES];
+        [field setTarget:nil];
+        [field setAction:@selector(keySaveClicked:)]; // Enter submits
+        g_keyField = field;
+        [card addSubview:field];
+
+        NSTextField *status = [NSTextField labelWithString:@""];
+        [status setFont:[NSFont systemFontOfSize:10]];
+        [status setTextColor:[NSColor systemRedColor]];
+        [status setFrame:NSMakeRect(20, ch - 168, cw - 40, 16)];
+        g_keyStatus = status;
+        [card addSubview:status];
+
+        const CGFloat bh = 30.0, by = 20.0;
+        NSButton *getBtn = [NSButton buttonWithTitle:@"Get a Key…"
+            target:nil action:@selector(keyGetClicked:)];
+        [getBtn setFrame:NSMakeRect(20, by, 110, bh)];
+        [card addSubview:getBtn];
+
+        NSButton *skipBtn = [NSButton buttonWithTitle:@"Continue without"
+            target:nil action:@selector(keySkipClicked:)];
+        [skipBtn setFrame:NSMakeRect(140, by, 140, bh)];
+        [card addSubview:skipBtn];
+
+        NSButton *saveBtn = [NSButton buttonWithTitle:@"Save & Start"
+            target:nil action:@selector(keySaveClicked:)];
+        [saveBtn setFrame:NSMakeRect(cw - 140, by, 120, bh)];
+        [saveBtn setKeyEquivalent:@"\r"]; // default button
+        [card addSubview:saveBtn];
+
+        [g_metalView addSubview:card];
+    }
+
     [NSApp activateIgnoringOtherApps:YES];
     LOG_INFO("macOS window created (%ux%u)", width, height);
     return true;
@@ -784,6 +865,9 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
 @interface NSApplication (TopBarActions)
 - (void)modeButtonClicked:(id)sender;
 - (void)bookmarkButtonClicked:(id)sender;
+- (void)keySaveClicked:(id)sender;
+- (void)keyGetClicked:(id)sender;
+- (void)keySkipClicked:(id)sender;
 @end
 
 @implementation NSApplication (TopBarActions)
@@ -799,6 +883,34 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     (void)sender;
     MarkUserInput(g_input);
     g_input.cycleBookmarkRequested = true;   // 'B'-key equivalent
+}
+// Save & Start: hand the pasted key to the frame loop, which persists it and
+// late-inits the tile engine on the render/updateView thread (see main()).
+- (void)keySaveClicked:(id)sender {
+    (void)sender;
+    std::string key([[g_keyField stringValue] UTF8String] ?: "");
+    // trim
+    while (!key.empty() && (key.back() == ' ' || key.back() == '\t' ||
+                            key.back() == '\r' || key.back() == '\n')) key.pop_back();
+    size_t b = key.find_first_not_of(" \t");
+    if (b != std::string::npos) key = key.substr(b);
+    if (key.empty()) {
+        [g_keyStatus setStringValue:@"Paste a key first."];
+        return;
+    }
+    [g_keyStatus setTextColor:[NSColor secondaryLabelColor]];
+    [g_keyStatus setStringValue:@"Starting…"];
+    g_pendingKey = key;
+    g_keySubmitRequested = true;
+}
+- (void)keyGetClicked:(id)sender {
+    (void)sender;
+    [[NSWorkspace sharedWorkspace] openURL:
+        [NSURL URLWithString:[NSString stringWithUTF8String:kMapTilesConsoleURL]]];
+}
+- (void)keySkipClicked:(id)sender {
+    (void)sender;
+    [g_keyCard setHidden:YES];   // stay on the placeholder; B/Tab/etc still work
 }
 @end
 
@@ -1768,8 +1880,11 @@ int main() {
           LOG_WARN("tile renderer init failed");
       } else {
           g_tilesActive = g_tileEngine.init(&g_tileRenderer);
-          if (!g_tilesActive)
-              LOG_WARN("No Google Map Tiles API key — set GOOGLE_MAPS_API_KEY or put key=... in earthview.ini");
+          if (!g_tilesActive) {
+              LOG_WARN("No Google Map Tiles API key — showing the in-app entry card "
+                       "(or set GOOGLE_MAPS_API_KEY / earthview.ini)");
+              [g_keyCard setHidden:NO];   // first-run key entry (docs/api-key.md)
+          }
       }
     }
 
@@ -1813,6 +1928,27 @@ int main() {
         lastTime = now;
         g_frameCount++;
         g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
+
+        // API-key entry: persist the pasted key and late-init the tile engine
+        // HERE (the frame-loop thread == the updateView thread cesium's
+        // prepareInMainThread/free require). Save-to-config + env so it sticks
+        // across relaunches.
+        if (g_keySubmitRequested) {
+            g_keySubmitRequested = false;
+            if (!earthviewSaveApiKey(g_pendingKey))
+                LOG_WARN("Could not persist key to %s (will still try this session)",
+                         earthviewKeyConfigPath().c_str());
+            setenv("GOOGLE_MAPS_API_KEY", g_pendingKey.c_str(), 1);
+            g_tilesActive = g_tileEngine.init(&g_tileRenderer);
+            if (g_tilesActive) {
+                [g_keyCard setHidden:YES];
+                LOG_INFO("API key accepted — streaming started");
+            } else {
+                [g_keyStatus setTextColor:[NSColor systemRedColor]];
+                [g_keyStatus setStringValue:@"That key didn't work. Check it and try again."];
+            }
+            g_pendingKey.clear();
+        }
 
         // Handle Auto-Orbit toggle (M key or button)
         if (g_input.animateToggleRequested) {
@@ -2388,8 +2524,8 @@ int main() {
                             [NSString stringWithUTF8String:line.c_str()]];
                     } else {
                         [g_attributionText setStringValue:
-                            @"EarthView needs a Google Map Tiles API key — set "
-                             "GOOGLE_MAPS_API_KEY or put key=... in earthview.ini, then relaunch."];
+                            @"EarthView needs a Google Map Tiles API key — enter it in "
+                             "the panel (or press the key icon). Data © Google."];
                     }
                 }
                 if (g_input.hudVisible && g_hudView != nil) {

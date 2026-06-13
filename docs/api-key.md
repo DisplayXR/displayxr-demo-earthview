@@ -6,14 +6,17 @@ never exposed, and the planned in-app key-entry flow.
 
 ## Status
 
-- **Now (M1):** key resolved from `GOOGLE_MAPS_API_KEY` env or a gitignored
-  `earthview.ini` next to the exe / cwd. Keyless launch shows a minimal HUD card
-  and never crashes. **No key is committed or bundled** (verified: `earthview.ini`
-  is gitignored and was never in history; the `.pkg` payload contains no
-  ini/key — only the binary, Google logo, and dylibs).
-- **Planned (before tagging v0.1.0):** in-app key entry + per-user persistence,
-  so end users supply their **own** key and the dev key is never needed by the
-  distributed app.
+- **Implemented (macOS):** in-app key entry + per-user persistence. Keyless
+  launch shows a centered entry card (paste field, *Get a Key…*, *Save & Start*,
+  *Continue without*); on save the key is written to the per-user app-support
+  config (mode 600) and the tile engine is late-initialized on the frame-loop
+  thread — no relaunch. Resolution order below. **No key is committed or
+  bundled** (verified: `earthview.ini`/`.env*` gitignored and never in history;
+  the `.pkg` payload contains no ini/key — only the binary, Google logo, dylibs).
+  Cross-platform pieces (`earthviewKeyConfigPath` / `earthviewGetApiKey` /
+  `earthviewSaveApiKey` in `tiles_common/tile_engine.cpp`) are shared; the
+  Windows entry **dialog** (Win32) is the remaining follow-up — env/`.env.local`/
+  ini already unblock Windows.
 
 ## Key resolution order (never a baked-in default)
 
