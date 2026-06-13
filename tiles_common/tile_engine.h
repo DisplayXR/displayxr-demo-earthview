@@ -116,3 +116,9 @@ earthviewKeyConfigPath();
 // END USER's own — never Leia's, never bundled. See docs/api-key.md.
 bool
 earthviewSaveApiKey(const std::string &key);
+
+// Delete the per-user saved key (the app-support config) so nothing persists
+// to the next launch. Returns true if removed or already absent. Dev stores
+// (env / repo earthview.ini / .env.local) are untouched.
+bool
+earthviewClearApiKey();

@@ -451,6 +451,16 @@ static std::string g_pendingKey;
 static const char *kMapTilesConsoleURL =
     "https://console.cloud.google.com/google/maps-apis/api-list";
 
+// Show the API-key card and give the field keyboard focus (the layer-backed
+// Metal view is the window's first responder, so without this a click on the
+// field doesn't focus it and ⌘V beeps). Reused by first-run + the ⌘K shortcut.
+static void ShowKeyCard() {
+    if (!g_keyCard) return;
+    [g_keyCard setHidden:NO];
+    [g_window makeKeyAndOrderFront:nil];
+    [g_window makeFirstResponder:g_keyField];
+}
+
 // Translucent dark background view used behind the top bar.
 @interface TopBarBackdropView : NSView
 @end
@@ -543,6 +553,11 @@ static const char *kMapTilesConsoleURL =
     NSString *chars = [event charactersIgnoringModifiers];
     if ([chars length] == 0) return;
     unichar ch = [chars characterAtIndex:0];
+    // ⌘K — open the API-key panel any time (change / remove / re-enter a key).
+    if ((event.modifierFlags & NSEventModifierFlagCommand) && (ch == 'k' || ch == 'K')) {
+        ShowKeyCard();
+        return;
+    }
     switch (ch) {
         case 'w': case 'W': g_input.keyW = true; break;
         case 'a': case 'A': g_input.keyA = true; break;
@@ -648,6 +663,31 @@ static void SignalHandler(int sig) {
 static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+    // Minimal menu bar with a standard Edit menu — WITHOUT it a bare AppKit app
+    // doesn't route ⌘X/⌘C/⌘V/⌘A to the focused text field's editor, so paste
+    // into the API-key card beeps. The selectors dispatch through the responder
+    // chain to the field editor.
+    {
+        NSMenu *mainMenu = [[NSMenu alloc] init];
+        NSMenuItem *appItem = [[NSMenuItem alloc] init];
+        [mainMenu addItem:appItem];
+        NSMenu *appMenu = [[NSMenu alloc] init];
+        [appMenu addItemWithTitle:@"Quit EarthView" action:@selector(terminate:)
+                    keyEquivalent:@"q"];
+        [appItem setSubmenu:appMenu];
+
+        NSMenuItem *editItem = [[NSMenuItem alloc] init];
+        [mainMenu addItem:editItem];
+        NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+        [editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+        [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+        [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
+        [[editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:)
+                      keyEquivalent:@"a"] setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
+        [editItem setSubmenu:editMenu];
+        [NSApp setMainMenu:mainMenu];
+    }
 
     AppDelegate *delegate = [[AppDelegate alloc] init];
     [NSApp setDelegate:delegate];
@@ -824,6 +864,10 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         [field setPlaceholderString:@"AIza…  (paste your Map Tiles API key)"];
         [field setFont:[NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular]];
         [[field cell] setUsesSingleLineMode:YES];
+        [field setEditable:YES];
+        [field setSelectable:YES];
+        [field setBezeled:YES];
+        [field setRefusesFirstResponder:NO];
         [field setTarget:nil];
         [field setAction:@selector(keySaveClicked:)]; // Enter submits
         g_keyField = field;
@@ -839,17 +883,23 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         const CGFloat bh = 30.0, by = 20.0;
         NSButton *getBtn = [NSButton buttonWithTitle:@"Get a Key…"
             target:nil action:@selector(keyGetClicked:)];
-        [getBtn setFrame:NSMakeRect(20, by, 110, bh)];
+        [getBtn setFrame:NSMakeRect(18, by, 92, bh)];
         [card addSubview:getBtn];
 
-        NSButton *skipBtn = [NSButton buttonWithTitle:@"Continue without"
+        // Remove the SAVED key so nothing persists to next launch ("clean box").
+        NSButton *rmBtn = [NSButton buttonWithTitle:@"Remove key"
+            target:nil action:@selector(keyRemoveClicked:)];
+        [rmBtn setFrame:NSMakeRect(112, by, 96, bh)];
+        [card addSubview:rmBtn];
+
+        NSButton *skipBtn = [NSButton buttonWithTitle:@"Close"
             target:nil action:@selector(keySkipClicked:)];
-        [skipBtn setFrame:NSMakeRect(140, by, 140, bh)];
+        [skipBtn setFrame:NSMakeRect(212, by, 62, bh)];
         [card addSubview:skipBtn];
 
         NSButton *saveBtn = [NSButton buttonWithTitle:@"Save & Start"
             target:nil action:@selector(keySaveClicked:)];
-        [saveBtn setFrame:NSMakeRect(cw - 140, by, 120, bh)];
+        [saveBtn setFrame:NSMakeRect(cw - 132, by, 114, bh)];
         [saveBtn setKeyEquivalent:@"\r"]; // default button
         [card addSubview:saveBtn];
 
@@ -868,6 +918,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
 - (void)keySaveClicked:(id)sender;
 - (void)keyGetClicked:(id)sender;
 - (void)keySkipClicked:(id)sender;
+- (void)keyRemoveClicked:(id)sender;
 @end
 
 @implementation NSApplication (TopBarActions)
@@ -910,7 +961,20 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
 }
 - (void)keySkipClicked:(id)sender {
     (void)sender;
-    [g_keyCard setHidden:YES];   // stay on the placeholder; B/Tab/etc still work
+    [g_keyCard setHidden:YES];   // stay on the placeholder / keep streaming
+}
+// Remove the saved key so it won't persist to the next launch ("clean box").
+// The current session keeps using whatever key is already live.
+- (void)keyRemoveClicked:(id)sender {
+    (void)sender;
+    bool ok = earthviewClearApiKey();
+    [g_keyField setStringValue:@""];
+    [g_keyStatus setTextColor:[NSColor secondaryLabelColor]];
+    [g_keyStatus setStringValue:ok
+        ? @"Saved key removed — it won't persist to the next launch."
+        : @"Could not remove the saved key file."];
+    [g_window makeFirstResponder:g_keyField];
+    LOG_INFO("Saved API key removed (%s)", ok ? "ok" : "failed");
 }
 @end
 
@@ -1893,7 +1957,7 @@ int main() {
           if (!g_tilesActive) {
               LOG_WARN("No Google Map Tiles API key — showing the in-app entry card "
                        "(or set GOOGLE_MAPS_API_KEY / earthview.ini)");
-              [g_keyCard setHidden:NO];   // first-run key entry (docs/api-key.md)
+              ShowKeyCard();   // first-run key entry (docs/api-key.md)
           }
       }
     }
@@ -1926,7 +1990,7 @@ int main() {
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Controls: WASD=Pan  E/Q=Climb  LMB-drag=Look  Scroll=Dolly  DblClick=Orbit-acquire");
     LOG_INFO("          B=City  C=Orbit->Fly  Esc/Space=Release/Reset  -/= Depth  M=Auto-Orbit  V=Mode");
-    LOG_INFO("          I=Capture  T=EyeTracking  Tab=HUD  ESC=Quit");
+    LOG_INFO("          I=Capture  T=EyeTracking  Cmd+K=API key  Tab=HUD  ESC=Quit");
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
