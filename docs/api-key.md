@@ -14,9 +14,17 @@ never exposed, and the planned in-app key-entry flow.
   bundled** (verified: `earthview.ini`/`.env*` gitignored and never in history;
   the `.pkg` payload contains no ini/key — only the binary, Google logo, dylibs).
   Cross-platform pieces (`earthviewKeyConfigPath` / `earthviewGetApiKey` /
-  `earthviewSaveApiKey` in `tiles_common/tile_engine.cpp`) are shared; the
-  Windows entry **dialog** (Win32) is the remaining follow-up — env/`.env.local`/
-  ini already unblock Windows.
+  `earthviewSaveApiKey` / `earthviewClearApiKey` / `TileEngine::probeKey` in
+  `tiles_common/tile_engine.cpp`) are shared. **Validated** against Google: the
+  pasted key is probed (`root.json`, HTTP-status checked) BEFORE it is saved —
+  an invalid key is rejected inline and not persisted. `⌘K` / `Ctrl+K` reopens
+  the panel any time; a **Remove key** button deletes the saved key so nothing
+  persists ("clean box after use"). `EV_PROBE=<key>` is a CLI validation tool.
+- **Windows:** the Win32 entry dialog (`ShowApiKeyDialog` in `windows/main.cpp`)
+  mirrors the macOS card using the same shared functions — first-run keyless +
+  Ctrl+K, modal, Save validates then defers the late-init to the render thread.
+  Implemented; **pending live validation on a Windows machine** (compile-checked
+  by `build-windows.yml`).
 
 ## Key resolution order (never a baked-in default)
 

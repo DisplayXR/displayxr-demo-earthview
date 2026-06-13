@@ -223,7 +223,7 @@ TileEngine::probeKey(const std::string &key, std::string &errOut)
 		}
 		if (s == 400 || s == 401 || s == 403) {
 			errOut = "Key rejected by Google. Check the key and that the "
-			         "“Map Tiles API” is enabled for it.";
+			         "'Map Tiles API' is enabled for it.";
 		} else if (s == 429) {
 			errOut = "Quota exceeded for this key (HTTP 429).";
 		} else {
