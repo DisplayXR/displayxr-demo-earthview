@@ -183,6 +183,17 @@ earthviewSaveApiKey(const std::string &key)
 }
 
 bool
+earthviewClearApiKey()
+{
+	// Delete the per-user saved key so nothing persists to the next launch
+	// ("leave a clean box after use"). Returns true if removed or already
+	// absent. Does NOT touch dev stores (env / repo earthview.ini / .env.local).
+	std::error_code ec;
+	std::filesystem::remove(earthviewKeyConfigPath(), ec);
+	return !ec;
+}
+
+bool
 TileEngine::probeKey(const std::string &key, std::string &errOut)
 {
 	// Validate a key by fetching root.json and checking the HTTP status. Blocks
@@ -246,6 +257,10 @@ TileEngine::init(Cesium3DTilesSelection::IPrepareRendererResources *prepare)
 	if (key_.empty()) {
 		return false; // app stays up — first-run card (PRD §7.4)
 	}
+
+	// Re-callable: changing the key mid-session (via the entry card) drops the
+	// old tileset first so we don't leak it / double-register content types.
+	shutdown();
 
 	spdlog::set_level(spdlog::level::critical); // mute per-request parse-warning spam
 
