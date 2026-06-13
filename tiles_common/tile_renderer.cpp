@@ -727,6 +727,21 @@ TileRenderer::createSamplerAndDefaults()
 	sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
 	sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
 	sci.maxLod = VK_LOD_CLAMP_NONE;
+	// Anisotropic filtering: photogrammetry terrain is viewed obliquely almost
+	// all the time (looking across the ground), where plain trilinear minifies
+	// anisotropically and sparkles ("textures rapidly changing" on small
+	// detail). Aniso resolves it. Requires the samplerAnisotropy device feature
+	// (enabled in the app shells' CreateVulkanDevice); fall back gracefully if
+	// the device's cap is < 2.
+	{
+		VkPhysicalDeviceProperties props = {};
+		vkGetPhysicalDeviceProperties(physDevice_, &props);
+		float maxAniso = props.limits.maxSamplerAnisotropy;
+		if (maxAniso >= 2.0f) {
+			sci.anisotropyEnable = VK_TRUE;
+			sci.maxAnisotropy = (maxAniso < 16.0f) ? maxAniso : 16.0f;
+		}
+	}
 	if (vkCreateSampler(device_, &sci, nullptr, &sampler_) != VK_SUCCESS) {
 		return false;
 	}
@@ -915,6 +930,19 @@ TileRenderer::renderEye(VkImage swapchainImage,
 		}
 	}
 
+	// Supersample: render the view at kSsaa× the final per-view size into the
+	// (swapchain-sized) internal target, then downsample on the blit below —
+	// geometry-edge anti-aliasing. Clamp to the internal target so we never
+	// exceed it (worst case ssW == width_, i.e. 1× when the view already fills
+	// the panel half-width).
+	const uint32_t kSsaa = ssaaFactor_ < 1 ? 1u : ssaaFactor_;
+	uint32_t ssW = viewportWidth * kSsaa;
+	if (ssW > width_) ssW = width_;
+	uint32_t ssH = viewportHeight * kSsaa;
+	if (ssH > height_) ssH = height_;
+	lastSsScaleX_ = (viewportWidth > 0) ? (float)ssW / (float)viewportWidth : 1.0f;
+	lastSsScaleY_ = (viewportHeight > 0) ? (float)ssH / (float)viewportHeight : 1.0f;
+
 	const glm::mat4 view = glm::make_mat4(viewMatrix);
 	const glm::mat4 proj = glm::make_mat4(projMatrix);
 	const glm::mat4 vp = proj * view;
@@ -937,16 +965,17 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	rpbi.renderPass = renderPass_;
 	rpbi.framebuffer = framebuffer_;
 	rpbi.renderArea.offset = {0, 0};
-	rpbi.renderArea.extent = {viewportWidth, viewportHeight};
+	rpbi.renderArea.extent = {ssW, ssH};
 	rpbi.clearValueCount = 2;
 	rpbi.pClearValues = clears;
 	vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
 	// Negative-height viewport flips Vulkan Y-down at the rasterizer (same
-	// convention as ModelRenderer — the shell's view/proj are +Y-up).
-	VkViewport vpRect = {0.0f,      (float)viewportHeight,  (float)viewportWidth,
-	                     -(float)viewportHeight, 0.0f,      1.0f};
-	VkRect2D scissor = {{0, 0}, {viewportWidth, viewportHeight}};
+	// convention as ModelRenderer — the shell's view/proj are +Y-up). Rendered
+	// at the supersampled size; the blit downsamples to the swapchain tile.
+	VkViewport vpRect = {0.0f,      (float)ssH,  (float)ssW,
+	                     -(float)ssH, 0.0f,      1.0f};
+	VkRect2D scissor = {{0, 0}, {ssW, ssH}};
 	vkCmdSetViewport(cmd, 0, 1, &vpRect);
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 
@@ -1007,7 +1036,7 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	VkImageBlit blit = {};
 	blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 	blit.srcOffsets[0] = {0, 0, 0};
-	blit.srcOffsets[1] = {(int32_t)viewportWidth, (int32_t)viewportHeight, 1};
+	blit.srcOffsets[1] = {(int32_t)ssW, (int32_t)ssH, 1};  // supersampled source
 	blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 	blit.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
 	blit.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
@@ -1036,6 +1065,10 @@ TileRenderer::renderEye(VkImage swapchainImage,
 float
 TileRenderer::readDepth(uint32_t px, uint32_t py)
 {
+	// px/py are in final per-view pixels; the depth buffer was rendered at the
+	// supersampled size, so scale into it.
+	px = (uint32_t)((float)px * lastSsScaleX_);
+	py = (uint32_t)((float)py * lastSsScaleY_);
 	if (!initialized_ || px >= width_ || py >= height_) {
 		return 1.0f;
 	}
@@ -1109,6 +1142,10 @@ TileRenderer::dumpColorTarget(const char *path, uint32_t w, uint32_t h)
 	if (!initialized_ || colorImage_.image == VK_NULL_HANDLE) {
 		return;
 	}
+	// The view was rendered at the supersampled size; grab that whole region so
+	// the dump shows the full eye (not just the top-left 1/kSsaa² corner).
+	w = (uint32_t)((float)w * lastSsScaleX_);
+	h = (uint32_t)((float)h * lastSsScaleY_);
 	w = std::min(w, width_);
 	h = std::min(h, height_);
 	const VkDeviceSize bytes = (VkDeviceSize)w * h * 4;

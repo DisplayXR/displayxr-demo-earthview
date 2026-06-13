@@ -149,6 +149,21 @@ public:
 	void
 	dumpColorTarget(const char *path, uint32_t w, uint32_t h);
 
+	// Supersample factor (1 = off): renderEye draws each view at N× the final
+	// per-view resolution and downsamples on the blit (geometry-edge AA). Costs
+	// ~N² fragment work. Clamped to the internal target. Live-tweakable (the
+	// shell cycles it with the 'S' key for A/B).
+	void
+	setSupersample(uint32_t n)
+	{
+		ssaaFactor_ = (n < 1) ? 1u : n;
+	}
+	uint32_t
+	supersample() const
+	{
+		return ssaaFactor_;
+	}
+
 	// HUD stats.
 	double
 	gpuResidentMB() const
@@ -188,6 +203,13 @@ private:
 	VkQueue queue_ = VK_NULL_HANDLE;
 	uint32_t queueFamily_ = 0;
 	uint32_t width_ = 0, height_ = 0;
+	// Supersample anti-aliasing: renderEye draws each view at kSsaa× the final
+	// per-view resolution into the (swapchain-sized) internal target, then the
+	// blit downsamples to the swapchain tile (geometry-edge AA). lastSsScale*_
+	// carry the actual src/dst ratio (clamped to the target) so readDepth and
+	// dumpColorTarget sample the supersampled buffer at the right pixel.
+	float lastSsScaleX_ = 1.0f, lastSsScaleY_ = 1.0f;
+	uint32_t ssaaFactor_ = 1;  // 1 = off (default); shell cycles 1→2→4 via 'S'
 	bool initialized_ = false;
 
 	VkCommandPool cmdPool_ = VK_NULL_HANDLE;
