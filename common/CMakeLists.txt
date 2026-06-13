@@ -15,7 +15,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    # Match cesium-native's dynamic CRT (/MD) — see windows/CMakeLists.txt. This
+    # also propagates to the FetchContent'd displayxr::common below, keeping the
+    # whole link closure on one CRT.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
 # displayxr-common reuses whatever OpenXR target the consumer provides, else
