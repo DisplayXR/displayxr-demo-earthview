@@ -54,6 +54,7 @@
 #include "view_params.h"
 #include "display3d_view.h"
 #include "camera3d_view.h"
+#include "dxr_view_math.h"  // rig converters (cam<->display) for focus mode
 #include "projection_depth.h"
 #include "tile_engine.h"
 #include "tile_renderer.h"
@@ -192,6 +193,22 @@ static constexpr double kDioramaGlideTau = 0.35; // s
 // refine it (matching the Windows leg). See docs/rendering-notes.md.
 static constexpr float kCameraVFovRad = 0.6498f;  // ~37.2° full vertical FOV (2*atan(0.3249))
 static float g_convDiopters = 1.0f;               // 1/m to convergence plane
+static float g_canvasWM = 0.0f, g_canvasHM = 0.0f; // runtime-resolved canvas size (m)
+static float g_viewDistXR = 0.0f;                  // frustum-source eye->focus distance
+// Double-click "focus" model: seamless cam->display rig switch (disturbance-free
+// converter), frame the picked POI onto the zero-parallax plane via targetDist, and
+// orbit the camera around it. World stays camera-centric (no diorama); orbitAcquired
+// is NOT used in this path.
+static bool g_focusActive = false;
+static double g_focusT = 0.0;                      // 0->1 re-aim/reframe transition
+static glm::dvec3 g_focusPOIecef(0.0);             // POI in ECEF — orbit pivot + ZDP target
+// Smooth re-aim/reframe transition toward a newly picked POI (driven by g_focusT).
+static glm::dvec3 g_poiXitFromDir(0.0), g_poiXitToDir(0.0);
+static double g_poiXitFromTD = 0.0, g_poiXitToTD = 0.0;
+// [FOCUS] stereo "fullness": 1 in orbit (display ipd/par -> 1, full depth on the
+// feature), 0 in fly (ipd/par -> the user's original viewParams). Glides toward
+// g_focusActive; the rig branches lerp ipd/par by it. display ipd=1 <-> cam ipd=1/f.
+static double g_stereoFull = 0.0;
 static constexpr double kConvSmoothTau = 0.15;    // s — convergence exp-filter time constant
 
 static double g_avgFrameTime = 0.0;
@@ -335,8 +352,46 @@ static void MarkUserInput(InputState& input) {
 // ============================================================================
 
 static void UpdateGeoNav(InputState& input, float dt) {
+    // [FOCUS] smooth POI transition (~0.4 s): re-aim cam.dir toward the new POI
+    // (slerp) + reframe targetDist (log-lerp) so the feature glides to centre and
+    // onto the zero-parallax plane. Camera position is fixed. Orbit drag cancels it.
+    if (g_focusActive && g_focusT < 1.0) {
+        g_focusT += (double)dt / 0.4;
+        double t = g_focusT > 1.0 ? 1.0 : g_focusT;
+        double e = t * t * (3.0 - 2.0 * t);  // smoothstep
+        double cosA = glm::clamp(glm::dot(g_poiXitFromDir, g_poiXitToDir), -1.0, 1.0);
+        double a = std::acos(cosA);
+        if (a < 1.0e-4) {
+            g_geoNav.cam.dir = g_poiXitToDir;
+        } else {
+            double s0 = std::sin((1.0 - e) * a) / std::sin(a);
+            double s1 = std::sin(e * a) / std::sin(a);
+            g_geoNav.cam.dir = glm::normalize(s0 * g_poiXitFromDir + s1 * g_poiXitToDir);
+        }
+        g_geoNav.cam.up = glm::normalize(g_geoNav.cam.pos);  // radial up
+        g_geoNav.targetDist = g_poiXitFromTD * std::pow(g_poiXitToTD / g_poiXitFromTD, e);
+        if (g_focusT >= 1.0) g_focusT = 1.0;
+    }
+    // [FOCUS] glide the stereo fullness toward the current mode (~0.4 s).
+    {
+        double tgt = g_focusActive ? 1.0 : 0.0;
+        double rate = (double)dt / 0.4;
+        if (g_stereoFull < tgt) g_stereoFull = std::min(tgt, g_stereoFull + rate);
+        else if (g_stereoFull > tgt) g_stereoFull = std::max(tgt, g_stereoFull - rate);
+    }
     if (input.releaseToFlyRequested) {
         input.releaseToFlyRequested = false;
+        if (g_focusActive) {
+            // Focus -> fly (cam rig): the cam rig inherits the frozen convergence,
+            // so the switch is seamless; the ground auto-focus then resumes. (The
+            // WASDQE return below is the primary exit; this is the explicit key.)
+            g_focusActive = false;
+            g_focusT = 0.0;
+            LOG_INFO("Focus released -> fly (cam rig)");
+            input.lastInputTimeSec = NowSec();
+            input.animationActive = false;
+            return;
+        }
         if (g_geoNav.orbitAcquired) {
             g_geoNav.releaseToFly(std::max(g_viewerPosXr.z, 0.1));
             LOG_INFO("Released orbit -> fly mode (continuous)");
@@ -365,7 +420,30 @@ static void UpdateGeoNav(InputState& input, float dt) {
 
     // Left-drag look / orbit.
     if (input.lookDX != 0.0f || input.lookDY != 0.0f) {
-        g_geoNav.look((double)input.lookDX, (double)input.lookDY);
+        if (g_focusActive) {
+            // [FOCUS] orbit the CAMERA around the POI (feature fixed) — display-rig
+            // navigation, vs the cam rig's look-around-the-eye. World stays
+            // camera-centric; only cam.pos/dir revolve about g_focusPOIecef.
+            g_focusT = 1.0;  // a drag cancels any in-flight re-aim transition
+            glm::dvec3 poi = g_focusPOIecef;
+            glm::dvec3 up = glm::normalize(poi);  // geodetic normal ~ radial
+            glm::dvec3 v = g_geoNav.cam.pos - poi;
+            glm::dmat4 ry = glm::rotate(glm::dmat4(1.0), -(double)input.lookDX, up);
+            v = glm::dvec3(ry * glm::dvec4(v, 0.0));
+            glm::dvec3 right = glm::normalize(glm::cross(up, glm::normalize(v)));
+            glm::dmat4 rp = glm::rotate(glm::dmat4(1.0), -(double)input.lookDY, right);
+            glm::dvec3 v2 = glm::dvec3(rp * glm::dvec4(v, 0.0));
+            if (std::abs(glm::dot(glm::normalize(v2), up)) < 0.98) v = v2;  // no pole flip
+            g_geoNav.cam.pos = poi + v;
+            g_geoNav.cam.dir = glm::normalize(poi - g_geoNav.cam.pos);
+            g_geoNav.cam.up = up;
+            // Keep the POI on the convergence plane: targetDist = radius/vDist
+            // (constant during orbit, so no zoom drift).
+            g_geoNav.targetDist =
+                std::max(glm::length(v) / std::max((double)g_viewDistXR, 0.1), 20.0);
+        } else {
+            g_geoNav.look((double)input.lookDX, (double)input.lookDY);
+        }
         input.lookDX = input.lookDY = 0.0f;
     }
     // Scroll dolly (exponential).
@@ -373,6 +451,18 @@ static void UpdateGeoNav(InputState& input, float dt) {
         g_geoNav.dolly((double)input.dollySteps);
         input.dollySteps = 0.0f;
     }
+    // [FOCUS] WASDQE while in orbit/display mode => disturbance-free return to the
+    // cam rig. At the switch instant the cam rig uses the frozen g_convDiopters
+    // (still the orbit-center convergence), so the display->cam swap is seamless;
+    // then the auto-focus (gated on !g_focusActive) smoothly re-tracks the ground.
+    // No C key needed.
+    if (g_focusActive && (input.keyW || input.keyS || input.keyA || input.keyD ||
+                          input.keyE || input.keyQ)) {
+        g_focusActive = false;
+        g_focusT = 1.0;  // cancel any in-flight re-aim transition
+        LOG_INFO("[FOCUS] WASDQE -> return to fly (cam rig); ground auto-focus resumes");
+    }
+
     // WASD pan in the ground tangent plane, E/Q climb. Speeds scale with
     // targetDist inside GeoNav, so dt is the only factor here (~half the
     // target distance per second of held key).
@@ -387,13 +477,22 @@ static void UpdateGeoNav(InputState& input, float dt) {
     if (panX != 0.0 || panY != 0.0) g_geoNav.pan(panX, panY);
     if (climb != 0.0) g_geoNav.elevate(climb);
 
-    // Auto-orbit: idle > 10 s → slow turntable (spins the diorama when an
-    // orbit center is acquired, pans the view when free).
+    // Auto-orbit: idle > 10 s. ONLY in focus/orbit mode, and as a gentle turntable
+    // AROUND the POI (not a free-look). In FLY it's disabled: the old idle look()
+    // rotated the view every frame, churning tile LOD and making zoomed-in content
+    // tremble vertically until the user moved (which reset the idle timer).
     double idleFor = NowSec() - input.lastInputTimeSec;
-    input.animationActive = (input.animateEnabled && idleFor > 10.0);
+    input.animationActive = (input.animateEnabled && idleFor > 10.0 && g_focusActive);
     if (input.animationActive) {
         double rate = 6.2831853 / 60.0; // one revolution per 60 seconds
-        g_geoNav.look(rate * dt, 0.0);
+        glm::dvec3 poi = g_focusPOIecef;
+        glm::dvec3 up = glm::normalize(poi);
+        glm::dvec3 v = g_geoNav.cam.pos - poi;
+        glm::dmat4 ry = glm::rotate(glm::dmat4(1.0), -(rate * (double)dt), up);
+        v = glm::dvec3(ry * glm::dvec4(v, 0.0));
+        g_geoNav.cam.pos = poi + v;
+        g_geoNav.cam.dir = glm::normalize(poi - g_geoNav.cam.pos);
+        g_geoNav.cam.up = up;
     }
 }
 
@@ -2112,17 +2211,45 @@ int main() {
                     // which sim_display never exposed). ORBIT uses the DISPLAY rig (portal).
                     const bool useRig =
                         xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
-                    const bool rigCamera = useRig && !g_geoNav.orbitAcquired;
+                    const bool naturalRigCamera = useRig && !g_geoNav.orbitAcquired;
+                    // Focus mode forces the display rig; the world stays camera-centric.
+                    const bool rigCamera = naturalRigCamera && !g_focusActive;
                     XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
                     XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
                     XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
                     if (useRig) {
+                        // physical_height_m MUST be the runtime's CANVAS height (window
+                        // client area), NOT the full display height — the cube C-toggle
+                        // proved this (canvasH 0.1434 vs dispH 0.1956 = the 1.36x zoom).
+                        float canvasH = (g_canvasHM > 1.0e-6f) ? g_canvasHM : xr.displayHeightM;
+                        float canvasW = (g_canvasWM > 1.0e-6f) ? g_canvasWM : xr.displayWidthM;
+                        dxr_rig_display_info dinfo = {
+                            canvasH,
+                            (canvasH > 1.0e-6f) ? (canvasW / canvasH) : 1.0f,
+                            xr.nominalViewerZ};
                         if (rigCamera) {
                             cameraRig.pose = cameraPose;  // identity
                             cameraRig.ipdFactor = g_input.viewParams.ipdFactor;
                             cameraRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                             cameraRig.convergenceDiopters = g_convDiopters;  // 1/m, auto-focused
                             cameraRig.verticalFov = kCameraVFovRad;
+                            // [FOCUS] on the orbit->fly return, glide ipd/par from the value
+                            // that matches the orbit's display rig (ipd=1 <-> cam ipd=1/f,
+                            // f=convDiopters*N => seamless at the switch instant) back to the
+                            // user's original viewParams. g_stereoFull drops 1->0 over ~0.4 s.
+                            if (g_stereoFull > 1.0e-4) {
+                                double f = (double)cameraRig.convergenceDiopters * (double)xr.nominalViewerZ;
+                                double invF = (f > 1.0e-4) ? (1.0 / f) : 1.0;
+                                double sf = g_stereoFull;
+                                cameraRig.ipdFactor =
+                                    (float)((1.0 - sf) * g_input.viewParams.ipdFactor + sf * invF);
+                                cameraRig.parallaxFactor =
+                                    (float)((1.0 - sf) * g_input.viewParams.parallaxFactor + sf * invF);
+                            }
+                            // Frustum-source viewing distance = eye->focus = 1/convergence
+                            // (the cam rig's ZDP distance). Drives the focus framing + orbit.
+                            g_viewDistXR = (cameraRig.convergenceDiopters > 1.0e-6f)
+                                               ? (1.0f / cameraRig.convergenceDiopters) : 0.0f;
                             locateInfo.next = &cameraRig;
                         } else {
                             displayRig.pose = cameraPose;
@@ -2130,6 +2257,50 @@ int main() {
                             displayRig.ipdFactor = g_input.viewParams.ipdFactor;
                             displayRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                             displayRig.perspectiveFactor = g_input.viewParams.perspectiveFactor;
+                            if (g_focusActive) {
+                                // Focus: convert the live camera rig -> display rig.
+                                dxr_camera_rig crig0 = {};
+                                crig0.pose.orientation = {0, 0, 0, 1};
+                                crig0.ipd_factor = g_input.viewParams.ipdFactor;
+                                crig0.parallax_factor = g_input.viewParams.parallaxFactor;
+                                crig0.inv_convergence_distance = g_convDiopters;
+                                crig0.half_tan_vfov = tanf(0.5f * kCameraVFovRad);
+                                crig0.m2v = 1.0f;
+                                dxr_display_rig drig = {};
+                                dxr_view_rig_camera_to_display(&crig0, &dinfo, &drig);
+                                displayRig.pose.orientation = {drig.pose.orientation.x, drig.pose.orientation.y,
+                                                               drig.pose.orientation.z, drig.pose.orientation.w};
+                                displayRig.pose.position = {drig.pose.position.x, drig.pose.position.y,
+                                                            drig.pose.position.z};
+                                displayRig.virtualDisplayHeight = drig.virtual_display_height;
+                                displayRig.ipdFactor = drig.ipd_factor;
+                                displayRig.parallaxFactor = drig.parallax_factor;
+                                displayRig.perspectiveFactor = drig.perspective_factor;
+                                // [FOCUS] glide ipd/par from the converter's disturbance-free
+                                // value (t=0, seamless switch) to FULL 1.0 (t=1) for full
+                                // stereo depth on the inspected feature.
+                                if (g_focusActive) {
+                                    double sf = g_stereoFull;
+                                    displayRig.ipdFactor =
+                                        (float)((1.0 - sf) * drig.ipd_factor + sf * 1.0);
+                                    displayRig.parallaxFactor =
+                                        (float)((1.0 - sf) * drig.parallax_factor + sf * 1.0);
+                                }
+                            }
+                            // [FOCUS] NO rig-pose translation. The POI is placed on the
+                            // convergence/zero-parallax plane purely by the targetDist framing
+                            // (set at acquire + orbit), so the display eye stays at the origin
+                            // (consistent with selCam + the camera-centric world) and the depth
+                            // pick stays accurate. Translating the pose moved the eye and made
+                            // the pick drift in orbit mode after a few clicks.
+                            // Frustum-source viewing distance = eye->display plane = es*N
+                            // = persp * m2v * N (m2v = vH/canvasH); matches the cam rig's
+                            // 1/convergence. Drives the focus framing + orbit.
+                            {
+                                float m2v_eff = (canvasH > 1.0e-6f)
+                                                    ? (displayRig.virtualDisplayHeight / canvasH) : 0.0f;
+                                g_viewDistXR = displayRig.perspectiveFactor * m2v_eff * xr.nominalViewerZ;
+                            }
                             locateInfo.next = &displayRig;
                         }
                         eyeTrackingState.next = &viewRigRaw;
@@ -2166,6 +2337,14 @@ int main() {
                         // HUD eye readout. Under the rig, views[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel
                         // (XrViewDisplayRawEXT); without the rig, fall back to views[].
+                        // Capture the runtime-resolved CANVAS size (window client area in
+                        // meters) — the physical height the runtime runs the Kooima/rig
+                        // math on. The cam<->display converter MUST be fed this (not the
+                        // full display height), else the rig switch zooms ~1.36x.
+                        if (viewRigRaw.canvasSizeMeters.height > 1.0e-6f) {
+                            g_canvasWM = viewRigRaw.canvasSizeMeters.width;
+                            g_canvasHM = viewRigRaw.canvasSizeMeters.height;
+                        }
                         if (useRig && viewRigRaw.eyeCountOutput > 0) {
                             for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
                                 xr.eyePositions[v][0] = viewRigRaw.rawEyes[v].x;
@@ -2237,14 +2416,13 @@ int main() {
                                 const XrView& sv = srcViews[eye];
                                 float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
                                 float near_z, far_z;
-                                if (rigCamera) {
-                                    // Camera rig: a plain perspective camera. The geo target
-                                    // is fixed at kTargetXrDist (1 XR-m) regardless of altitude
-                                    // (s = kTargetXrDist/targetDist), so a FIXED tight near/far
-                                    // around that scene scale keeps depth precision (~4000:1).
-                                    // Decoupled from the convergence — the convergence
-                                    // auto-focus tracks the crosshair ground (which can be at
-                                    // the horizon), and tying near to it would clip foreground.
+                                if (rigCamera || g_focusActive) {
+                                    // Camera rig — AND the focus-mode converted display rig,
+                                    // which frames the scene at the SAME XR scale (POI at
+                                    // ~1 XR-m) and has eye_display.z (ez) ~= 0. Using the
+                                    // ez-based display range below would give near=1e-4,
+                                    // far=1500 (1.5e7 ratio) => total depth-precision collapse
+                                    // / z-fighting. Use the fixed tight range instead.
                                     near_z = 0.05f;
                                     far_z  = 200.0f;
                                 } else {
@@ -2353,7 +2531,7 @@ int main() {
                                 // XR-m, exp-smoothed; fed to the rig next frame.
                                 double groundM = geo::rayGroundDistanceM(g_geoNav.cam.pos,
                                                                          g_geoNav.cam.dir);
-                                if (groundM > 0.0) {
+                                if (groundM > 0.0 && !g_focusActive) {  // [FOCUS] freeze conv during focus
                                     double xrDist = groundM * s;
                                     if (xrDist < 0.2) xrDist = 0.2;
                                     if (xrDist > 50.0) xrDist = 50.0;
@@ -2503,10 +2681,28 @@ int main() {
                                         glm::dvec3 xrPos = pickAccum / (double)pickHits;
                                         glm::dvec3 ecef = glm::dvec3(
                                             glm::inverse(g_xrFromEcef) * glm::dvec4(xrPos, 1.0));
-                                        g_geoNav.acquireOrbit(ecef, std::max(g_viewerPosXr.z, 0.1));
-                                        g_dioramaCenterXr = xrPos; // glide from here
-                                        LOG_INFO("Orbit acquired (diorama, %d-eye pick): ECEF (%.1f, %.1f, %.1f)",
-                                                 pickHits, ecef.x, ecef.y, ecef.z);
+                                        // Smoothly re-aim the camera to center the new POI and
+                                        // reframe it onto the zero-parallax plane (targetDist =
+                                        // eye->POI / vDist => POI at XR depth vDist). Camera
+                                        // POSITION stays put; only dir + zoom lerp (g_focusT).
+                                        // Eye stays at the origin (no rig translation) => the pick
+                                        // stays as accurate as fly mode.
+                                        double poiDist = glm::length(g_geoNav.cam.pos - ecef);
+                                        g_focusPOIecef = ecef;
+                                        g_poiXitFromDir = g_geoNav.cam.dir;
+                                        g_poiXitToDir = glm::normalize(ecef - g_geoNav.cam.pos);
+                                        g_poiXitFromTD = g_geoNav.targetDist;
+                                        g_poiXitToTD =
+                                            std::max(poiDist / std::max((double)g_viewDistXR, 0.1), 20.0);
+                                        g_focusT = 0.0;  // start the transition
+                                        if (g_focusActive) {
+                                            LOG_INFO("[FOCUS] shift POI -> ECEF (%.1f, %.1f, %.1f) dist=%.0f",
+                                                     ecef.x, ecef.y, ecef.z, poiDist);
+                                        } else {
+                                            g_focusActive = true;
+                                            LOG_INFO("[FOCUS] acquired POI ECEF (%.1f, %.1f, %.1f) dist=%.0f vDist=%.3f",
+                                                     ecef.x, ecef.y, ecef.z, poiDist, g_viewDistXR);
+                                        }
                                     } else {
                                         LOG_INFO("Pick missed (sky) — staying camera-centric");
                                     }
