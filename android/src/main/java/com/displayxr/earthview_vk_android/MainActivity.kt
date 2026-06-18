@@ -14,10 +14,11 @@
 //      xrCreateInstance and, if it can't be reached, prompt the user.
 //
 // Vendor-neutral + out-of-process (ADR-025): no CNSDK, no CAMERA — the OOP
-// runtime service owns eye tracking + weave. This is the M3 placeholder leg:
-// it brings up the OOP OpenXR session and renders a cleared globe-blue frame to
-// prove the harness on NP02J. Tile streaming (cesium) + the focus/orbit camera
-// land in the next step — see docs/m3-android-plan.md.
+// runtime service owns eye tracking + weave. Beyond the bring-up jobs above it
+// also owns: (4) the first-run Map Tiles API-key dialog (persisted in
+// SharedPreferences, handed to native) and (5) the Google attribution overlay
+// (logo + the data-provider credits native reports — required by the Map Tiles
+// ToS). See docs/m3-android-plan.md / docs/api-key.md.
 
 package com.displayxr.earthview_vk_android
 
@@ -25,13 +26,26 @@ import android.app.AlertDialog
 import android.app.NativeActivity
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
+import android.view.Gravity
 import android.view.GestureDetector
 import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.EditText
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 
 class MainActivity : NativeActivity() {
@@ -47,6 +61,11 @@ class MainActivity : NativeActivity() {
             "org.freedesktop.monado.openxr_runtime.out_of_process",
             "org.freedesktop.monado.openxr_runtime.in_process",
         )
+
+        private const val PREFS = "earthview"
+        private const val PREF_API_KEY = "api_key"
+        private const val KEY_HELP_URL =
+            "https://developers.google.com/maps/documentation/tile/get-api-key"
     }
 
     // Implemented in main.cpp. rotation = Surface.ROTATION_0/90/180/270 → 0/1/2/3.
@@ -68,6 +87,17 @@ class MainActivity : NativeActivity() {
     // fly. (x,y) are view pixels; native unprojects via a depth pick.
     private external fun nativeOnDoubleTap(x: Float, y: Float)
 
+    // The user's Map Tiles API key (re-creates the tileset native-side).
+    private external fun nativeSetApiKey(key: String)
+
+    // True once the tileset is streaming (false ⇒ keyless ⇒ show the dialog).
+    private external fun nativeTilesActive(): Boolean
+
+    // Joined data-provider credits for the attribution overlay (logo is local).
+    private external fun nativeGetAttribution(): String
+
+    private val prefs: SharedPreferences by lazy { getSharedPreferences(PREFS, Context.MODE_PRIVATE) }
+
     private val installedRuntime: String? by lazy {
         RUNTIME_PACKAGES.firstOrNull {
             try {
@@ -86,6 +116,10 @@ class MainActivity : NativeActivity() {
                 override fun onDoubleTap(e: MotionEvent): Boolean {
                     try { nativeOnDoubleTap(e.x, e.y) } catch (_: Throwable) {}
                     return true
+                }
+
+                override fun onLongPress(e: MotionEvent) {
+                    showKeyDialog(prefs.getString(PREF_API_KEY, null))  // change key
                 }
             },
         )
@@ -169,12 +203,152 @@ class MainActivity : NativeActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         wakeRuntime()
+        // Hand any saved key to native BEFORE bring-up so tiles_init finds it.
+        prefs.getString(PREF_API_KEY, null)?.takeIf { it.isNotEmpty() }?.let {
+            try { nativeSetApiKey(it) } catch (_: Throwable) {}
+        }
         super.onCreate(savedInstanceState)
         pushRotation()
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
             .registerDisplayListener(displayListener, null)
         watchForRuntimeUnavailable()
+        watchForKeyAndAttribution()
         showControlsHint()
+    }
+
+    // ── Map Tiles API key ───────────────────────────────────────────────────
+    // After bring-up, if the tileset isn't streaming and we have no saved key,
+    // prompt for one. Also kicks the attribution overlay once tiles are live.
+    private fun watchForKeyAndAttribution() {
+        val handler = Handler(Looper.getMainLooper())
+        handler.postDelayed(
+            object : Runnable {
+                var tries = 0
+                var prompted = false
+                override fun run() {
+                    if (isFinishing) return
+                    val active = try { nativeTilesActive() } catch (_: Throwable) { false }
+                    if (active) {
+                        ensureAttributionOverlay()
+                        return  // streaming — done
+                    }
+                    val haveKey = !prefs.getString(PREF_API_KEY, null).isNullOrEmpty()
+                    val ready = try { nativeXrReady() } catch (_: Throwable) { false }
+                    if (ready && !haveKey && !prompted) {
+                        prompted = true
+                        showKeyDialog(null)
+                    }
+                    if (tries++ < 60) handler.postDelayed(this, 1000)
+                }
+            },
+            3000,
+        )
+    }
+
+    private fun showKeyDialog(current: String?) {
+        try {
+            val density = resources.displayMetrics.density
+            val pad = (20 * density).toInt()
+            val field = EditText(this).apply {
+                hint = "AIza…  (paste your Map Tiles API key)"
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                setText(current ?: "")
+            }
+            val container = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(pad, pad / 2, pad, 0)
+                addView(field)
+            }
+            AlertDialog.Builder(this)
+                .setTitle("Google Map Tiles API key")
+                .setMessage(
+                    "EarthView streams Google Photorealistic 3D Tiles, which need " +
+                        "your own Map Tiles API key. Paste it below, or get one from " +
+                        "the Google Cloud Console (enable “Map Tiles API”).",
+                )
+                .setView(container)
+                .setCancelable(current != null)
+                .setPositiveButton("Save") { _, _ ->
+                    val key = field.text.toString().trim()
+                    if (key.isNotEmpty()) {
+                        prefs.edit().putString(PREF_API_KEY, key).apply()
+                        try { nativeSetApiKey(key) } catch (_: Throwable) {}
+                    }
+                }
+                .setNeutralButton("Get a key") { _, _ ->
+                    try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(KEY_HELP_URL))) } catch (_: Throwable) {}
+                    // Re-prompt after they return.
+                    Handler(Looper.getMainLooper()).postDelayed({ if (!isFinishing) showKeyDialog(current) }, 500)
+                }
+                .apply { if (current != null) setNegativeButton("Cancel", null) }
+                .show()
+        } catch (_: Throwable) {}
+    }
+
+    // ── Google attribution overlay (required by the Map Tiles ToS) ──────────
+    // A bottom strip ABOVE the runtime's MonadoView weave surface: the Google
+    // logo + the data-provider credits native reports (~2 Hz). Added as its own
+    // WindowManager window (like the modelviewer bar) so it stacks over the
+    // weave window.
+    private var attrBar: LinearLayout? = null
+    private var attrText: TextView? = null
+    private val attrHandler = Handler(Looper.getMainLooper())
+
+    private fun ensureAttributionOverlay() {
+        if (attrBar != null) return
+        try {
+            val density = resources.displayMetrics.density
+            val bar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding((12 * density).toInt(), (6 * density).toInt(),
+                    (12 * density).toInt(), (6 * density).toInt())
+                background = GradientDrawable().apply { setColor(0x66000000) }  // subtle scrim
+            }
+            val logo = ImageView(this).apply {
+                setImageResource(R.drawable.google_logo)
+                val h = (16 * density).toInt()
+                layoutParams = LinearLayout.LayoutParams((h * 66 / 26), h).apply {
+                    marginEnd = (10 * density).toInt()
+                }
+            }
+            attrText = TextView(this).apply {
+                setTextColor(Color.WHITE)
+                textSize = 11f
+                text = "Google"
+                maxLines = 2
+            }
+            bar.addView(logo)
+            bar.addView(attrText)
+            val wlp = WindowManager.LayoutParams().apply {
+                width = WindowManager.LayoutParams.MATCH_PARENT
+                height = WindowManager.LayoutParams.WRAP_CONTENT
+                gravity = Gravity.BOTTOM
+                type = WindowManager.LayoutParams.TYPE_APPLICATION
+                flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                format = PixelFormat.TRANSLUCENT
+            }
+            windowManager.addView(bar, wlp)
+            attrBar = bar
+            refreshAttribution()
+        } catch (_: Throwable) {}
+    }
+
+    private val refreshRunnable = object : Runnable {
+        override fun run() {
+            refreshAttribution()
+            attrHandler.postDelayed(this, 2000)
+        }
+    }
+
+    private fun refreshAttribution() {
+        try {
+            val credits = nativeGetAttribution()
+            attrText?.text = if (credits.isNullOrEmpty()) "Google" else "Google  ·  $credits"
+            attrHandler.removeCallbacks(refreshRunnable)
+            attrHandler.postDelayed(refreshRunnable, 2000)
+        } catch (_: Throwable) {}
     }
 
     private fun showControlsHint() {
@@ -205,6 +379,9 @@ class MainActivity : NativeActivity() {
             (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
                 .unregisterDisplayListener(displayListener)
         } catch (_: Throwable) {}
+        attrHandler.removeCallbacks(refreshRunnable)
+        attrBar?.let { try { windowManager.removeViewImmediate(it) } catch (_: Throwable) {} }
+        attrBar = null
         super.onDestroy()
     }
 }
