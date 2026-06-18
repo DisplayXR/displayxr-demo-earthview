@@ -48,6 +48,12 @@
     -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- EarthView streams Google Photorealistic 3D Tiles over HTTPS (cesium-
+         native + CesiumCurl) — unlike the modelviewer template (local files),
+         this leg needs network access or every tile fetch fails silently. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
