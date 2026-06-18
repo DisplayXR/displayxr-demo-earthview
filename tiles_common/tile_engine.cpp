@@ -106,6 +106,28 @@ stripHtml(const std::string &html)
 	return std::regex_replace(html, tags, "");
 }
 
+// CesiumCurl options for the platform. On Android the statically-linked
+// curl/OpenSSL has no default CA bundle and CURLSSLOPT_NATIVE_CA (used by the
+// desktop legs) is a no-op with OpenSSL, so every HTTPS tile fetch fails cert
+// verification → zero tiles. Point CURLOPT_CAPATH at Android's system CA store
+// (OpenSSL-hashed dir). Desktop keeps the default (native CA store).
+CesiumCurl::CurlAssetAccessorOptions
+curlOptions()
+{
+	CesiumCurl::CurlAssetAccessorOptions opts;
+#ifdef __ANDROID__
+	// Prefer a CAINFO bundle the app built from the device's certs (the system
+	// cacerts dir is hashed in the old OpenSSL-1.0 format, so CAPATH fails with
+	// cesium's OpenSSL 3.x). Fall back to CAPATH if the bundle is unavailable.
+	if (const char *ca = std::getenv("EARTHVIEW_CA_BUNDLE"); ca != nullptr && *ca != '\0') {
+		opts.certificateFile = ca;
+	} else {
+		opts.certificatePath = "/system/etc/security/cacerts";
+	}
+#endif
+	return opts;
+}
+
 } // namespace
 
 namespace {
@@ -207,7 +229,7 @@ TileEngine::probeKey(const std::string &key, std::string &errOut)
 	}
 	try {
 		CesiumAsync::AsyncSystem async(std::make_shared<ThreadTaskProcessor>());
-		auto accessor = std::make_shared<CesiumCurl::CurlAssetAccessor>();
+		auto accessor = std::make_shared<CesiumCurl::CurlAssetAccessor>(curlOptions());
 		const std::string url =
 		    "https://tile.googleapis.com/v1/3dtiles/root.json?key=" + key;
 		std::shared_ptr<CesiumAsync::IAssetRequest> req =
@@ -269,7 +291,7 @@ TileEngine::init(Cesium3DTilesSelection::IPrepareRendererResources *prepare)
 	Cesium3DTilesContent::registerAllTileContentTypes();
 
 	auto pAccessor = std::make_shared<KeyInjectingAccessor>(
-	    std::make_shared<CesiumCurl::CurlAssetAccessor>(), key_);
+	    std::make_shared<CesiumCurl::CurlAssetAccessor>(curlOptions()), key_);
 	impl_->credits = std::make_shared<CesiumUtility::CreditSystem>();
 
 	// Non-owning: TileRenderer is owned by the app and outlives the engine.

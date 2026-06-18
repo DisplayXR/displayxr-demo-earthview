@@ -33,11 +33,16 @@
 #include "tile_engine.h"
 #include "tile_renderer.h"
 
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/android_sink.h>
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <jni.h>
 #include <mutex>
 #include <string>
@@ -128,6 +133,7 @@ uint32_t g_image_count = 0;
 uint32_t g_atlas_w = 0, g_atlas_h = 0, g_tile_w = 0, g_tile_h = 0;
 bool g_has_view_rig = false;
 uint64_t g_frame_count = 0;
+const char *g_internal_data_path = nullptr;  // NativeActivity internalDataPath
 
 // Tiles.
 TileRenderer g_tile_renderer;
@@ -382,9 +388,49 @@ seed_api_key_from_prop()
 	}
 }
 
+// cesium's bundled curl/OpenSSL 3.x has no CA store on Android, and CURLOPT_CAPATH
+// to /system/etc/security/cacerts fails (those are hashed in the old OpenSSL 1.0
+// format). Concatenate the device's own PEM certs into one bundle and hand it to
+// CesiumCurl as CURLOPT_CAINFO (via EARTHVIEW_CA_BUNDLE → tile_engine curlOptions).
+std::string
+build_ca_bundle()
+{
+	if (!g_internal_data_path) return "";
+	const char *sys = "/system/etc/security/cacerts";
+	DIR *d = opendir(sys);
+	if (!d) { LOGW("no system CA dir %s", sys); return ""; }
+	std::string out = std::string(g_internal_data_path) + "/cacert.pem";
+	FILE *of = fopen(out.c_str(), "wb");
+	if (!of) { closedir(d); return ""; }
+	int n = 0;
+	char buf[8192];
+	for (struct dirent *e; (e = readdir(d)) != nullptr;) {
+		if (e->d_name[0] == '.') continue;
+		std::string p = std::string(sys) + "/" + e->d_name;
+		FILE *in = fopen(p.c_str(), "rb");
+		if (!in) continue;
+		for (size_t r; (r = fread(buf, 1, sizeof(buf), in)) > 0;) fwrite(buf, 1, r, of);
+		fputc('\n', of);
+		fclose(in);
+		++n;
+	}
+	fclose(of);
+	closedir(d);
+	LOGI("CA bundle: %d certs -> %s", n, out.c_str());
+	return n > 0 ? out : "";
+}
+
 bool
 tiles_init()
 {
+	// Route cesium's spdlog to logcat (tag "cesium") so HTTP/TLS/tile errors are
+	// visible — tile_engine otherwise mutes spdlog to `critical` with no sink.
+	spdlog::set_default_logger(std::make_shared<spdlog::logger>(
+	    "cesium", std::make_shared<spdlog::sinks::android_sink_mt>("cesium")));
+
+	std::string ca = build_ca_bundle();
+	if (!ca.empty()) setenv("EARTHVIEW_CA_BUNDLE", ca.c_str(), 1);
+
 	seed_api_key_from_prop();
 	if (!g_tile_renderer.init(g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
 	        g_vk_queue_family, g_tile_w, g_tile_h)) {
@@ -392,6 +438,10 @@ tiles_init()
 		return false;
 	}
 	g_tiles_active = g_tile_engine.init(&g_tile_renderer);
+	// tile_engine mutes spdlog to `critical`; relax to `err` so HTTP/TLS failures
+	// surface in logcat (tag "cesium") without the per-request parse-warning spam.
+	spdlog::set_level(spdlog::level::err);
+	spdlog::flush_on(spdlog::level::err);
 	LOGI("TileEngine::init -> tiles %s (key %s)", g_tiles_active ? "ACTIVE" : "inactive",
 	     g_tile_engine.hasKey() ? "present" : "MISSING");
 	g_geoNav.frameBookmark(0);  // seed the first city
@@ -558,6 +608,12 @@ render_frame()
 			const auto &result = g_tile_engine.update(selCam, (double)g_tile_w, (double)g_tile_h, hfov, vfov);
 			auto drawList = g_tile_renderer.buildDrawList(result, g_xrFromEcef);
 
+			if ((g_frame_count % 300) == 0) {
+				const auto &att = g_tile_engine.attribution();
+				LOGI("tiles draw=%zu inflight=%d rt=%d convD=%.3f groundM=%.0f",
+				     drawList.size(), att.tilesInFlight, att.renderTiles, g_convDiopters, groundM);
+			}
+
 			uint32_t idx = 0;
 			XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 			if (xrAcquireSwapchainImage(g_swapchain, &ai, &idx) == XR_SUCCESS) {
@@ -709,6 +765,7 @@ extern "C" void
 android_main(struct android_app *app)
 {
 	LOGI("earthview_vk_android: android_main entered");
+	g_internal_data_path = app->activity->internalDataPath;
 	app->onAppCmd = handle_cmd;
 	if (!initialize_loader(app)) LOGE("OpenXR loader init failed");
 	while (true) {
