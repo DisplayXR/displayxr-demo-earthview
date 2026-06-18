@@ -37,7 +37,10 @@ android {
             cmake {
                 arguments "-DANDROID_PLATFORM=${project.sharedMinSdk}",
                     "-DANDROID_STL=c++_shared",
-                    "-DANDROID_ARM_NEON=TRUE"
+                    "-DANDROID_ARM_NEON=TRUE",
+                    // cesium-native deps cross-build for arm64-android via
+                    // ezvcpkg (else it defaults to the host triplet). §5a spike.
+                    "-DVCPKG_TRIPLET=arm64-android"
             }
         }
 
@@ -65,7 +68,10 @@ android {
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
-            version "${cmake_version}"
+            // tiles_common + cesium-native require CMake >= 3.25; AGP bundles
+            // 3.22.1, so local.properties sets cmake.dir to a newer CMake
+            // (Homebrew 3.31.6). The version here must match that install.
+            version "3.31.6"
         }
     }
 
