@@ -191,7 +191,17 @@ static constexpr double kDioramaGlideTau = 0.35; // s
 // eye tracking perturbs the frustum. Convergence default = 1/kTargetXrDist (the
 // geo target sits 1 XR-m in front of the camera); a centre-ray depth read will
 // refine it (matching the Windows leg). See docs/rendering-notes.md.
-static constexpr float kCameraVFovRad = 0.6498f;  // ~37.2° full vertical FOV (2*atan(0.3249))
+static constexpr float kCameraVFovRad = 0.6498f;  // ~37.2° — fallback before display info resolves
+// Physical (orthoscopic) cam-rig vFOV: the angle the FULL DISPLAY subtends from
+// the nominal viewing position. 2*tan(vfov/2) = displayH / nominalZ. Use the full
+// physical display height (NOT the window canvas) so the fly framing stays the
+// full-screen FOV even windowed. Falls back to kCameraVFovRad until display info
+// (height + nominal Z) resolves. See docs/rendering-notes.md §5.
+static inline float CamVFovRad(float physHeightM, float nominalZ) {
+    return (physHeightM > 1.0e-6f && nominalZ > 1.0e-6f)
+               ? 2.0f * atanf(physHeightM / (2.0f * nominalZ))
+               : kCameraVFovRad;
+}
 static float g_convDiopters = 1.0f;               // 1/m to convergence plane
 static float g_canvasWM = 0.0f, g_canvasHM = 0.0f; // runtime-resolved canvas size (m)
 static float g_viewDistXR = 0.0f;                  // frustum-source eye->focus distance
@@ -446,9 +456,26 @@ static void UpdateGeoNav(InputState& input, float dt) {
         }
         input.lookDX = input.lookDY = 0.0f;
     }
-    // Scroll dolly (exponential).
+    // Scroll dolly (exponential). Zoom is a CESIUM-WORLD op (scales the tile world
+    // via targetDist), NOT a rig op — so it must keep the orbit POI fixed itself (§6).
     if (input.dollySteps != 0.0f) {
-        g_geoNav.dolly((double)input.dollySteps);
+        if (g_focusActive) {
+            // [FOCUS] zoom = change the orbit RADIUS about the POI, then re-pin the
+            // POI on the convergence plane (mirrors the orbit-drag re-pin above). A
+            // plain forward dolly moves toward the geo target (not the POI during
+            // orbit), so the POI slides off the convergence plane and the physical-FOV
+            // full perspective makes that drift visible.
+            glm::dvec3 poi = g_focusPOIecef;
+            glm::dvec3 v = g_geoNav.cam.pos - poi;          // radius vector
+            double k = std::pow(0.9, (double)input.dollySteps);  // match GeoNav::dolly
+            v *= k;
+            g_geoNav.cam.pos = poi + v;
+            g_geoNav.cam.dir = glm::normalize(poi - g_geoNav.cam.pos);
+            g_geoNav.targetDist =
+                std::max(glm::length(v) / std::max((double)g_viewDistXR, 0.1), 20.0);
+        } else {
+            g_geoNav.dolly((double)input.dollySteps);
+        }
         input.dollySteps = 0.0f;
     }
     // [FOCUS] WASDQE while in orbit/display mode => disturbance-free return to the
@@ -2232,7 +2259,9 @@ int main() {
                             cameraRig.ipdFactor = g_input.viewParams.ipdFactor;
                             cameraRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                             cameraRig.convergenceDiopters = g_convDiopters;  // 1/m, auto-focused
-                            cameraRig.verticalFov = kCameraVFovRad;
+                            // Orthoscopic vFOV from the FULL display's physical subtense so the
+                            // fly view matches the full-screen panel even windowed (§5).
+                            cameraRig.verticalFov = CamVFovRad(xr.displayHeightM, xr.nominalViewerZ);
                             // [FOCUS] on the orbit->fly return, glide ipd/par from the value
                             // that matches the orbit's display rig (ipd=1 <-> cam ipd=1/f,
                             // f=convDiopters*N => seamless at the switch instant) back to the
@@ -2264,7 +2293,10 @@ int main() {
                                 crig0.ipd_factor = g_input.viewParams.ipdFactor;
                                 crig0.parallax_factor = g_input.viewParams.parallaxFactor;
                                 crig0.inv_convergence_distance = g_convDiopters;
-                                crig0.half_tan_vfov = tanf(0.5f * kCameraVFovRad);
+                                // Source half-tan-vfov = the live PHYSICAL fly FOV, so the
+                                // cam->display conversion reproduces the fly framing exactly =>
+                                // disturbance-free switch. (MUST match cameraRig.verticalFov; §5.)
+                                crig0.half_tan_vfov = tanf(0.5f * CamVFovRad(xr.displayHeightM, xr.nominalViewerZ));
                                 crig0.m2v = 1.0f;
                                 dxr_display_rig drig = {};
                                 dxr_view_rig_camera_to_display(&crig0, &dinfo, &drig);
@@ -2520,8 +2552,10 @@ int main() {
                                 double s = kTargetXrDist / std::max(g_geoNav.targetDist, 1.0);
                                 g_xrFromEcef = geo::xrFromEcefCamera(g_geoNav.cam, anchorXr, s);
                                 double aspect = (renderH > 0) ? (double)renderW / (double)renderH : 1.0;
-                                vfov = (double)kCameraVFovRad * 1.15;
-                                double vHalfTan = std::tan(0.5 * (double)kCameraVFovRad);
+                                // Match the selection frustum to the cam rig's physical vFOV (§5).
+                                double camVFov = (double)CamVFovRad(xr.displayHeightM, xr.nominalViewerZ);
+                                vfov = camVFov * 1.15;
+                                double vHalfTan = std::tan(0.5 * camVFov);
                                 hfov = 2.0 * std::atan(vHalfTan * aspect) * 1.15;
 
                                 // Convergence auto-focus: forward ray → GROUND distance (geo
