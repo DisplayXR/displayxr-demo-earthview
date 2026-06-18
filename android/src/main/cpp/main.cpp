@@ -175,6 +175,13 @@ uint32_t g_canvas_px_w = 0, g_canvas_px_h = 0;  // from XrViewDisplayRawEXT
 // that drive the orthoscopic fly FOV (CamVFovRad). See docs/rendering-notes.md §5.
 float g_displayHeightM = 0.0f, g_nominalViewerZ = 0.0f;
 
+// API key (from the Kotlin dialog / SharedPreferences) + attribution feed.
+std::mutex g_key_mtx;
+std::string g_pending_key;            // set via JNI; seeds GOOGLE_MAPS_API_KEY
+std::atomic<bool> g_apply_key{false}; // re-init the tileset on the render thread
+std::mutex g_attr_mtx;
+std::string g_attr_text;              // joined credit lines for the Kotlin overlay
+
 // JNI-shared.
 std::atomic<int> g_display_rotation{0};
 std::atomic<bool> g_runtime_unavailable{false};
@@ -412,8 +419,18 @@ create_reference_space()
 // Pull a dev key from `debug.dxr.ev.key` into GOOGLE_MAPS_API_KEY so
 // TileEngine::init() finds it (Android has no shell env for the app).
 void
-seed_api_key_from_prop()
+seed_api_key()
 {
+	// (1) a key from the in-app dialog / SharedPreferences (set via JNI), else
+	// (2) the dev `debug.dxr.ev.key` system property.
+	{
+		std::lock_guard<std::mutex> lk(g_key_mtx);
+		if (!g_pending_key.empty()) {
+			setenv("GOOGLE_MAPS_API_KEY", g_pending_key.c_str(), 1);
+			LOGI("API key from app (len %zu)", g_pending_key.size());
+			return;
+		}
+	}
 	char prop[PROP_VALUE_MAX] = {};
 	if (__system_property_get("debug.dxr.ev.key", prop) > 0 && prop[0]) {
 		setenv("GOOGLE_MAPS_API_KEY", prop, 1);
@@ -464,13 +481,14 @@ tiles_init()
 	std::string ca = build_ca_bundle();
 	if (!ca.empty()) setenv("EARTHVIEW_CA_BUNDLE", ca.c_str(), 1);
 
-	seed_api_key_from_prop();
+	seed_api_key();
 	if (!g_tile_renderer.init(g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
 	        g_vk_queue_family, g_tile_w, g_tile_h)) {
 		LOGE("TileRenderer::init failed");
 		return false;
 	}
 	g_tiles_active = g_tile_engine.init(&g_tile_renderer);
+	g_apply_key.store(false, std::memory_order_relaxed);  // consumed by init
 	// tile_engine mutes spdlog to `critical`; relax to `err` so HTTP/TLS failures
 	// surface in logcat (tag "cesium") without the per-request parse-warning spam.
 	spdlog::set_level(spdlog::level::err);
@@ -479,6 +497,21 @@ tiles_init()
 	     g_tile_engine.hasKey() ? "present" : "MISSING");
 	g_geoNav.frameBookmark(0);  // seed the first city
 	return true;
+}
+
+// Re-create the tileset with a key entered at runtime (the in-app dialog). Runs
+// on the render thread, where the Vulkan device + cesium main thread are valid.
+void
+apply_pending_key()
+{
+	if (!g_apply_key.exchange(false, std::memory_order_relaxed)) return;
+	vkDeviceWaitIdle(g_vk_device);
+	g_tile_engine.shutdown();
+	seed_api_key();
+	g_tiles_active = g_tile_engine.init(&g_tile_renderer);
+	spdlog::set_level(spdlog::level::err);
+	LOGI("API key applied -> tiles %s (key %s)", g_tiles_active ? "ACTIVE" : "inactive",
+	     g_tile_engine.hasKey() ? "present" : "MISSING");
 }
 
 void
@@ -744,10 +777,24 @@ render_frame()
 			const auto &result = g_tile_engine.update(selCam, (double)g_tile_w, (double)g_tile_h, hfov, vfov);
 			auto drawList = g_tile_renderer.buildDrawList(result, g_xrFromEcef);
 
-			if ((g_frame_count % 300) == 0) {
+			// Attribution feed for the Kotlin overlay (~2 Hz). The Google Map Tiles
+			// ToS REQUIRES showing the Google logo + the per-tile data-provider
+			// credits; the logo is in the overlay, the credits come from here.
+			if ((g_frame_count % 30) == 0) {
 				const auto &att = g_tile_engine.attribution();
-				LOGI("tiles draw=%zu inflight=%d rt=%d convD=%.3f groundM=%.0f",
-				     drawList.size(), att.tilesInFlight, att.renderTiles, g_convDiopters, groundM);
+				std::string s;
+				for (size_t i = 0; i < att.credits.size() && i < 8; ++i) {
+					if (!s.empty()) s += " • ";
+					s += att.credits[i];
+				}
+				{
+					std::lock_guard<std::mutex> lk(g_attr_mtx);
+					g_attr_text = s;
+				}
+				if ((g_frame_count % 300) == 0)
+					LOGI("tiles draw=%zu inflight=%d rt=%d convD=%.3f credits=%zu",
+					     drawList.size(), att.tilesInFlight, att.renderTiles, g_convDiopters,
+					     att.credits.size());
 			}
 
 			// [FOCUS] deferred double-tap pick: after each eye renders, read its
@@ -955,6 +1002,40 @@ Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeOnDoubleTap(
 	g_pendingPick.store(true, std::memory_order_relaxed);
 }
 
+// The user's Map Tiles API key, from the in-app dialog (persisted in Kotlin
+// SharedPreferences). Re-creates the tileset on the render thread.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeSetApiKey(
+    JNIEnv *env, jobject, jstring key)
+{
+	const char *k = key ? env->GetStringUTFChars(key, nullptr) : nullptr;
+	{
+		std::lock_guard<std::mutex> lk(g_key_mtx);
+		g_pending_key = (k != nullptr) ? k : "";
+	}
+	if (k) env->ReleaseStringUTFChars(key, k);
+	g_apply_key.store(true, std::memory_order_relaxed);
+}
+
+// True once the tileset is streaming (Kotlin shows the key dialog if false).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeTilesActive(JNIEnv *, jobject)
+{
+	return g_tiles_active ? JNI_TRUE : JNI_FALSE;
+}
+
+// Joined data-provider credits (the Google logo is rendered by the overlay).
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeGetAttribution(JNIEnv *env, jobject)
+{
+	std::string s;
+	{
+		std::lock_guard<std::mutex> lk(g_attr_mtx);
+		s = g_attr_text;
+	}
+	return env->NewStringUTF(s.c_str());
+}
+
 extern "C" void
 android_main(struct android_app *app)
 {
@@ -973,6 +1054,7 @@ android_main(struct android_app *app)
 		if (g_instance != XR_NULL_HANDLE) {
 			poll_xr_events();
 			if (g_exit_requested) { destroy_all(); return; }
+			apply_pending_key();  // re-create the tileset if a key was just entered
 			if (app->window != nullptr && g_session_running) render_frame();
 		}
 	}
