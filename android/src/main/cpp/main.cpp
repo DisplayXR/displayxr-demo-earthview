@@ -32,6 +32,7 @@
 #include "geo_math.h"
 #include "tile_engine.h"
 #include "tile_renderer.h"
+#include "dxr_view_math.h"  // cam->display rig converter (focus/orbit display rig)
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/android_sink.h>
@@ -153,6 +154,8 @@ geo::GeoNav g_geoNav;
 glm::dmat4 g_xrFromEcef(1.0);
 float g_convDiopters = 1.0f;
 float g_viewDistXR = 0.0f;  // eye->focus distance = 1/convergence
+float g_canvasWM = 0.0f;    // runtime canvas width (m), for the rig converter aspect
+double g_stereoFull = 0.0;  // [FOCUS] ipd/par glide: 1 in focus (full depth), 0 in fly
 auto g_last_t = std::chrono::steady_clock::now();
 
 // Double-tap "focus" model (macOS parity, commit c95b624): double-tap a landmark
@@ -190,10 +193,15 @@ std::atomic<bool> g_reset_view{false};
 
 // Touch → nav deltas (accumulated by JNI, drained by the render thread).
 std::mutex g_touch_mtx;
-double g_look_dx = 0, g_look_dy = 0, g_dolly = 0;
+double g_look_dx = 0, g_look_dy = 0, g_dolly = 0, g_pan_dx = 0, g_pan_dy = 0;
 float g_last_x0 = 0, g_last_y0 = 0;
 float g_last_pinch = -1.0f;
+float g_last_cx = 0, g_last_cy = 0;     // two-finger centroid (for pan)
 int g_last_count = 0;
+// Two-finger tap / double-tap detection (reset view, like the desktop Space).
+double g_two_down_t = 0.0, g_last_two_tap_t = 0.0;
+float g_two_down_cx = 0, g_two_down_cy = 0;
+bool g_two_moved = false;
 double g_last_input_t = 0.0;  // for idle auto-orbit
 std::atomic<double> g_now_sec{0.0};
 
@@ -595,11 +603,12 @@ orbit_camera_around_poi(double dYaw, double dPitch)
 void
 apply_nav(float dt)
 {
-	double look_dx, look_dy, dolly;
+	double look_dx, look_dy, dolly, pan_dx, pan_dy;
 	{
 		std::lock_guard<std::mutex> lk(g_touch_mtx);
 		look_dx = g_look_dx; look_dy = g_look_dy; dolly = g_dolly;
-		g_look_dx = g_look_dy = g_dolly = 0;
+		pan_dx = g_pan_dx; pan_dy = g_pan_dy;
+		g_look_dx = g_look_dy = g_dolly = g_pan_dx = g_pan_dy = 0;
 	}
 
 	// [FOCUS] smooth POI transition (~0.4 s): re-aim cam.dir (slerp) + reframe
@@ -622,12 +631,35 @@ apply_nav(float dt)
 		if (g_focusT >= 1.0) g_focusT = 1.0;
 	}
 
+	// [FOCUS] glide the stereo fullness toward the current mode (~0.4 s) — drives
+	// the camera<->display rig ipd/parallax crossfade so the switch is seamless.
+	{
+		double tgt = g_focusActive ? 1.0 : 0.0;
+		double rate = (double)dt / 0.4;
+		if (g_stereoFull < tgt) g_stereoFull = std::min(tgt, g_stereoFull + rate);
+		else if (g_stereoFull > tgt) g_stereoFull = std::max(tgt, g_stereoFull - rate);
+	}
+
 	if (g_reset_view.exchange(false)) {
 		g_focusActive = false;
 		g_geoNav.frameBookmark(g_geoNav.bookmarkIndex);
 	}
 
 	bool active = false;
+
+	// Two-finger drag → pan (the desktop WASD translate), and it EXITS focus back
+	// to free fly — the natural way out of orbit mode (mirrors the macOS WASDQE
+	// auto-exit). Applied before look so the focus exit lands this frame.
+	if (pan_dx != 0 || pan_dy != 0) {
+		if (g_focusActive) {
+			g_focusActive = false;
+			g_focusT = 1.0;
+			LOGI("[FOCUS] two-finger pan -> fly");
+		}
+		g_geoNav.pan(pan_dx, pan_dy);
+		active = true;
+	}
+
 	if (look_dx != 0 || look_dy != 0) {
 		if (g_focusActive) {
 			g_focusT = 1.0;  // a drag cancels any in-flight re-aim
@@ -692,18 +724,61 @@ render_frame()
 		li.displayTime = fs.predictedDisplayTime;
 		li.space = g_app_space;
 
-		// Camera rig (fly): the runtime owns the off-axis eyes; convergence
-		// auto-focuses on the ground under the crosshair.
-		XrCameraRigEXT rig = {XR_TYPE_CAMERA_RIG_EXT};
+		// FLY uses the CAMERA rig (runtime owns the off-axis eyes, convergence
+		// auto-focuses on the ground). FOCUS uses the DISPLAY rig (portal) built
+		// from the live camera rig via the cam->display converter — the macOS/
+		// Windows model (PR #4): the world stays camera-centric, the POI is framed
+		// onto the zero-parallax plane by targetDist, and the display eye sits at
+		// the convergence anchor so the pick lands on the inspected feature.
+		XrCameraRigEXT camRig = {XR_TYPE_CAMERA_RIG_EXT};
+		XrDisplayRigEXT dispRig = {XR_TYPE_DISPLAY_RIG_EXT};
 		XrViewDisplayRawEXT raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
 		if (g_has_view_rig) {
-			rig.pose.orientation = {0, 0, 0, 1};
-			rig.ipdFactor = 1.0f; rig.parallaxFactor = 1.0f;
-			rig.convergenceDiopters = g_convDiopters;
-			// Orthoscopic fly FOV from the display's physical subtense (latched from
-			// the rig raw channel last frame). See docs/rendering-notes.md §5.
-			rig.verticalFov = CamVFovRad(g_displayHeightM, g_nominalViewerZ);
-			li.next = &rig;
+			const float camVFov = CamVFovRad(g_displayHeightM, g_nominalViewerZ);
+			if (!g_focusActive) {
+				camRig.pose.orientation = {0, 0, 0, 1};
+				camRig.ipdFactor = 1.0f;
+				camRig.parallaxFactor = 1.0f;
+				camRig.convergenceDiopters = g_convDiopters;
+				camRig.verticalFov = camVFov;
+				// On the focus->fly return, glide ipd/par from the focus value back
+				// to 1.0 over ~0.4 s (g_stereoFull drops 1->0).
+				if (g_stereoFull > 1.0e-4) {
+					double f = (double)g_convDiopters * (double)g_nominalViewerZ;
+					double invF = (f > 1.0e-4) ? (1.0 / f) : 1.0;
+					camRig.ipdFactor = (float)((1.0 - g_stereoFull) * 1.0 + g_stereoFull * invF);
+					camRig.parallaxFactor = camRig.ipdFactor;
+				}
+				g_viewDistXR = (g_convDiopters > 1.0e-6f) ? (1.0f / g_convDiopters) : 0.0f;
+				li.next = &camRig;
+			} else {
+				float canvasH = (g_displayHeightM > 1.0e-6f) ? g_displayHeightM : 1.0f;
+				float canvasW = (g_canvasWM > 1.0e-6f) ? g_canvasWM : canvasH;
+				dxr_rig_display_info dinfo = {
+				    canvasH, (canvasH > 1.0e-6f) ? (canvasW / canvasH) : 1.0f, g_nominalViewerZ};
+				dxr_camera_rig crig0 = {};
+				crig0.pose.orientation = {0, 0, 0, 1};
+				crig0.ipd_factor = 1.0f;
+				crig0.parallax_factor = 1.0f;
+				crig0.inv_convergence_distance = g_convDiopters;
+				crig0.half_tan_vfov = tanf(0.5f * camVFov);
+				crig0.m2v = 1.0f;
+				dxr_display_rig drig = {};
+				dxr_view_rig_camera_to_display(&crig0, &dinfo, &drig);
+				dispRig.pose.orientation = {drig.pose.orientation.x, drig.pose.orientation.y,
+				                            drig.pose.orientation.z, drig.pose.orientation.w};
+				dispRig.pose.position = {drig.pose.position.x, drig.pose.position.y,
+				                         drig.pose.position.z};
+				dispRig.virtualDisplayHeight = drig.virtual_display_height;
+				dispRig.perspectiveFactor = drig.perspective_factor;
+				// Glide ipd/par from the converter's seamless value to full 1.0.
+				double sf = g_stereoFull;
+				dispRig.ipdFactor = (float)((1.0 - sf) * drig.ipd_factor + sf * 1.0);
+				dispRig.parallaxFactor = (float)((1.0 - sf) * drig.parallax_factor + sf * 1.0);
+				float m2v_eff = (canvasH > 1.0e-6f) ? (drig.virtual_display_height / canvasH) : 0.0f;
+				g_viewDistXR = drig.perspective_factor * m2v_eff * g_nominalViewerZ;
+				li.next = &dispRig;
+			}
 			vs.next = &raw;
 		}
 
@@ -732,19 +807,21 @@ render_frame()
 			const double s = kTargetXrDist / std::max(g_geoNav.targetDist, 1.0);
 			g_xrFromEcef = geo::xrFromEcefCamera(g_geoNav.cam, glm::dvec3(0.0), s);
 
-			// Convergence auto-focus: ground distance under the forward ray. In
-			// focus the camera looks AT the POI, so the same ray lands the ZDP on
-			// the inspected landmark — no special-casing needed.
+			// Convergence auto-focus: ground distance under the forward ray.
+			// FROZEN during focus (macOS parity — the `!g_focusActive` gate): while
+			// inspecting, the POI was framed onto the ZDP at acquire, so the orbit
+			// must keep that convergence FIXED. Letting the auto-focus run in focus
+			// drifts convD every frame (the "auto IPD shrinkage over an orbit
+			// session" — Android-only because Win/Mac freeze it + use the display rig).
 			double groundM = geo::rayGroundDistanceM(g_geoNav.cam.pos, g_geoNav.cam.dir);
-			if (groundM > 0.0) {
+			if (groundM > 0.0 && !g_focusActive) {
 				double xrDist = std::min(std::max(groundM * s, 0.2), 50.0);
 				float tgt = (float)(1.0 / xrDist);
 				double a = 1.0 - std::exp(-(double)dt / kConvSmoothTau);
 				g_convDiopters += (tgt - g_convDiopters) * (float)a;
 			}
-			// Frustum-source eye->focus distance = 1/convergence (drives the focus
-			// reframe + orbit radius). Captured from the requested convergence.
-			g_viewDistXR = (g_convDiopters > 1.0e-6f) ? (1.0f / g_convDiopters) : 0.0f;
+			// (g_viewDistXR is set per-rig in the rig block above: 1/convergence for
+			// the camera rig in fly, the display-plane distance in focus.)
 			// Canvas px (for the tap→NDC pick), from the rig raw channel.
 			if (raw.canvasRectPx.extent.width > 0 && raw.canvasRectPx.extent.height > 0) {
 				g_canvas_px_w = (uint32_t)raw.canvasRectPx.extent.width;
@@ -757,6 +834,7 @@ render_frame()
 			if (raw.canvasSizeMeters.height > 0.0f && raw.eyeCountOutput > 0 &&
 			    (g_displayHeightM <= 0.0f || !raw.isTracking)) {
 				g_displayHeightM = raw.canvasSizeMeters.height;
+				g_canvasWM = raw.canvasSizeMeters.width;
 				g_nominalViewerZ = std::fabs(raw.rawEyes[0].z);
 			}
 
@@ -792,14 +870,25 @@ render_frame()
 					g_attr_text = s;
 				}
 				if ((g_frame_count % 300) == 0)
-					LOGI("tiles draw=%zu inflight=%d rt=%d convD=%.3f credits=%zu",
-					     drawList.size(), att.tilesInFlight, att.renderTiles, g_convDiopters,
-					     att.credits.size());
+					LOGI("tiles draw=%zu rt=%d convD=%.3f tgtDist=%.0f focus=%d",
+					     drawList.size(), att.renderTiles, g_convDiopters, g_geoNav.targetDist,
+					     (int)g_focusActive);
 			}
 
-			// [FOCUS] deferred double-tap pick: after each eye renders, read its
-			// depth at the tapped texel and unproject through that eye's matrices;
-			// the acquired point is the midpoint of the per-eye hits.
+			// [FOCUS] depth pick — render a dedicated CAMERA-CENTRIC mono view (XR
+			// origin, identity orientation = looking -Z, symmetric physical FOV)
+			// into tile 0, read depth at the tap NDC, unproject through it. This is
+			// the EXACT frame g_xrFromEcef maps to: the geo camera is always pinned
+			// to the XR origin (xrFromEcefCamera(cam, origin, s)), every frame, in
+			// fly AND focus. So the pick stays correct regardless of which rig is
+			// PRESENTING. The bug it fixes: once focused, the located views[] are the
+			// DISPLAY-rig eyes (back-offset pose + perspective/ipd scaling); reading
+			// their depth and unprojecting against the camera-centric world map threw
+			// the POI high into the sky (worse the more you zoomed — first tap from
+			// fly was fine, every tap while focused drifted up). A centred mono view
+			// also puts the tapped object AT the NDC (no off-axis disparity that a
+			// per-eye read would shift past). Tile 0 is overwritten by the
+			// presentation eyes immediately below.
 			const bool pendingPick = g_pendingPick.load(std::memory_order_relaxed);
 			glm::dvec3 pickAccum(0.0);
 			int pickHits = 0;
@@ -810,24 +899,42 @@ render_frame()
 				XrSwapchainImageWaitInfo wii = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 				wii.timeout = XR_INFINITE_DURATION;
 				if (xrWaitSwapchainImage(g_swapchain, &wii) == XR_SUCCESS) {
+					if (pendingPick && !drawList.empty()) {
+						// Cyclopean pick from the CAMERA ORIGIN (the geo camera is pinned
+						// there by g_xrFromEcef) looking -Z, symmetric physical fov. This
+						// recovers the object's XR position with the least error: the
+						// display-rig presentation centre is backed off ~1 unit, so
+						// casting from there threw a large translation ("way on top").
+						// A centred symmetric view also cancels off-axis disparity.
+						XrPosef cyc;
+						cyc.position = {0.0f, 0.0f, 0.0f};
+						cyc.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+						float vHalf = 0.5f * (float)camVFov;
+						float hHalf = std::atan(std::tan(vHalf) * (float)aspect);
+						XrFovf cfov = {-hHalf, hHalf, vHalf, -vHalf};  // symmetric centre frustum
+						float cV[16], cP[16];
+						mat4_view_from_xr_pose(cV, cyc);
+						mat4_from_xr_fov(cP, cfov, 0.05f, 200.0f);
+						convert_projection_gl_to_zero_to_one(cP);
+						g_tile_renderer.renderEye(g_images[idx].image, g_swapchain_format,
+						    g_atlas_w, g_atlas_h, 0, 0, g_tile_w, g_tile_h, cV, cP, drawList);
+						uint32_t px = (uint32_t)std::min(std::max(
+						    (g_pickNdcX + 1.0f) * 0.5f * (float)g_tile_w, 0.0f), (float)(g_tile_w - 1));
+						uint32_t py = (uint32_t)std::min(std::max(
+						    (1.0f - g_pickNdcY) * 0.5f * (float)g_tile_h, 0.0f), (float)(g_tile_h - 1));
+						float d = g_tile_renderer.readDepth(px, py);
+						if (d < 1.0f) {
+							glm::dmat4 V = glm::dmat4(glm::make_mat4(cV));
+							glm::dmat4 P = glm::dmat4(glm::make_mat4(cP));
+							glm::dvec4 w = glm::inverse(P * V) *
+							    glm::dvec4((double)g_pickNdcX, (double)g_pickNdcY, (double)d, 1.0);
+							if (std::abs(w.w) > 1e-12) { pickAccum = glm::dvec3(w) / w.w; pickHits = 1; }
+						}
+					}
 					for (uint32_t e = 0; e < kViewCount; ++e) {
 						g_tile_renderer.renderEye(g_images[idx].image, g_swapchain_format,
 						    g_atlas_w, g_atlas_h, e * g_tile_w, 0, g_tile_w, g_tile_h,
 						    viewMat[e], projMat[e], drawList);
-						if (pendingPick && e < 2 && !drawList.empty()) {
-							uint32_t px = (uint32_t)std::min(std::max(
-							    (g_pickNdcX + 1.0f) * 0.5f * (float)g_tile_w, 0.0f), (float)(g_tile_w - 1));
-							uint32_t py = (uint32_t)std::min(std::max(
-							    (1.0f - g_pickNdcY) * 0.5f * (float)g_tile_h, 0.0f), (float)(g_tile_h - 1));
-							float d = g_tile_renderer.readDepth(px, py);
-							if (d < 1.0f) {
-								glm::dmat4 V = glm::dmat4(glm::make_mat4(viewMat[e]));
-								glm::dmat4 P = glm::dmat4(glm::make_mat4(projMat[e]));
-								glm::dvec4 clip((double)g_pickNdcX, (double)g_pickNdcY, (double)d, 1.0);
-								glm::dvec4 w = glm::inverse(P * V) * clip;
-								if (std::abs(w.w) > 1e-12) { pickAccum += glm::dvec3(w) / w.w; pickHits++; }
-							}
-						}
 					}
 					rendered = true;
 				}
@@ -850,7 +957,9 @@ render_frame()
 					g_poiXitToTD = std::max(poiDist / std::max((double)g_viewDistXR, 0.1), 20.0);
 					g_focusT = 0.0;
 					g_last_input_t = g_now_sec.load(std::memory_order_relaxed);
-					LOGI("[FOCUS] %s POI dist=%.0f", g_focusActive ? "shift" : "acquired", poiDist);
+					LOGI("[FOCUS] %s POI dist=%.0f alt=%.1f",
+					     g_focusActive ? "shift" : "acquired", poiDist,
+					     geo::heightAboveEllipsoid(ecef));
 					g_focusActive = true;
 				} else if (g_focusActive) {
 					g_focusActive = false;
@@ -963,24 +1072,54 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeOnTouch(
     JNIEnv *, jobject, jint action, jint count, jfloat x0, jfloat y0, jfloat x1, jfloat y1)
 {
-	// action: 0=DOWN 1=UP 2=MOVE 5=PTR_DOWN 6=PTR_UP. Map to geo nav deltas.
+	// action: 0=DOWN 1=UP 2=MOVE 5=PTR_DOWN 6=PTR_UP. 1 finger = look/orbit,
+	// 2 fingers = pinch-zoom + pan (pan exits focus, like the desktop WASDQE);
+	// a quick 2-finger double-tap resets the view (like the desktop Space).
+	const double now = std::chrono::duration<double>(
+	    std::chrono::steady_clock::now().time_since_epoch()).count();
 	std::lock_guard<std::mutex> lk(g_touch_mtx);
-	if (action == 0 || action == 5 || action == 6) {  // (re)start tracking
+	const float cx = (count > 1) ? (x0 + x1) * 0.5f : x0;
+	const float cy = (count > 1) ? (y0 + y1) * 0.5f : y0;
+
+	if (action == 0 || action == 5 || action == 6) {  // DOWN / PTR_DOWN / PTR_UP
+		if (action == 5 && count == 2) {  // 2-finger gesture begins
+			g_two_down_t = now; g_two_down_cx = cx; g_two_down_cy = cy; g_two_moved = false;
+		}
+		if (action == 6 && count == 2) {  // 2-finger gesture ends (one lifted)
+			if (!g_two_moved && (now - g_two_down_t) < 0.30) {  // a 2-finger tap
+				if ((now - g_last_two_tap_t) < 0.40) {
+					g_reset_view.store(true, std::memory_order_relaxed);  // double → reset
+					g_last_two_tap_t = 0.0;
+				} else {
+					g_last_two_tap_t = now;
+				}
+			}
+		}
 		g_last_x0 = x0; g_last_y0 = y0; g_last_count = count;
 		g_last_pinch = (count > 1) ? std::hypot(x1 - x0, y1 - y0) : -1.0f;
+		g_last_cx = cx; g_last_cy = cy;
 		return;
 	}
-	if (action == 1) { g_last_count = 0; g_last_pinch = -1.0f; return; }
+	if (action == 1) { g_last_count = 0; g_last_pinch = -1.0f; return; }  // UP
 	if (action == 2) {  // MOVE
 		if (count > 1) {
 			float d = std::hypot(x1 - x0, y1 - y0);
+			float pinchMag = std::fabs(d - g_last_pinch);
+			float panMag = std::hypot(cx - g_last_cx, cy - g_last_cy);
 			if (g_last_pinch > 0) g_dolly += (double)(d - g_last_pinch) * 0.01;  // pinch → dolly
+			// Centroid translation → pan, when it dominates the pinch (a real
+			// two-finger drag). Inverted so the world follows the fingers.
+			if (panMag > pinchMag) {
+				g_pan_dx += -(double)(cx - g_last_cx) * 0.0016;
+				g_pan_dy += (double)(cy - g_last_cy) * 0.0016;
+			}
+			if (panMag > 6.0f || pinchMag > 6.0f) g_two_moved = true;
 			g_last_pinch = d;
 		} else {
-			g_look_dx += (double)(x0 - g_last_x0) * 0.004;  // drag → look
+			g_look_dx += (double)(x0 - g_last_x0) * 0.004;  // 1-finger → look/orbit
 			g_look_dy += (double)(y0 - g_last_y0) * 0.004;
 		}
-		g_last_x0 = x0; g_last_y0 = y0; g_last_count = count;
+		g_last_x0 = x0; g_last_y0 = y0; g_last_cx = cx; g_last_cy = cy; g_last_count = count;
 	}
 }
 extern "C" JNIEXPORT void JNICALL
@@ -991,14 +1130,26 @@ Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeResetView(JNIEnv *,
 
 // Double-tap at (x,y) view pixels → defer a depth-pick (resolved on the render
 // thread): hit a landmark = focus/orbit it; miss (sky) = release focus → fly.
+// (viewW,viewH) are the TOUCH SURFACE (View) dims, passed from Kotlin. We must
+// derive the pick NDC from these, NOT from XrViewDisplayRawEXT::canvasRectPx:
+// on a portrait-native panel the runtime reports canvasRectPx in the panel's
+// unrotated (portrait) basis (e.g. 1600x2560), while the app runs landscape and
+// the touch coords are in the rotated (landscape) basis (2560x1600). Dividing
+// landscape coords by portrait dims TRANSPOSES the NDC — a centre tap mapped to
+// (0.6,0.375), so every pick sampled depth up-and-right of the tap and landed on
+// the ground past the tapped object. The View dims share the rendered tile's
+// orientation (both landscape, aspect 1.6), so the tap↔render NDC is coherent —
+// exactly how Windows divides mouse coords by its (landscape) windowW/H.
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeOnDoubleTap(
-    JNIEnv *, jobject, jfloat x, jfloat y)
+    JNIEnv *, jobject, jfloat x, jfloat y, jfloat viewW, jfloat viewH)
 {
-	uint32_t w = g_canvas_px_w, h = g_canvas_px_h;
-	if (w == 0 || h == 0) return;  // no canvas dims yet
-	g_pickNdcX = 2.0f * x / (float)w - 1.0f;
-	g_pickNdcY = -(2.0f * y / (float)h - 1.0f);  // Android y-down -> +Y-up NDC
+	float w = viewW, h = viewH;
+	if (w <= 0.0f || h <= 0.0f) { w = (float)g_canvas_px_w; h = (float)g_canvas_px_h; }
+	if (w <= 0.0f || h <= 0.0f) return;  // no surface dims yet
+	g_pickNdcX = 2.0f * x / w - 1.0f;
+	g_pickNdcY = -(2.0f * y / h - 1.0f);  // Android y-down -> +Y-up NDC
+	LOGI("TAP x=%.0f y=%.0f view=%.0fx%.0f -> ndc=(%.3f,%.3f)", x, y, w, h, g_pickNdcX, g_pickNdcY);
 	g_pendingPick.store(true, std::memory_order_relaxed);
 }
 

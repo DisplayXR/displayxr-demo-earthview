@@ -188,3 +188,56 @@ geo_math,model_vulkan_utils}.cpp`, `tiles_common/shaders/*`, `common/leia_math.h
 `AndroidManifest.xml`, `cpp/main.cpp` (skeleton from `cube_handle_vk_android`),
 `cpp/CMakeLists.txt`, the focus/orbit copy (§4 Task 2), the Kotlin API-key dialog,
 the HUD/attribution backend.
+
+## 7. Known issue — double-tap focus converges short (orbit centre on the ground)
+
+**Status:** open (deferred; tracked here). The double-tap focus/orbit *direction*
+is correct (the orbit centres under your finger), but the focus **depth** lands
+short — on the ground / in front of a tall object (e.g. the Eiffel Tower base
+rather than the structure), and on repeated re-focus the world slowly drifts in
+depth.
+
+**What was fixed in this PR (real bugs, resolved):**
+1. **Tap→NDC transpose.** The pick NDC was divided by `XrViewDisplayRawEXT::canvasRectPx`,
+   which the OOP runtime reports in the panel's *unrotated* (portrait, 1600×2560)
+   basis, while touch coords are landscape (2560×1600). A centre tap mapped to
+   `ndc=(0.6, 0.375)`. Fixed by deriving the NDC from the **View (decorView) dims**
+   passed from Kotlin (`nativeOnDoubleTap(x,y,viewW,viewH)`) — the same basis the
+   rendered tile uses.
+2. **Orientation flip.** The activity followed the sensor, so it launched portrait
+   or landscape unpredictably and `decorView` flipped with it, re-breaking the NDC
+   basis and throwing the pick off-axis (a centre tap returned `xr=(0.247,0.097,…)`,
+   a 13.6° re-aim that compounded into a tilt/altitude climb). Fixed by
+   `android:screenOrientation="sensorLandscape"`. With this, a centre tap returns
+   `xr=(0,0,−z)`, `reaimDot=1.0` — no tilt.
+3. **Pick viewpoint.** The depth pick renders a dedicated **camera-centric mono
+   view** (XR origin, identity orientation, physical fov — the exact frame
+   `g_xrFromEcef` maps to), decoupled from the presentation rig. Picking the
+   display-rig eyes instead (back-offset ~1 unit) threw the POI "way on top";
+   picking the located views while focused threw it into the sky.
+
+**The residual (this section's issue): convergence-basis mismatch.**
+After the above, a centre tap on framed ground measures the surface at XR depth
+`|xr.z| ≈ 0.98`, but the rig's convergence `viewDistXR ≈ 1.04` (focus path:
+`drig.perspective_factor * m2v * nominalZ` from `dxr_view_rig_camera_to_display`).
+The ~6% gap means:
+- the focused feature sits slightly **in front of** the zero-parallax plane
+  ("focuses on the ground / in front"), and
+- the reframe `targetDist = poiDist / viewDistXR` is **not idempotent**: each
+  re-focus (every two-finger-drag exit makes the next double-tap a fresh acquire)
+  multiplies `targetDist` by `|xr.z|/viewDistXR ≈ 0.94`, so the world slowly
+  zooms/drifts on repeated re-focus.
+
+**Root cause to chase:** reconcile the pick's depth basis (camera-origin mono,
+`camVFov`, near 0.05 / far 200) with the converter's convergence (`viewDistXR`).
+Either (a) measure the pick depth through the same projection the rig uses so
+`|xr.z| == viewDistXR` (makes the reframe idempotent *and* frames to the ZDP), or
+(b) make the reframe idempotent by referencing the pick's own measured depth
+(`poiDist/|xrPos|`) — but (b) alone leaves the feature ~6% in front of the ZDP.
+The desktop (macOS/Windows) reference does not exhibit this because its pick
+unprojects through the same presentation projection that defines `viewDistXR`.
+
+Diagnostic recipe: temporarily restore the verbose `[FOCUS]` log (xr.x/y/z,
+`reaimDot`, `tgtD→toTD`, `vDistXR`) and tap dead-centre repeatedly in landscape;
+`tgtD` drift with `xr.x≈xr.y≈0, reaimDot≈1.0` isolates the basis mismatch from the
+orientation bugs above.
