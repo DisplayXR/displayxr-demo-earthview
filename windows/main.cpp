@@ -273,7 +273,18 @@ static constexpr double kDioramaGlideTau = 0.35; // s
 // under the centre crosshair: invd = 1/(XR distance the centre ray hits the
 // ground), exponentially smoothed across frames (one-frame lag — fed from the
 // previous frame's centre depth read).
-static constexpr float kCameraVFovRad = 0.6498f;  // ~37.2° full vertical FOV (2*atan(0.3249))
+static constexpr float kCameraVFovRad = 0.6498f;  // ~37.2° — fallback before display info resolves
+// Physical (orthoscopic) cam-rig vFOV: the angle the FULL DISPLAY subtends from the
+// nominal viewing position. 2*tan(vfov/2) = displayH / nominalZ. We use the full
+// physical display height (NOT the window canvas) so the fly framing stays the
+// full-screen FOV even in a small window — a canvas-based FOV gets uncomfortably
+// narrow when windowed. Falls back to the fixed kCameraVFovRad until display info
+// (height + nominal Z) has resolved.
+static inline float CamVFovRad(float physHeightM, float nominalZ) {
+    return (physHeightM > 1.0e-6f && nominalZ > 1.0e-6f)
+               ? 2.0f * atanf(physHeightM / (2.0f * nominalZ))
+               : kCameraVFovRad;
+}
 // 1/m to the convergence plane. Default = 1/kTargetXrDist (the geo target sits
 // 1 XR-m in front of the camera), refined per frame by the centre-ray depth.
 static float g_convDiopters = 1.0f;
@@ -470,9 +481,30 @@ static void UpdateGeoNav(InputState& input, float dt,
             g_geoNav.look((double)lookDX, (double)lookDY);
         }
     }
-    // Scroll dolly (exponential).
-    if (dollySteps != 0.0f)
-        g_geoNav.dolly((double)dollySteps);
+    // Scroll dolly (exponential). Zoom is a CESIUM-WORLD operation (it scales the
+    // tile world via targetDist), NOT a rig operation — so it must keep the orbit
+    // POI fixed itself.
+    if (dollySteps != 0.0f) {
+        if (g_focusActive) {
+            // [FOCUS] zoom = change the orbit RADIUS about the POI, then re-pin the
+            // POI on the convergence plane (mirrors the orbit-drag re-pin above).
+            // A plain forward dolly moves toward the geo target (cam.pos +
+            // cam.dir*targetDist), which is NOT the POI during orbit (targetDist =
+            // radius/vDist != radius), so the POI slides off the convergence plane
+            // and the physical-FOV perspective makes that drift visible. Scaling the
+            // radius keeps the POI centred + at zero parallax through the zoom.
+            glm::dvec3 poi = g_focusPOIecef;
+            glm::dvec3 v = g_geoNav.cam.pos - poi;          // radius vector
+            double k = std::pow(0.9, (double)dollySteps);   // match GeoNav::dolly
+            v *= k;
+            g_geoNav.cam.pos = poi + v;
+            g_geoNav.cam.dir = glm::normalize(poi - g_geoNav.cam.pos);
+            g_geoNav.targetDist =
+                std::max(glm::length(v) / std::max((double)g_viewDistXR, 0.1), 20.0);
+        } else {
+            g_geoNav.dolly((double)dollySteps);
+        }
+    }
 
     // [FOCUS] WASDQE while in orbit/display mode => disturbance-free return to the
     // cam rig. At the switch instant the cam rig uses the frozen g_convDiopters
@@ -1234,7 +1266,10 @@ static void RenderThreadFunc(
                                 cameraRig.ipdFactor = inputSnapshot.viewParams.ipdFactor;
                                 cameraRig.parallaxFactor = inputSnapshot.viewParams.parallaxFactor;
                                 cameraRig.convergenceDiopters = g_convDiopters;  // 1/m, auto-focused
-                                cameraRig.verticalFov = kCameraVFovRad;
+                                // Orthoscopic vFOV from the FULL display's physical subtense
+                                // (displayH / nominalZ) so the fly view matches the full-screen
+                                // panel even when windowed — not a fixed 37.2°, not the canvas.
+                                cameraRig.verticalFov = CamVFovRad(xr->displayHeightM, xr->nominalViewerZ);
                                 // [FOCUS] on the orbit->fly return, glide ipd/par from the value
                                 // that matches the orbit's display rig (ipd=1 <-> cam ipd=1/f,
                                 // f=convDiopters*N => seamless at the switch instant) back to the
@@ -1267,7 +1302,17 @@ static void RenderThreadFunc(
                                     crig0.ipd_factor = inputSnapshot.viewParams.ipdFactor;
                                     crig0.parallax_factor = inputSnapshot.viewParams.parallaxFactor;
                                     crig0.inv_convergence_distance = g_convDiopters;
-                                    crig0.half_tan_vfov = tanf(0.5f * kCameraVFovRad);
+                                    // Source half-tan-vfov = the live PHYSICAL fly FOV, so the
+                                    // cam->display conversion exactly reproduces the fly framing
+                                    // => disturbance-free switch. This makes zoomFactor != 1, so
+                                    // the converter emits a non-zero eye pose translation — which
+                                    // is fine because the selection/world block below anchors the
+                                    // geo camera at that SAME translated eye (displayRig.pose), so
+                                    // "geo camera == eye" holds for any zoomFactor and the orbit
+                                    // zoom stays centred. (Do NOT force this to the canonical
+                                    // reference — that pops the switch; the old hardcoded 36°
+                                    // assumption was the bug.)
+                                    crig0.half_tan_vfov = tanf(0.5f * CamVFovRad(xr->displayHeightM, xr->nominalViewerZ));
                                     crig0.m2v = 1.0f;
                                     dxr_display_rig drig = {};
                                     dxr_view_rig_camera_to_display(&crig0, &dinfo, &drig);
@@ -1514,7 +1559,11 @@ static void RenderThreadFunc(
                                 // and place the target a fixed kTargetXrDist in front (scale
                                 // s = kTargetXrDist/targetDist). The camera rig's verticalFov
                                 // + convergenceDiopters own the stereo; selection just needs
-                                // to match the camera frustum.
+                                // to match the camera frustum. (Focus uses the SAME origin
+                                // anchor: the converter's eye pose offset is the convergence
+                                // distance, applied by the runtime to the located eyes, NOT a
+                                // shift of the world anchor — anchoring at the eye sends the
+                                // view back by 1/invd.)
                                 const double kTargetXrDist = 1.0;  // XR metres to the geo target
                                 anchorXr = glm::dvec3(0.0, 0.0, 0.0);
                                 double s = kTargetXrDist / std::max(g_geoNav.targetDist, 1.0);
@@ -1522,8 +1571,11 @@ static void RenderThreadFunc(
                                 // Selection frustum = the camera rig frustum (verticalFov)
                                 // widened to the atlas tile aspect, +15% margin.
                                 double aspect = (renderH > 0) ? (double)renderW / (double)renderH : 1.0;
-                                vfov = (double)kCameraVFovRad * 1.15;
-                                double vHalfTan = std::tan(0.5 * (double)kCameraVFovRad);
+                                // Match the selection frustum to the cam rig's physical vFOV
+                                // (same full-display height / nominalZ the rig used above).
+                                double camVFov = (double)CamVFovRad(xr->displayHeightM, xr->nominalViewerZ);
+                                vfov = camVFov * 1.15;
+                                double vHalfTan = std::tan(0.5 * camVFov);
                                 hfov = 2.0 * std::atan(vHalfTan * aspect) * 1.15;
 
                                 // Convergence auto-focus: forward ray → GROUND distance
