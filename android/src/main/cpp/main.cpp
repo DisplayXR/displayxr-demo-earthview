@@ -142,7 +142,24 @@ bool g_tiles_active = false;
 geo::GeoNav g_geoNav;
 glm::dmat4 g_xrFromEcef(1.0);
 float g_convDiopters = 1.0f;
+float g_viewDistXR = 0.0f;  // eye->focus distance = 1/convergence
 auto g_last_t = std::chrono::steady_clock::now();
+
+// Double-tap "focus" model (macOS parity, commit c95b624): double-tap a landmark
+// → the camera re-aims to centre it and orbits it (the forward-ray convergence
+// auto-focus then lands the ZDP on it). Camera-rig presentation is kept (the
+// runtime owns the off-axis eyes); the macOS display-rig portal switch is a
+// follow-up. Double-tap the sky → release back to free fly.
+bool g_focusActive = false;
+double g_focusT = 0.0;                  // 0->1 re-aim/reframe transition
+glm::dvec3 g_focusPOIecef(0.0);
+glm::dvec3 g_poiXitFromDir(0.0), g_poiXitToDir(0.0);
+double g_poiXitFromTD = 0.0, g_poiXitToTD = 0.0;
+// Deferred double-tap pick: resolved after the eyes render (depth-readback
+// unproject), set by the JNI tap with the tapped screen NDC.
+std::atomic<bool> g_pendingPick{false};
+float g_pickNdcX = 0.0f, g_pickNdcY = 0.0f;
+uint32_t g_canvas_px_w = 0, g_canvas_px_h = 0;  // from XrViewDisplayRawEXT
 
 // JNI-shared.
 std::atomic<int> g_display_rotation{0};
@@ -156,6 +173,8 @@ double g_look_dx = 0, g_look_dy = 0, g_dolly = 0;
 float g_last_x0 = 0, g_last_y0 = 0;
 float g_last_pinch = -1.0f;
 int g_last_count = 0;
+double g_last_input_t = 0.0;  // for idle auto-orbit
+std::atomic<double> g_now_sec{0.0};
 
 // ── Bring-up (unchanged from the placeholder leg) ────────────────────────
 bool
@@ -504,6 +523,27 @@ clear_atlas(VkImage image, float r, float g, float b)
 	vkWaitForFences(g_vk_device, 1, &g_fence, VK_TRUE, UINT64_MAX);
 }
 
+// Orbit the camera around a POI (focus mode) or auto-orbit turntable. Mirrors
+// the macOS focus drag: world stays camera-centric, only cam.pos/dir revolve.
+void
+orbit_camera_around_poi(double dYaw, double dPitch)
+{
+	const glm::dvec3 poi = g_focusPOIecef;
+	const glm::dvec3 up = glm::normalize(poi);  // geodetic normal ~ radial
+	glm::dvec3 v = g_geoNav.cam.pos - poi;
+	glm::dmat4 ry = glm::rotate(glm::dmat4(1.0), -dYaw, up);
+	v = glm::dvec3(ry * glm::dvec4(v, 0.0));
+	glm::dvec3 right = glm::normalize(glm::cross(up, glm::normalize(v)));
+	glm::dmat4 rp = glm::rotate(glm::dmat4(1.0), -dPitch, right);
+	glm::dvec3 v2 = glm::dvec3(rp * glm::dvec4(v, 0.0));
+	if (std::abs(glm::dot(glm::normalize(v2), up)) < 0.98) v = v2;  // no pole flip
+	g_geoNav.cam.pos = poi + v;
+	g_geoNav.cam.dir = glm::normalize(poi - g_geoNav.cam.pos);
+	g_geoNav.cam.up = up;
+	// Keep the POI on the convergence plane: targetDist = radius / vDist.
+	g_geoNav.targetDist = std::max(glm::length(v) / std::max((double)g_viewDistXR, 0.1), 20.0);
+}
+
 // Drain accumulated touch deltas into the geo camera (render thread).
 void
 apply_nav(float dt)
@@ -514,10 +554,50 @@ apply_nav(float dt)
 		look_dx = g_look_dx; look_dy = g_look_dy; dolly = g_dolly;
 		g_look_dx = g_look_dy = g_dolly = 0;
 	}
-	if (g_reset_view.exchange(false)) g_geoNav.frameBookmark(g_geoNav.bookmarkIndex);
-	if (look_dx != 0 || look_dy != 0) g_geoNav.look(look_dx, look_dy);
-	if (dolly != 0) g_geoNav.dolly(dolly);
-	(void)dt;
+
+	// [FOCUS] smooth POI transition (~0.4 s): re-aim cam.dir (slerp) + reframe
+	// targetDist (log-lerp) so the feature glides to centre and onto the ZDP.
+	if (g_focusActive && g_focusT < 1.0) {
+		g_focusT += (double)dt / 0.4;
+		double t = g_focusT > 1.0 ? 1.0 : g_focusT;
+		double e = t * t * (3.0 - 2.0 * t);  // smoothstep
+		double cosA = glm::clamp(glm::dot(g_poiXitFromDir, g_poiXitToDir), -1.0, 1.0);
+		double a = std::acos(cosA);
+		if (a < 1.0e-4) {
+			g_geoNav.cam.dir = g_poiXitToDir;
+		} else {
+			double s0 = std::sin((1.0 - e) * a) / std::sin(a);
+			double s1 = std::sin(e * a) / std::sin(a);
+			g_geoNav.cam.dir = glm::normalize(s0 * g_poiXitFromDir + s1 * g_poiXitToDir);
+		}
+		g_geoNav.cam.up = glm::normalize(g_geoNav.cam.pos);  // radial up
+		g_geoNav.targetDist = g_poiXitFromTD * std::pow(g_poiXitToTD / g_poiXitFromTD, e);
+		if (g_focusT >= 1.0) g_focusT = 1.0;
+	}
+
+	if (g_reset_view.exchange(false)) {
+		g_focusActive = false;
+		g_geoNav.frameBookmark(g_geoNav.bookmarkIndex);
+	}
+
+	bool active = false;
+	if (look_dx != 0 || look_dy != 0) {
+		if (g_focusActive) {
+			g_focusT = 1.0;  // a drag cancels any in-flight re-aim
+			orbit_camera_around_poi(look_dx, look_dy);
+		} else {
+			g_geoNav.look(look_dx, look_dy);
+		}
+		active = true;
+	}
+	if (dolly != 0) { g_geoNav.dolly(dolly); active = true; }
+	if (active) g_last_input_t = g_now_sec.load(std::memory_order_relaxed);
+
+	// [FOCUS] idle auto-orbit (turntable around the POI) after 10 s — focus only.
+	double idleFor = g_now_sec.load(std::memory_order_relaxed) - g_last_input_t;
+	if (g_focusActive && idleFor > 10.0 && g_focusT >= 1.0) {
+		orbit_camera_around_poi((6.2831853 / 60.0) * (double)dt, 0.0);  // 1 rev / 60 s
+	}
 }
 
 bool
@@ -531,6 +611,7 @@ render_frame()
 
 	auto now = std::chrono::steady_clock::now();
 	float dt = std::chrono::duration<float>(now - g_last_t).count();
+	g_now_sec.store(std::chrono::duration<double>(now.time_since_epoch()).count(), std::memory_order_relaxed);
 	g_last_t = now;
 	if (dt > 0.1f) dt = 0.1f;
 	apply_nav(dt);
@@ -583,13 +664,23 @@ render_frame()
 			const double s = kTargetXrDist / std::max(g_geoNav.targetDist, 1.0);
 			g_xrFromEcef = geo::xrFromEcefCamera(g_geoNav.cam, glm::dvec3(0.0), s);
 
-			// Convergence auto-focus: ground distance under the forward ray.
+			// Convergence auto-focus: ground distance under the forward ray. In
+			// focus the camera looks AT the POI, so the same ray lands the ZDP on
+			// the inspected landmark — no special-casing needed.
 			double groundM = geo::rayGroundDistanceM(g_geoNav.cam.pos, g_geoNav.cam.dir);
 			if (groundM > 0.0) {
 				double xrDist = std::min(std::max(groundM * s, 0.2), 50.0);
 				float tgt = (float)(1.0 / xrDist);
 				double a = 1.0 - std::exp(-(double)dt / kConvSmoothTau);
 				g_convDiopters += (tgt - g_convDiopters) * (float)a;
+			}
+			// Frustum-source eye->focus distance = 1/convergence (drives the focus
+			// reframe + orbit radius). Captured from the requested convergence.
+			g_viewDistXR = (g_convDiopters > 1.0e-6f) ? (1.0f / g_convDiopters) : 0.0f;
+			// Canvas px (for the tap→NDC pick), from the rig raw channel.
+			if (raw.canvasRectPx.extent.width > 0 && raw.canvasRectPx.extent.height > 0) {
+				g_canvas_px_w = (uint32_t)raw.canvasRectPx.extent.width;
+				g_canvas_px_h = (uint32_t)raw.canvasRectPx.extent.height;
 			}
 
 			// Selection camera = the head camera in ECEF (inverse world).
@@ -614,6 +705,13 @@ render_frame()
 				     drawList.size(), att.tilesInFlight, att.renderTiles, g_convDiopters, groundM);
 			}
 
+			// [FOCUS] deferred double-tap pick: after each eye renders, read its
+			// depth at the tapped texel and unproject through that eye's matrices;
+			// the acquired point is the midpoint of the per-eye hits.
+			const bool pendingPick = g_pendingPick.load(std::memory_order_relaxed);
+			glm::dvec3 pickAccum(0.0);
+			int pickHits = 0;
+
 			uint32_t idx = 0;
 			XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 			if (xrAcquireSwapchainImage(g_swapchain, &ai, &idx) == XR_SUCCESS) {
@@ -624,11 +722,49 @@ render_frame()
 						g_tile_renderer.renderEye(g_images[idx].image, g_swapchain_format,
 						    g_atlas_w, g_atlas_h, e * g_tile_w, 0, g_tile_w, g_tile_h,
 						    viewMat[e], projMat[e], drawList);
+						if (pendingPick && e < 2 && !drawList.empty()) {
+							uint32_t px = (uint32_t)std::min(std::max(
+							    (g_pickNdcX + 1.0f) * 0.5f * (float)g_tile_w, 0.0f), (float)(g_tile_w - 1));
+							uint32_t py = (uint32_t)std::min(std::max(
+							    (1.0f - g_pickNdcY) * 0.5f * (float)g_tile_h, 0.0f), (float)(g_tile_h - 1));
+							float d = g_tile_renderer.readDepth(px, py);
+							if (d < 1.0f) {
+								glm::dmat4 V = glm::dmat4(glm::make_mat4(viewMat[e]));
+								glm::dmat4 P = glm::dmat4(glm::make_mat4(projMat[e]));
+								glm::dvec4 clip((double)g_pickNdcX, (double)g_pickNdcY, (double)d, 1.0);
+								glm::dvec4 w = glm::inverse(P * V) * clip;
+								if (std::abs(w.w) > 1e-12) { pickAccum += glm::dvec3(w) / w.w; pickHits++; }
+							}
+						}
 					}
 					rendered = true;
 				}
 				XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 				xrReleaseSwapchainImage(g_swapchain, &ri);
+			}
+
+			// Finalize the pick: hit → acquire/shift focus POI; miss (sky) →
+			// release focus back to fly (or stay fly).
+			if (pendingPick) {
+				g_pendingPick.store(false, std::memory_order_relaxed);
+				if (pickHits > 0) {
+					glm::dvec3 xrPos = pickAccum / (double)pickHits;
+					glm::dvec3 ecef = glm::dvec3(glm::inverse(g_xrFromEcef) * glm::dvec4(xrPos, 1.0));
+					double poiDist = glm::length(g_geoNav.cam.pos - ecef);
+					g_focusPOIecef = ecef;
+					g_poiXitFromDir = g_geoNav.cam.dir;
+					g_poiXitToDir = glm::normalize(ecef - g_geoNav.cam.pos);
+					g_poiXitFromTD = g_geoNav.targetDist;
+					g_poiXitToTD = std::max(poiDist / std::max((double)g_viewDistXR, 0.1), 20.0);
+					g_focusT = 0.0;
+					g_last_input_t = g_now_sec.load(std::memory_order_relaxed);
+					LOGI("[FOCUS] %s POI dist=%.0f", g_focusActive ? "shift" : "acquired", poiDist);
+					g_focusActive = true;
+				} else if (g_focusActive) {
+					g_focusActive = false;
+					g_focusT = 0.0;
+					LOGI("[FOCUS] sky tap -> release to fly");
+				}
 			}
 
 			for (uint32_t e = 0; e < kViewCount; ++e) {
@@ -759,6 +895,19 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeResetView(JNIEnv *, jobject)
 {
 	g_reset_view.store(true, std::memory_order_relaxed);
+}
+
+// Double-tap at (x,y) view pixels → defer a depth-pick (resolved on the render
+// thread): hit a landmark = focus/orbit it; miss (sky) = release focus → fly.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeOnDoubleTap(
+    JNIEnv *, jobject, jfloat x, jfloat y)
+{
+	uint32_t w = g_canvas_px_w, h = g_canvas_px_h;
+	if (w == 0 || h == 0) return;  // no canvas dims yet
+	g_pickNdcX = 2.0f * x / (float)w - 1.0f;
+	g_pickNdcY = -(2.0f * y / (float)h - 1.0f);  // Android y-down -> +Y-up NDC
+	g_pendingPick.store(true, std::memory_order_relaxed);
 }
 
 extern "C" void
