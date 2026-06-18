@@ -59,11 +59,14 @@ target_include_directories(native_app_glue PUBLIC
 # Khronos OpenXR loader from the openxr_loader_for_android .aar (prefab).
 find_package(OpenXR REQUIRED CONFIG)
 
-add_library(earthview_vk_android SHARED main.cpp)
+# stb_impl.c provides stbi_write_png (tile_renderer's dumpColorTarget needs it;
+# the desktop legs get it from displayxr-common, which the Android leg omits).
+add_library(earthview_vk_android SHARED main.cpp stb_impl.c)
 
 target_include_directories(earthview_vk_android BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${REPO_ROOT}/tiles_common               # geo_math.h, tile_engine.h, tile_renderer.h
+    ${REPO_ROOT}/spike                      # stb_image_write.h (single-header)
     ${REPO_ROOT}/common                     # leia_math.h
     # DisplayXR's in-tree OpenXR headers BEFORE the AAR's stock set.
     ${REPO_ROOT}/openxr_includes)
