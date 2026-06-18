@@ -84,8 +84,10 @@ class MainActivity : NativeActivity() {
     )
 
     // Double-tap a landmark → focus/orbit it; double-tap the sky → release to
-    // fly. (x,y) are view pixels; native unprojects via a depth pick.
-    private external fun nativeOnDoubleTap(x: Float, y: Float)
+    // fly. (x,y) are view pixels; (viewW,viewH) the touch-surface dims native
+    // needs to build the pick NDC (canvasRectPx is portrait-native on a rotated
+    // panel and would transpose the NDC). Native unprojects via a depth pick.
+    private external fun nativeOnDoubleTap(x: Float, y: Float, viewW: Float, viewH: Float)
 
     // The user's Map Tiles API key (re-creates the tileset native-side).
     private external fun nativeSetApiKey(key: String)
@@ -114,7 +116,12 @@ class MainActivity : NativeActivity() {
             this,
             object : GestureDetector.SimpleOnGestureListener() {
                 override fun onDoubleTap(e: MotionEvent): Boolean {
-                    try { nativeOnDoubleTap(e.x, e.y) } catch (_: Throwable) {}
+                    // The touch surface (decorView) is in the rotated/landscape
+                    // basis the rendered tile uses; pass its dims so native can
+                    // build a coherent pick NDC (NOT the portrait-native canvas).
+                    val vw = window.decorView.width.toFloat()
+                    val vh = window.decorView.height.toFloat()
+                    try { nativeOnDoubleTap(e.x, e.y, vw, vh) } catch (_: Throwable) {}
                     return true
                 }
 
@@ -356,8 +363,8 @@ class MainActivity : NativeActivity() {
             if (!isFinishing) {
                 Toast.makeText(
                     this,
-                    "Drag: look · Pinch: zoom · Double-tap a place: inspect · " +
-                        "Double-tap sky: back to fly",
+                    "Drag: look · Pinch: zoom · 2-finger drag: pan (exits inspect) · " +
+                        "Double-tap: inspect a place · 2-finger double-tap: reset view",
                     Toast.LENGTH_LONG,
                 ).show()
             }

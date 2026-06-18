@@ -70,6 +70,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:configChanges="orientation|keyboardHidden|screenSize"
+            android:screenOrientation="sensorLandscape"
             android:launchMode="singleTask">
             <meta-data
                 android:name="android.app.lib_name"

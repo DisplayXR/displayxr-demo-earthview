@@ -59,15 +59,31 @@ target_include_directories(native_app_glue PUBLIC
 # Khronos OpenXR loader from the openxr_loader_for_android .aar (prefab).
 find_package(OpenXR REQUIRED CONFIG)
 
+# displayxr-common's cam<->display rig converter (dxr_view_rig_camera_to_display)
+# for the focus/orbit display-rig model — the same source the desktop legs link
+# via displayxr::common. Self-contained pure math; fetch sources + compile the
+# one TU (don't run its CMake, which carries desktop platform deps).
+include(FetchContent)
+FetchContent_Declare(displayxr_common_dxr
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG v1.0.8 GIT_SHALLOW TRUE)
+FetchContent_GetProperties(displayxr_common_dxr)
+if(NOT displayxr_common_dxr_POPULATED)
+    FetchContent_Populate(displayxr_common_dxr)
+endif()
+set(DXR_VIEW_MATH_DIR ${displayxr_common_dxr_SOURCE_DIR}/include)
+
 # stb_impl.c provides stbi_write_png (tile_renderer's dumpColorTarget needs it;
 # the desktop legs get it from displayxr-common, which the Android leg omits).
-add_library(earthview_vk_android SHARED main.cpp stb_impl.c)
+add_library(earthview_vk_android SHARED main.cpp stb_impl.c
+    ${DXR_VIEW_MATH_DIR}/dxr_view_math.c)
 
 target_include_directories(earthview_vk_android BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${REPO_ROOT}/tiles_common               # geo_math.h, tile_engine.h, tile_renderer.h
     ${REPO_ROOT}/spike                      # stb_image_write.h (single-header)
     ${REPO_ROOT}/common                     # leia_math.h
+    ${DXR_VIEW_MATH_DIR}                     # dxr_view_math.h (rig converter)
     # DisplayXR's in-tree OpenXR headers BEFORE the AAR's stock set.
     ${REPO_ROOT}/openxr_includes)
 
