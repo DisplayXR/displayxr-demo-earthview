@@ -63,3 +63,4 @@ live in [`PRD.md`](../PRD.md) (§9). Rendering/coordinate internals:
   platform-neutral and carries over.
 - **M3 Android:** NDK leg through the OOP runtime (ADR-025 pattern, as
   modelviewer/mediaplayer); reduced SSE + tile-byte budget for NP02J; auto-orbit.
+  Full work breakdown: [`docs/m3-android-plan.md`](m3-android-plan.md).
