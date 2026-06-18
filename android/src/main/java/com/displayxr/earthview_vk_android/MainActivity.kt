@@ -64,8 +64,9 @@ class MainActivity : NativeActivity() {
         action: Int, count: Int, x0: Float, y0: Float, x1: Float, y1: Float,
     )
 
-    // Double-tap resets the viewpoint to the initial framing.
-    private external fun nativeResetView()
+    // Double-tap a landmark → focus/orbit it; double-tap the sky → release to
+    // fly. (x,y) are view pixels; native unprojects via a depth pick.
+    private external fun nativeOnDoubleTap(x: Float, y: Float)
 
     private val installedRuntime: String? by lazy {
         RUNTIME_PACKAGES.firstOrNull {
@@ -83,7 +84,7 @@ class MainActivity : NativeActivity() {
             this,
             object : GestureDetector.SimpleOnGestureListener() {
                 override fun onDoubleTap(e: MotionEvent): Boolean {
-                    try { nativeResetView() } catch (_: Throwable) {}
+                    try { nativeOnDoubleTap(e.x, e.y) } catch (_: Throwable) {}
                     return true
                 }
             },
@@ -181,7 +182,8 @@ class MainActivity : NativeActivity() {
             if (!isFinishing) {
                 Toast.makeText(
                     this,
-                    "EarthView (M3 bring-up) — drag/pinch coming next",
+                    "Drag: look · Pinch: zoom · Double-tap a place: inspect · " +
+                        "Double-tap sky: back to fly",
                     Toast.LENGTH_LONG,
                 ).show()
             }
