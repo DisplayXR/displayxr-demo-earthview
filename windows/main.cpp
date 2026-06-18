@@ -1415,7 +1415,7 @@ static void RenderThreadFunc(
                                 const XrView& sv = srcViews[eye];
                                 float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
                                 float near_z, far_z;
-                                if (rigCamera) {
+                                if (rigCamera || g_focusActive) {
                                     // Camera rig: a plain perspective camera. The geo target
                                     // is fixed at kTargetXrDist (1 XR-m) regardless of
                                     // altitude (s = kTargetXrDist/targetDist), so a FIXED tight
@@ -1425,6 +1425,13 @@ static void RenderThreadFunc(
                                     // convergence — the convergence auto-focus tracks the
                                     // crosshair (which can be at the horizon), and tying near
                                     // to it would clip the foreground.
+                                    // ALSO the focus-mode converted display rig, which frames
+                                    // the scene at the SAME XR scale (POI at ~1 XR-m) with
+                                    // eye_display.z (ez) ~= 0. Using the ez-based display range
+                                    // below would give near=1e-4, far=1500 (1.5e7 ratio) =>
+                                    // total depth-precision collapse / z-fighting (blue
+                                    // background bleeding through the mesh). Use the fixed
+                                    // tight range instead.
                                     near_z = 0.05f;
                                     far_z  = 200.0f;
                                 } else {
