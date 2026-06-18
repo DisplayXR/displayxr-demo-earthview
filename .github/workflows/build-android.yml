@@ -1,0 +1,208 @@
+name: Build Android
+
+# Android (NDK) APK build for the EarthView demo (M3). Mirrors build-macos.yml's
+# structure: a DetectChanges/docs_only gate, validation-only on PR + push-to-main,
+# and a release-attach step gated on a v* tag.
+#
+# The Android leg (android/) is a standalone Gradle project — a vendor-neutral
+# OOP OpenXR client (Vulkan, NativeActivity; ADR-025). It compiles the shared
+# tiles_common/ renderer + cesium-native streaming engine cross-built for
+# arm64-android via ezvcpkg.
+#
+# Version-bump dispatch lives in build-macos.yml (the sole earthview_demo
+# bumper) — this workflow intentionally does NOT dispatch a second bump.
+#
+# ── CMake 3.31.6 decision (the main gotcha) ──────────────────────────────────
+# android/build.gradle pins `cmake { version "3.31.6" }` because tiles_common +
+# cesium-native require CMake >= 3.25, but the Android SDK's sdkmanager only
+# offers cmake;3.22.1. Locally David points AGP at Homebrew's 3.31.6 via
+# local.properties (cmake.dir=/opt/homebrew). We do NOT relax the pin (3.22.1 is
+# too old for cesium, and matching dev's exact 3.31.6 avoids version drift).
+# Instead CI installs the official Kitware 3.31.6 Linux tarball, drops a `ninja`
+# (from apt) alongside it — AGP requires `ninja` next to `cmake` in cmake.dir/bin
+# — and points AGP at it through a generated local.properties.
+
+on:
+  pull_request: {}
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          # First push to a new repo/branch: before is all-zeros (no parent) →
+          # there's nothing to diff, so build (not docs-only).
+          if [ "$BASE" = "0000000000000000000000000000000000000000" ] || \
+             ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  BuildAPK:
+    name: Build Android
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Doc-only PR — skipping heavy build steps
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "docs_only=true; build steps will skip and report success."
+
+      - name: Set up JDK 17 (temurin)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # cesium-native is consumed via add_subdirectory(third_party/cesium-native)
+      # and bootstraps its own deps through ezvcpkg on first configure.
+      - name: Clone cesium-native (v0.61.0)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          git clone --branch v0.61.0 --depth 1 --recurse-submodules \
+            https://github.com/CesiumGS/cesium-native.git third_party/cesium-native
+
+      - name: Install Android NDK (26.3.11579264) + SDK components
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;26.3.11579264" "platforms;android-35" "build-tools;34.0.0"
+          # ezvcpkg's vcpkg arm64-android triplet + the NDK chainload need
+          # ANDROID_NDK_HOME (the cpp CMakeLists has a ${ANDROID_NDK} fallback,
+          # but export it explicitly so the env path is authoritative).
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+
+      # See the CMake 3.31.6 decision note at the top of this file.
+      - name: Install CMake 3.31.6 (+ ninja) for AGP
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          CMAKE_VER=3.31.6
+          curl -fsSL -o /tmp/cmake.tar.gz \
+            "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz"
+          mkdir -p "$HOME/cmake-dist"
+          tar -xzf /tmp/cmake.tar.gz -C "$HOME/cmake-dist" --strip-components=1
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          # AGP requires `ninja` next to `cmake` in cmake.dir/bin.
+          ln -sf "$(command -v ninja)" "$HOME/cmake-dist/bin/ninja"
+          "$HOME/cmake-dist/bin/cmake" --version
+          echo "EARTHVIEW_CMAKE_DIR=$HOME/cmake-dist" >> "$GITHUB_ENV"
+
+      - name: Write local.properties (sdk.dir + cmake.dir)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "sdk.dir=$ANDROID_SDK_ROOT"
+            echo "cmake.dir=$EARTHVIEW_CMAKE_DIR"
+          } > android/local.properties
+          cat android/local.properties
+
+      # ezvcpkg cross-builds ~118 vcpkg libs (OpenSSL/curl/draco/KTX/…) for
+      # arm64-android on first configure — slow and potentially flaky. Cache the
+      # ezvcpkg base dir so subsequent runs skip the dep rebuild.
+      - name: Cache ezvcpkg (cesium arm64-android deps)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ezvcpkg
+          key: ezvcpkg-arm64-android-${{ hashFiles('android/src/main/cpp/CMakeLists.txt', 'android/build.gradle') }}
+          restore-keys: |
+            ezvcpkg-arm64-android-
+
+      - name: Build :android:assembleDebug
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./gradlew :android:assembleDebug --no-daemon --stacktrace
+
+      - name: Derive version
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="0.0.0-dev.${GITHUB_SHA::8}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Built APK with VERSION=$VERSION"
+
+      - name: Stage APK (rename to release artifact name)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: apk
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          SRC=android/build/outputs/apk/debug/android-debug.apk
+          if [ ! -f "$SRC" ]; then
+            echo "::error::expected APK missing: $SRC"
+            find android/build/outputs -name '*.apk' -type f || true
+            exit 1
+          fi
+          OUT="DisplayXREarthView-${VERSION}-android.apk"
+          cp "$SRC" "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+          ls -la "$OUT"
+
+      - name: Upload APK
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: DisplayXREarthView-Android
+          if-no-files-found: error
+          path: ${{ steps.apk.outputs.path }}
+
+      - name: Attach APK to GitHub release on tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.apk.outputs.path }}
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
