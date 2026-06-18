@@ -117,7 +117,7 @@ jobs:
           echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
 
       # See the CMake 3.31.6 decision note at the top of this file.
-      - name: Install CMake 3.31.6 (+ ninja) for AGP
+      - name: Install CMake 3.31.6 (+ ninja + glslangValidator) for AGP
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
@@ -127,7 +127,11 @@ jobs:
           mkdir -p "$HOME/cmake-dist"
           tar -xzf /tmp/cmake.tar.gz -C "$HOME/cmake-dist" --strip-components=1
           sudo apt-get update
-          sudo apt-get install -y ninja-build
+          # ninja: AGP needs it next to cmake (below). glslang-tools: provides
+          # glslangValidator, which tiles_common/CMakeLists.txt requires to bake
+          # the tile.vert/tile.frag SPIR-V headers (the macOS leg gets it from
+          # `brew install glslang`). Vulkan itself comes from the NDK sysroot.
+          sudo apt-get install -y ninja-build glslang-tools
           # AGP requires `ninja` next to `cmake` in cmake.dir/bin.
           ln -sf "$(command -v ninja)" "$HOME/cmake-dist/bin/ninja"
           "$HOME/cmake-dist/bin/cmake" --version
