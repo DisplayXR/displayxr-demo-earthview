@@ -81,7 +81,43 @@ EarthView's reason for being. cesium-native v0.61.0 + ezvcpkg bootstraps
   (AAssetManager vs `std::ifstream`).
 
 **De-risk this in isolation first** (standalone `arm64-v8a` configure + one tile
-fetch over TLS) before any UI work. See §5 for the live spike status.
+fetch over TLS) before any UI work. **Spike done — see §5a.**
+
+#### §5a — cesium-native NDK spike results (2026-06-17)
+
+Ran a standalone `arm64-v8a` configure of `third_party/cesium-native` (v0.61.0)
+with NDK `26.3.11579264`. **Verdict: the dependency tree cross-compiles cleanly —
+the dominant M3 risk is retired.**
+
+- ✅ **All hard deps built for `arm64-android`**: OpenSSL (ssl+crypto), **curl**,
+  **draco**, **KTX**, libwebp, zstd, abseil, s2geometry — **118 static libs**,
+  vcpkg `install` exit 0, **zero port-build failures**. Verified genuine: a
+  `libdraco.a` member reads `ELF64 / AArch64` via NDK `llvm-readelf`.
+- ⚠️ **Triplet trap (documented unblock):** ezvcpkg silently defaults to the
+  **host** triplet (`arm64-osx`) when handed only the NDK toolchain. You MUST pass
+  `-DVCPKG_TRIPLET=arm64-android` **and** export `ANDROID_NDK_HOME`. Exact
+  configure that worked:
+  ```
+  ANDROID_NDK_HOME=$NDK cmake -S third_party/cesium-native -B <build> -G Ninja \
+    -DVCPKG_TRIPLET=arm64-android \
+    -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+    -DCESIUM_TESTS_ENABLED=OFF -DCESIUM_USE_EZVCPKG=ON
+  ```
+- ⚠️ **Project-config wiring gap (not a blocker):** in that standalone invocation,
+  ezvcpkg overwrites the top-level `CMAKE_TOOLCHAIN_FILE`, so cesium's **own**
+  targets configured against the **host** OpenSSL and the `ANDROID_ABI/PLATFORM`
+  vars were reported "not used". The deps are right; cesium's own libs + the app
+  must be driven under the NDK toolchain with vcpkg pointed at the
+  `arm64-android` installed tree. This is exactly what AGP's `externalNativeBuild`
+  sets up — resolve it when scaffolding the Gradle harness (step 2), not as
+  separate work.
+- ⏱️ **Cost:** cold dep build is heavy (~hours wall for the full set), but it
+  caches in `~/.ezvcpkg/<hash>/installed/arm64-android` and is reused by the real
+  Gradle build, so it's a one-time tax per machine/CI cache.
+
+Net: Task 1 is **green** — proceed to the harness scaffold (step 2) with
+confidence that cesium streams on `arm64-v8a`.
 
 ### Task 2 — port the focus/orbit camera model (MEDIUM)
 The `g_focusActive` focus state machine + `dxr_view_rig_camera_to_display`
@@ -135,8 +171,9 @@ manifest metadata.
 
 ## 5. Risks & dependencies
 
-- **cesium-native Android buildability (Task 1)** is the only item that can
-  fundamentally change scope. Everything else is well-trodden by
+- **cesium-native Android buildability (Task 1)** was the only item that could
+  fundamentally change scope — **now retired** by the §5a spike (full dep tree
+  builds for `arm64-android`). Everything else is well-trodden by
   modelviewer/mediaplayer.
 - DisplayXR runtime APK pre-installed on NP02J (weave + DP + eye tracking).
 - `tiles_common/` needs `__ANDROID__` gating that `model_common/` already has.
