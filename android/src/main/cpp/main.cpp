@@ -59,6 +59,16 @@ namespace {
 
 constexpr uint32_t kViewCount = 2;
 constexpr float kCameraVFovRad = 0.6498f;  // ~37.2° full vertical FOV
+// Physical (orthoscopic) cam-rig vFOV: the angle the display subtends from the
+// nominal viewing position. 2*tan(vfov/2) = physHeightM / nominalZ. On Android the
+// canvas is always full-screen, so canvasSizeMeters == the display. Falls back to
+// kCameraVFovRad until the rig raw channel reports a size + eye Z. See
+// docs/rendering-notes.md §5.
+static inline float CamVFovRad(float physHeightM, float nominalZ) {
+	return (physHeightM > 1.0e-6f && nominalZ > 1.0e-6f)
+	           ? 2.0f * atanf(physHeightM / (2.0f * nominalZ))
+	           : kCameraVFovRad;
+}
 constexpr double kTargetXrDist = 1.0;      // XR metres to the geo target (fly)
 constexpr double kConvSmoothTau = 0.15;
 
@@ -160,6 +170,10 @@ double g_poiXitFromTD = 0.0, g_poiXitToTD = 0.0;
 std::atomic<bool> g_pendingPick{false};
 float g_pickNdcX = 0.0f, g_pickNdcY = 0.0f;
 uint32_t g_canvas_px_w = 0, g_canvas_px_h = 0;  // from XrViewDisplayRawEXT
+// Physical display height (m) + nominal viewer Z (m), latched from the rig raw
+// channel (canvasSizeMeters + rawEyes display-space Z) — stable nominal values
+// that drive the orthoscopic fly FOV (CamVFovRad). See docs/rendering-notes.md §5.
+float g_displayHeightM = 0.0f, g_nominalViewerZ = 0.0f;
 
 // JNI-shared.
 std::atomic<int> g_display_rotation{0};
@@ -590,7 +604,26 @@ apply_nav(float dt)
 		}
 		active = true;
 	}
-	if (dolly != 0) { g_geoNav.dolly(dolly); active = true; }
+	// Zoom is a CESIUM-WORLD op (scales the tile world via targetDist), NOT a rig
+	// op — so in focus it must keep the orbit POI fixed itself (§6). FLY = forward
+	// dolly. FOCUS = change the orbit RADIUS about the POI + re-pin on the
+	// convergence plane (same re-pin orbit_camera_around_poi uses); a plain forward
+	// dolly moves toward the geo target, not the POI, and the physical-FOV full
+	// perspective makes that drift visible.
+	if (dolly != 0) {
+		if (g_focusActive) {
+			const glm::dvec3 poi = g_focusPOIecef;
+			glm::dvec3 v = g_geoNav.cam.pos - poi;          // radius vector
+			v *= std::pow(0.9, dolly);                      // match GeoNav::dolly
+			g_geoNav.cam.pos = poi + v;
+			g_geoNav.cam.dir = glm::normalize(poi - g_geoNav.cam.pos);
+			g_geoNav.targetDist =
+			    std::max(glm::length(v) / std::max((double)g_viewDistXR, 0.1), 20.0);
+		} else {
+			g_geoNav.dolly(dolly);
+		}
+		active = true;
+	}
 	if (active) g_last_input_t = g_now_sec.load(std::memory_order_relaxed);
 
 	// [FOCUS] idle auto-orbit (turntable around the POI) after 10 s — focus only.
@@ -634,7 +667,9 @@ render_frame()
 			rig.pose.orientation = {0, 0, 0, 1};
 			rig.ipdFactor = 1.0f; rig.parallaxFactor = 1.0f;
 			rig.convergenceDiopters = g_convDiopters;
-			rig.verticalFov = kCameraVFovRad;
+			// Orthoscopic fly FOV from the display's physical subtense (latched from
+			// the rig raw channel last frame). See docs/rendering-notes.md §5.
+			rig.verticalFov = CamVFovRad(g_displayHeightM, g_nominalViewerZ);
 			li.next = &rig;
 			vs.next = &raw;
 		}
@@ -682,6 +717,15 @@ render_frame()
 				g_canvas_px_w = (uint32_t)raw.canvasRectPx.extent.width;
 				g_canvas_px_h = (uint32_t)raw.canvasRectPx.extent.height;
 			}
+			// Latch physical display height (m) + nominal viewer Z for the orthoscopic
+			// FOV (§5): canvasSizeMeters = physical canvas (== full display on Android);
+			// rawEyes[].z = display-space viewer distance. Refresh only on nominal
+			// (non-tracking) samples so the FOV doesn't jitter with head tracking.
+			if (raw.canvasSizeMeters.height > 0.0f && raw.eyeCountOutput > 0 &&
+			    (g_displayHeightM <= 0.0f || !raw.isTracking)) {
+				g_displayHeightM = raw.canvasSizeMeters.height;
+				g_nominalViewerZ = std::fabs(raw.rawEyes[0].z);
+			}
 
 			// Selection camera = the head camera in ECEF (inverse world).
 			geo::GeoCamera selCam;
@@ -693,8 +737,9 @@ render_frame()
 				selCam.up = glm::normalize(invRot * glm::dvec3(0.0, 1.0, 0.0));
 			}
 			double aspect = (g_tile_h > 0) ? (double)g_tile_w / (double)g_tile_h : 1.0;
-			double vfov = (double)kCameraVFovRad * 1.15;
-			double hfov = 2.0 * std::atan(std::tan(0.5 * (double)kCameraVFovRad) * aspect) * 1.15;
+			double camVFov = (double)CamVFovRad(g_displayHeightM, g_nominalViewerZ);
+			double vfov = camVFov * 1.15;  // selection frustum matches the render FOV (§5)
+			double hfov = 2.0 * std::atan(std::tan(0.5 * camVFov) * aspect) * 1.15;
 
 			const auto &result = g_tile_engine.update(selCam, (double)g_tile_w, (double)g_tile_h, hfov, vfov);
 			auto drawList = g_tile_renderer.buildDrawList(result, g_xrFromEcef);
