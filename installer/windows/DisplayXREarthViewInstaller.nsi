@@ -169,7 +169,7 @@ Section "EarthView Demo" SecDemo
     FileWrite $0 '  "type": "3d",$\r$\n'
     FileWrite $0 '  "category": "demo",$\r$\n'
     FileWrite $0 '  "display_mode": "auto",$\r$\n'
-    FileWrite $0 '  "description": "Streaming 3D city viewer on Google Photorealistic 3D Tiles. Requires a Google Map Tiles API key.",$\r$\n'
+    FileWrite $0 '  "description": "Streaming 3D city viewer on Google Photorealistic 3D Tiles. Fly the full-scale world camera-style, or double-click a landmark to inspect it and orbit around it. Requires a Google Map Tiles API key.",$\r$\n'
     FileWrite $0 '  "icon": "earthview_icon.png",$\r$\n'
     FileWrite $0 '  "icon_3d": "earthview_icon_sbs.png",$\r$\n'
     FileWrite $0 '  "icon_3d_layout": "sbs-lr",$\r$\n'
