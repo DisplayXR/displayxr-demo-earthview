@@ -1072,8 +1072,6 @@ static void RenderThreadFunc(
         InputState inputSnapshot;
         bool resetRequested = false;
         bool animateToggle = false;
-        bool cycleModeRequested = false;
-        int32_t absoluteModeRequest = -1;
         uint32_t windowW, windowH;
         // EarthView geo-nav deltas, snapshotted + cleared under the input lock.
         float gLookDX = 0.0f, gLookDY = 0.0f, gDolly = 0.0f;
@@ -1089,9 +1087,9 @@ static void RenderThreadFunc(
             g_inputState.resetViewRequested = false;
             g_inputState.teleportRequested = false;
             g_inputState.fullscreenToggleRequested = false;
-            cycleModeRequested = g_inputState.cycleRenderingModeRequested;
+            // ModeSwitch consumes the V/0-8 flags off inputSnapshot (captured
+            // above); clear them on the shared state so they fire exactly once.
             g_inputState.cycleRenderingModeRequested = false;
-            absoluteModeRequest = g_inputState.absoluteRenderingModeRequested;
             g_inputState.absoluteRenderingModeRequested = -1;
             g_inputState.eyeTrackingModeToggleRequested = false;
             g_inputState.animateToggleRequested = false;
@@ -1121,18 +1119,12 @@ static void RenderThreadFunc(
                      g_tilesActive.load() ? "started" : "init failed");
         }
 
-        // Rendering mode requests (V/mode-button=cycle, 0-8=absolute). Single
-        // source of truth: runtime owns current mode via xr->currentModeIndex.
-        if (cycleModeRequested && xr->pfnRequestDisplayRenderingModeEXT &&
-            xr->session != XR_NULL_HANDLE && xr->renderingModeCount > 0) {
-            uint32_t next = (xr->currentModeIndex + 1) % xr->renderingModeCount;
-            xr->pfnRequestDisplayRenderingModeEXT(xr->session, next);
-        }
-        if (absoluteModeRequest >= 0 && xr->pfnRequestDisplayRenderingModeEXT &&
-            xr->session != XR_NULL_HANDLE &&
-            (uint32_t)absoluteModeRequest < xr->renderingModeCount) {
-            xr->pfnRequestDisplayRenderingModeEXT(xr->session, (uint32_t)absoluteModeRequest);
-        }
+        // Rendering mode requests (V/mode-button=cycle, 0-8=absolute) through the
+        // shared ModeSwitch sequencer: eases viewParams.ipdFactor around the switch
+        // and fires xrRequestDisplayRenderingModeEXT on the right frame. Ramped ipd
+        // lands on inputSnapshot.viewParams.ipdFactor (what the render path reads).
+        // Runtime owns current mode via xr->currentModeIndex.
+        XrSessionUpdateModeSwitch(*xr, inputSnapshot, perfStats.deltaTime);
 
         // Handle eye tracking mode toggle (T key)
         if (inputSnapshot.eyeTrackingModeToggleRequested) {
