@@ -77,6 +77,11 @@ jobs:
     runs-on: windows-2022
     env:
       GH_TOKEN: ${{ github.token }}
+      # Pin cesium's ezvcpkg dependency tree to a short, fixed path so it is
+      # (a) deterministically cacheable and (b) clear of the Windows MAX_PATH
+      # ceiling in vcpkg buildtrees (HOME is empty on the runner, so the
+      # built-in default resolves to a drive-root path we can't reliably name).
+      EZVCPKG_BASEDIR: C:\ez
 
     steps:
       - uses: actions/checkout@v4
@@ -137,11 +142,31 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Building installer with VERSION=$version"
 
+      # Restore cesium-native's ezvcpkg dependency tree (vcpkg checkout +
+      # prebuilt installed packages) from the pinned EZVCPKG_BASEDIR. Keyed on
+      # the cesium tag + the vcpkg commit cesium pins
+      # (third_party/cesium-native/CMakeLists.txt ezvcpkg_fetch COMMIT) — bump
+      # the suffix if either changes. On a hit ezvcpkg sees the installed tree
+      # and skips the ~11 min bootstrap. A cache miss/outage is non-fatal
+      # (actions/cache only warns), so this can never break the build.
+      - name: Cache cesium vcpkg dependencies (ezvcpkg)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: C:\ez
+          key: ezvcpkg-${{ runner.os }}-cesium-v0.61.0-vcpkg-afc0a2e0
+
       - name: Build demo
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
         run: |
+          # Explicitly DISABLE any compiler-launcher cache. cesium-native's
+          # CMakeLists auto-wires sccache if it finds it on PATH, and an sccache
+          # backed by the (intermittently unavailable) GitHub Actions cache can
+          # hard-fail the compile. Defining the launchers empty makes cesium's
+          # `if(NOT DEFINED ...)` guard skip that auto-detect entirely.
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_C_COMPILER_LAUNCHER=" "-DCMAKE_CXX_COMPILER_LAUNCHER=" `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
           cmake --build build
 
