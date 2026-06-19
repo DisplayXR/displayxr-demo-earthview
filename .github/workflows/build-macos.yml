@@ -72,6 +72,17 @@ jobs:
     runs-on: macos-14
     env:
       GH_TOKEN: ${{ github.token }}
+      # Build caching — see the "Cache cesium..." + sccache steps below.
+      #  - SCCACHE_GHA_ENABLED routes the compiler cache to the GitHub Actions
+      #    cache backend.
+      #  - CMAKE_CXX_COMPILER_LAUNCHER is read by scripts/build_macos.sh and
+      #    forwarded as -DCMAKE_{C,CXX}_COMPILER_LAUNCHER so the cesium-native +
+      #    demo compile routes through sccache.
+      #  - EZVCPKG_BASEDIR pins cesium's ezvcpkg dependency tree to a fixed,
+      #    cacheable path (the vcpkg dep bootstrap, which sccache can't reach).
+      SCCACHE_GHA_ENABLED: "true"
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      EZVCPKG_BASEDIR: ${{ github.workspace }}/.ezvcpkg
 
     steps:
       - uses: actions/checkout@v4
@@ -107,11 +118,28 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building installer with VERSION=$VERSION"
 
+      # Restore cesium-native's ezvcpkg dependency tree (vcpkg checkout +
+      # prebuilt installed packages). Keyed on the cesium tag + the vcpkg commit
+      # cesium pins — bump the suffix if either changes. On a hit ezvcpkg skips
+      # the dependency bootstrap.
+      - name: Cache cesium vcpkg dependencies (ezvcpkg)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ezvcpkg
+          key: ezvcpkg-${{ runner.os }}-cesium-v0.61.0-vcpkg-afc0a2e0
+
+      - name: Set up sccache
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.6
+
       - name: Build demo + installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
           DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
-        run: ./scripts/build_macos.sh --installer
+        run: |
+          ./scripts/build_macos.sh --installer
+          sccache --show-stats
 
       - name: Assert .pkg payload (regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'
