@@ -77,6 +77,16 @@ jobs:
     runs-on: windows-2022
     env:
       GH_TOKEN: ${{ github.token }}
+      # Build caching (see the "Cache cesium..." + sccache steps below). The
+      # cold build recompiles cesium-native from scratch (~28 min); these two
+      # caches cut warm builds to a few minutes:
+      #  - SCCACHE_GHA_ENABLED routes the compiler cache to the GitHub Actions
+      #    cache backend (covers cesium-native + the demo compile).
+      #  - EZVCPKG_BASEDIR pins cesium's ezvcpkg dependency tree to a fixed,
+      #    cacheable path (covers the vcpkg dep bootstrap, which sccache can't
+      #    reach — vcpkg builds ports in their own process).
+      SCCACHE_GHA_ENABLED: "true"
+      EZVCPKG_BASEDIR: ${{ github.workspace }}/.ezvcpkg
 
     steps:
       - uses: actions/checkout@v4
@@ -137,13 +147,31 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Building installer with VERSION=$version"
 
+      # Restore cesium-native's ezvcpkg dependency tree (vcpkg checkout +
+      # prebuilt installed packages). Keyed on the cesium tag + the exact vcpkg
+      # commit cesium pins (third_party/cesium-native/CMakeLists.txt
+      # ezvcpkg_fetch COMMIT) — bump the key suffix if either changes. On a hit
+      # ezvcpkg sees the installed tree and skips the ~11 min bootstrap.
+      - name: Cache cesium vcpkg dependencies (ezvcpkg)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ezvcpkg
+          key: ezvcpkg-${{ runner.os }}-cesium-v0.61.0-vcpkg-afc0a2e0
+
+      - name: Set up sccache
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.6
+
       - name: Build demo
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
           cmake --build build
+          sccache --show-stats
 
       - name: Stage OpenXR loader next to demo binary
         if: needs.DetectChanges.outputs.docs_only != 'true'

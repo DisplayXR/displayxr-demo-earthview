@@ -67,9 +67,20 @@ else
 fi
 
 # --- 1. cmake build -------------------------------------------------------
+# Optional compiler cache: if CMAKE_CXX_COMPILER_LAUNCHER is exported (CI sets
+# it to "sccache"), forward it as the CMake launcher for both languages. Unset
+# in local dev → empty array → no behavior change.
+CMAKE_LAUNCHER_ARGS=()
+if [ -n "${CMAKE_CXX_COMPILER_LAUNCHER:-}" ]; then
+    CMAKE_LAUNCHER_ARGS+=(
+        -DCMAKE_C_COMPILER_LAUNCHER="$CMAKE_CXX_COMPILER_LAUNCHER"
+        -DCMAKE_CXX_COMPILER_LAUNCHER="$CMAKE_CXX_COMPILER_LAUNCHER"
+    )
+fi
 cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+    -DCMAKE_PREFIX_PATH="$OPENXR_DIR" \
+    ${CMAKE_LAUNCHER_ARGS[@]+"${CMAKE_LAUNCHER_ARGS[@]}"}
 cmake --build build
 
 BIN="$REPO_ROOT/build/macos/earthview_handle_vk_macos"
