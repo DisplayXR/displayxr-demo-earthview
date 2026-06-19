@@ -72,6 +72,9 @@ jobs:
     runs-on: macos-14
     env:
       GH_TOKEN: ${{ github.token }}
+      # Pin cesium's ezvcpkg dependency tree to a fixed path so it is
+      # deterministically cacheable. (No MAX_PATH concern on macOS.)
+      EZVCPKG_BASEDIR: /Users/runner/.ezvcpkg
 
     steps:
       - uses: actions/checkout@v4
@@ -107,10 +110,27 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building installer with VERSION=$VERSION"
 
+      # Restore cesium-native's ezvcpkg dependency tree from the pinned
+      # EZVCPKG_BASEDIR. Keyed on the cesium tag + the pinned vcpkg commit —
+      # bump the suffix if either changes. Cache miss/outage is non-fatal
+      # (actions/cache only warns), so this can never break the build.
+      - name: Cache cesium vcpkg dependencies (ezvcpkg)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: /Users/runner/.ezvcpkg
+          key: ezvcpkg-${{ runner.os }}-cesium-v0.61.0-vcpkg-afc0a2e0
+
       - name: Build demo + installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
           DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
+          # Explicitly DISABLE the compiler-launcher cache (empty value). cesium
+          # auto-wires sccache if found on PATH, and an sccache backed by the
+          # intermittently-unavailable GitHub Actions cache can hard-fail the
+          # compile; build_macos.sh forwards this empty value so cesium's
+          # auto-detect guard skips it.
+          CMAKE_CXX_COMPILER_LAUNCHER: ""
         run: ./scripts/build_macos.sh --installer
 
       - name: Assert .pkg payload (regression guard)

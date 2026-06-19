@@ -67,9 +67,18 @@ else
 fi
 
 # --- 1. cmake build -------------------------------------------------------
+# Compiler-launcher cache: forward CMAKE_CXX_COMPILER_LAUNCHER (sccache/ccache)
+# for BOTH languages, ALWAYS defining them — empty means "no launcher". Defining
+# them even when empty also suppresses cesium-native's own find_program(sccache)
+# auto-detect (its `if(NOT DEFINED ...)` guard), keeping the build deterministic
+# regardless of what is installed on PATH. Local dev: export
+# CMAKE_CXX_COMPILER_LAUNCHER=sccache to opt in.
+LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-}"
 cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+    -DCMAKE_PREFIX_PATH="$OPENXR_DIR" \
+    -DCMAKE_C_COMPILER_LAUNCHER="$LAUNCHER" \
+    -DCMAKE_CXX_COMPILER_LAUNCHER="$LAUNCHER"
 cmake --build build
 
 BIN="$REPO_ROOT/build/macos/earthview_handle_vk_macos"
