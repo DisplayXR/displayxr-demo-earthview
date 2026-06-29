@@ -42,7 +42,7 @@ done
 # BUILD_WITH_SYSTEM_JSONCPP=OFF + jsoncpp include-order patch are required
 # to avoid baking a Homebrew jsoncpp path into the redistributable dylib
 # (runtime repo issue #205).
-OPENXR_VERSION="${OPENXR_VERSION:-1.1.43}"
+OPENXR_VERSION="${OPENXR_VERSION:-1.1.51}"
 OPENXR_DIR="/tmp/openxr-install"
 if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.dylib" ]; then
     echo "==> Building OpenXR loader $OPENXR_VERSION → $OPENXR_DIR"
