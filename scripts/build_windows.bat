@@ -27,11 +27,39 @@ if not exist "third_party\cesium-native\CMakeLists.txt" (
     exit /b 1
 )
 
-if "%OpenXR_ROOT%"=="" set "OpenXR_ROOT=C:/dev/openxr_sdk"
-if "%VULKAN_SDK_PREFIX%"=="" set "VULKAN_SDK_PREFIX=C:/VulkanSDK/1.4.341.1"
+REM --- Vulkan SDK ---------------------------------------------------------------
+REM Default to the VULKAN_SDK env var the LunarG installer exports (any version);
+REM find_package(Vulkan) picks it up, so no -DCMAKE_PREFIX_PATH is needed. An
+REM explicit VULKAN_SDK_PREFIX override still wins (passed as CMAKE_PREFIX_PATH).
+set "VK_PREFIX_ARG="
+if not "%VULKAN_SDK_PREFIX%"=="" set "VK_PREFIX_ARG=-DCMAKE_PREFIX_PATH=%VULKAN_SDK_PREFIX%"
+if "%VULKAN_SDK_PREFIX%"=="" if "%VULKAN_SDK%"=="" (
+    echo ERROR: neither VULKAN_SDK nor VULKAN_SDK_PREFIX is set. Install the Vulkan
+    echo        SDK from https://vulkan.lunarg.com and open a fresh terminal so
+    echo        VULKAN_SDK is exported, or set VULKAN_SDK_PREFIX, then re-run.
+    goto :error
+)
+
+REM --- OpenXR loader -------------------------------------------------------------
+REM If OpenXR_ROOT isn't overridden, auto-provision the prebuilt Khronos loader,
+REM pinned to the same spec revision as the vendored openxr_includes/ headers
+REM (XR_CURRENT_API_VERSION = 1.1.51), into build\openxr_sdk so a fresh clone
+REM builds with no manually-staged SDK. (Mirrors .github/workflows/build-windows.yml.)
+set "OPENXR_VER=1.1.51"
+if "%OpenXR_ROOT%"=="" set "OpenXR_ROOT=%CD%/build/openxr_sdk"
+if not exist "build\openxr_sdk\x64\lib\openxr_loader.lib" if "%OpenXR_ROOT%"=="%CD%/build/openxr_sdk" (
+    echo === Provisioning OpenXR loader %OPENXR_VER% ===
+    if not exist build mkdir build
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+      "$ErrorActionPreference='Stop';" ^
+      "$u='https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-%OPENXR_VER%/openxr_loader_windows-%OPENXR_VER%.zip';" ^
+      "Invoke-WebRequest -Uri $u -OutFile 'build\openxr_loader.zip';" ^
+      "Expand-Archive -Path 'build\openxr_loader.zip' -DestinationPath 'build\openxr_sdk' -Force;" ^
+      "Remove-Item 'build\openxr_loader.zip' -Force" || goto :error
+)
 
 echo === Configuring ===
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT=%OpenXR_ROOT% -DCMAKE_PREFIX_PATH=%VULKAN_SDK_PREFIX% || goto :error
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OpenXR_ROOT%" %VK_PREFIX_ARG% || goto :error
 echo === Building ===
 cmake --build build || goto :error
 echo.
