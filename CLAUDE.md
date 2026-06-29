@@ -92,3 +92,12 @@ env vars force a bookmark framing to reproduce a reported pose.
   the same selected set.
 - Doubles live in `geo_math` only; the frame loop sees per-tile `float[16]`.
 - Releases: `/dxr-release earthview vX.Y.Z` from the runtime hub repo (M4).
+- **Dev-build dependency rule (don't regress).** `scripts/build_windows.bat` +
+  `scripts/build_macos.sh` **auto-provision the OpenXR loader**, pinned to the
+  vendored `openxr_includes/` spec rev (`XR_CURRENT_API_VERSION`, currently
+  1.1.51) — never hardcode an SDK path (`C:/dev/openxr_sdk`, `C:/VulkanSDK/<ver>`);
+  Vulkan defaults to the `VULKAN_SDK` env (the `OpenXR_ROOT` / `VULKAN_SDK_PREFIX`
+  overrides still win). A fresh clone must build with only the toolchain + Vulkan
+  SDK (+ the one-time cesium-native clone). Keep CI (`build-windows.yml`) == dev
+  script == header rev. Dev-only — the released installer always provisioned via
+  CI and bundles `openxr_loader.dll`, so it was never affected. (Fixed in #11.)
