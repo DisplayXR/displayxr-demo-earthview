@@ -47,3 +47,7 @@ android/.cxx/
 local.properties
 android/local.properties
 *.apk
+
+# Android signing keystores — never commit (CI uses GitHub secrets)
+*.jks
+*.keystore
