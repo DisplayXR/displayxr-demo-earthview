@@ -28,7 +28,7 @@ live in [`PRD.md`](../PRD.md) (§9). Rendering/coordinate internals:
   [cesium-unity](rendering-notes.md#1) (off-axis stereo is render-only); frustum
   sized to *contain* the off-axis display angle; `enableFogCulling=false`,
   `forbidHoles=true`. Near plane scaled to `ez` (the clipped-bottom fix).
-- **Distribution** — public repo, BSL-1.0, macOS `.pkg`
+- **Distribution** — public repo, Apache-2.0, macOS `.pkg`
   (`scripts/build_macos.sh --installer`), `build-macos.yml` (build + payload
   guard + release attach + `versions.json` bump dispatch on `v*`).
 - **Tooling** — `DXR_DUMP=N` self-capture (mono eye-0 PNG; vk_native has no

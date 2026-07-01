@@ -1,5 +1,5 @@
 /* Copyright 2026, Leia Inc.
- * SPDX-License-Identifier: BSL-1.0
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Single stb_image_write implementation TU for the Android leg. tile_renderer.cpp
  * forward-declares `extern "C" int stbi_write_png(...)` and expects the symbol to

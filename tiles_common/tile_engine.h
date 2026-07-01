@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // tile_engine — Cesium3DTilesSelection::Tileset wrapper for Google
 // Photorealistic 3D Tiles (ported from the M0 spike, spike/main.cpp).

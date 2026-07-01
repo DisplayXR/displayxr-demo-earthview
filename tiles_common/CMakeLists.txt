@@ -1,5 +1,5 @@
 # Copyright 2026, Leia Inc.
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # tiles_common — the EarthView scene layer: cesium-native glue (tile_engine),
 # the Vulkan tile renderer (IPrepareRendererResources impl + draw), and the

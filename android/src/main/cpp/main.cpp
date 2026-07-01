@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // earthview_vk_android entry point — M3. Brings up the DisplayXR runtime
 // out-of-process (ADR-025) like the modelviewer/cube Android harness (loader →
