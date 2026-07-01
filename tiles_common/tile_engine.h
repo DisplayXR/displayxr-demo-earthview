@@ -1,4 +1,4 @@
-// Copyright 2026, Leia Inc.
+// Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 //
 // tile_engine — Cesium3DTilesSelection::Tileset wrapper for Google
@@ -113,7 +113,7 @@ earthviewKeyConfigPath();
 
 // Persist `key` to the per-user config (mode 600 on POSIX). Returns false on
 // IO error. A subsequent TileEngine::init() then picks it up. The key is the
-// END USER's own — never Leia's, never bundled. See docs/api-key.md.
+// END USER's own — never the project's, never bundled. See docs/api-key.md.
 bool
 earthviewSaveApiKey(const std::string &key);
 

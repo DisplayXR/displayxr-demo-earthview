@@ -1,7 +1,7 @@
 # EarthView API key — design
 
 EarthView streams Google Photorealistic 3D Tiles, which requires a **Google Map
-Tiles API key**. This documents how the key is supplied, why the Leia/dev key is
+Tiles API key**. This documents how the key is supplied, why the DisplayXR/dev key is
 never exposed, and the planned in-app key-entry flow.
 
 ## Status
@@ -69,4 +69,4 @@ of the app-support ini.
   expected files — a key file appearing there should fail review.
 - Each developer's key lives only in their local gitignored `earthview.ini`.
 - The persisted **user** key is per-user, mode 600; it is the end user's own
-  key, never Leia's.
+  key, never the project's.

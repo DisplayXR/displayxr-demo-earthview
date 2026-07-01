@@ -1,4 +1,4 @@
-// Copyright 2026, Leia Inc.
+// Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
@@ -1904,7 +1904,7 @@ static void RenderThreadFunc(
                                 // visible; rendering it here in the Tab-toggled panel is a
                                 // first-build placeholder — a dedicated always-on
                                 // attribution window-space layer (Google logo bitmap +
-                                // credits) is a Leia-validation follow-up.
+                                // credits) is a hardware-validation follow-up.
                                 std::wstring sceneText = L"\n--- EarthView ---";
                                 if (g_tilesActive.load()) {
                                     size_t n = 0;

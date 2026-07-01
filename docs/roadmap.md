@@ -39,7 +39,7 @@ live in [`PRD.md`](../PRD.md) (§9). Rendering/coordinate internals:
 
 1. **In-app API key entry** (before the first tag) — per-user key entry + app-
    support persistence + late engine init, so the distributed app never needs
-   the dev key. Design + invariants: [`api-key.md`](api-key.md). The Leia/dev
+   the dev key. Design + invariants: [`api-key.md`](api-key.md). The DisplayXR/dev
    key is verified *not* exposed (gitignored, never committed, not in the
    `.pkg`).
 2. **Tag `v0.1.0`** — `/dxr-release earthview v0.1.0` from the runtime hub
