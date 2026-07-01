@@ -1,4 +1,4 @@
-// Copyright 2026, Leia Inc.
+// Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #include "tile_engine.h"
@@ -198,7 +198,7 @@ earthviewSaveApiKey(const std::string &key)
 	f << "key=" << key << "\n";
 	f.close();
 #ifndef _WIN32
-	// Per-user secret: rw------- (the user's OWN key, not Leia's).
+	// Per-user secret: rw------- (the user's OWN key, not the project's).
 	chmod(path.c_str(), S_IRUSR | S_IWUSR);
 #endif
 	return f.good();
@@ -343,7 +343,7 @@ TileEngine::update(const geo::GeoCamera &cam, double viewW, double viewH, double
 
 	// ONE mono symmetric ViewState — exactly cesium-unity's
 	// CameraManager::unityCameraToViewState (the proven Google-P3DT path,
-	// used even by the Leia stereo Unity app). The display's off-axis
+	// used even by the reference stereo Unity app). The display's off-axis
 	// stereo is a render-time projection concern only; selection uses the
 	// head camera's real forward/up with a symmetric frustum.
 	ViewState view(cam.pos, cam.dir, upOrtho, glm::dvec2(viewW, viewH), hfovRad, vfovRad,

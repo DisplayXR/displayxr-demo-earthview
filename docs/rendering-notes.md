@@ -11,7 +11,7 @@ per-eye `XrFovf`, not a recentered direction, not a dual coverage frustum.
 
 This is exactly what `cesium-unity` does
 (`native~/src/Runtime/CameraManager.cpp::unityCameraToViewState`) and what the
-Leia stereo Unity app (`LeiaInc/UnityCesiumGoogleTiles`) relies on: even for a
+reference stereo Unity app (`LeiaInc/UnityCesiumGoogleTiles`) relies on: even for a
 3D display, selection is mono. **The off-axis Kooima stereo is a render-time
 projection concern only — it never enters tile selection.**
 

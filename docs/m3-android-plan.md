@@ -181,7 +181,7 @@ manifest metadata.
 ## 6. Reuse vs author-fresh summary
 
 **Inherited (compile by path, no fork):** `tiles_common/{tile_engine,tile_renderer,
-geo_math,model_vulkan_utils}.cpp`, `tiles_common/shaders/*`, `common/leia_math.h`,
+geo_math,model_vulkan_utils}.cpp`, `tiles_common/shaders/*`, `common/dxr_math.h`,
 `openxr_includes/`, `third_party/cesium-native` source (fresh NDK build config).
 
 **Author fresh:** the entire `android/` Gradle+NDK harness, `MainActivity.kt`,

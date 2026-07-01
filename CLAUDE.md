@@ -14,7 +14,7 @@ OpenXR `_handle`-class client app, Vulkan, structurally cloned from
 
 ```
 CMakeLists.txt        # root dispatch: cesium-native + common + tiles_common + macos
-common/               # displayxr-common FetchContent (HUD, input, leia_math)
+common/               # displayxr-common FetchContent (HUD, input, dxr_math)
 tiles_common/         # scene layer: cesium glue + VK tile renderer + geo math
 │   tile_engine.{h,cpp}      # Tileset wrapper, accessor, credits, ViewState
 │   tile_renderer.{h,cpp}    # IPrepareRendererResources + unlit draw

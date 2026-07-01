@@ -1,4 +1,4 @@
-# Copyright 2026, Leia Inc.
+# Copyright 2026, The DisplayXR Project and its contributors
 # SPDX-License-Identifier: Apache-2.0
 #
 # Native build for the Android leg of displayxr-demo-earthview (M3).
@@ -82,7 +82,7 @@ target_include_directories(earthview_vk_android BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${REPO_ROOT}/tiles_common               # geo_math.h, tile_engine.h, tile_renderer.h
     ${REPO_ROOT}/spike                      # stb_image_write.h (single-header)
-    ${REPO_ROOT}/common                     # leia_math.h
+    ${REPO_ROOT}/common                     # dxr_math.h
     ${DXR_VIEW_MATH_DIR}                     # dxr_view_math.h (rig converter)
     # DisplayXR's in-tree OpenXR headers BEFORE the AAR's stock set.
     ${REPO_ROOT}/openxr_includes)

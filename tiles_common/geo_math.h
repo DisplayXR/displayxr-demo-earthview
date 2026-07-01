@@ -1,4 +1,4 @@
-// Copyright 2026, Leia Inc.
+// Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 //
 // geo_math — the EarthView coordinate model (PRD §6.1).
