@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // See tile_renderer.h for the threading contract. The Vulkan plumbing
 // (internal target + viewport blit, negative-height viewport, texture upload

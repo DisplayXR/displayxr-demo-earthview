@@ -84,5 +84,7 @@ cmake --build spike/build
 
 ## License
 
-[BSL-1.0](LICENSE). EarthView consumes Google Photorealistic 3D Tiles under the
+[Apache-2.0](LICENSE). EarthView consumes Google Photorealistic 3D Tiles under the
 Google Maps Platform terms; the imagery is © Google and its data providers.
+(Vendored OpenXR extension headers under `openxr_includes/` remain BSL-1.0 —
+see their SPDX headers.)

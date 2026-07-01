@@ -1,5 +1,5 @@
 # Copyright 2026, Leia Inc.
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Top-level CMakeLists.txt for the displayxr-demo-earthview standalone repo.
 # Orchestrates the shared `common` and `tiles_common` libraries plus the
