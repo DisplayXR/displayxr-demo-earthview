@@ -7,7 +7,7 @@
   Signing is driven entirely by the command passed in -SignCmd (sourced from
   the SIGN_CMD environment variable by the build scripts). This script holds
   NO certificate and NO secret. On machines without signing capability,
-  SIGN_CMD is unset and the build scripts skip signing — the build is
+  SIGN_CMD is unset and the build scripts skip signing â the build is
   unsigned, with no behavior change.
 
     1. Walk the folder for *.dll / *.exe.
@@ -48,7 +48,13 @@ function Test-Signed($file) {
 function Invoke-Sign($file) {
     $parts = $SignCmd -split '\s+'
     $exe   = $parts[0]
-    $args  = @($parts[1..($parts.Length - 1)]) + $file
+    # A single-token SIGN_CMD (bare signer path, no extra args — e.g. the signing
+    # box's signFile.bat) makes $parts[1..($parts.Length-1)] the range 1..0, which
+    # PowerShell evaluates DESCENDING (1,0) and injects the signer path back as a
+    # bogus first arg (it ends up signing the .bat itself). Guard on Count so a
+    # lone token passes ONLY the file path.
+    $rest  = if ($parts.Count -gt 1) { $parts[1..($parts.Count - 1)] } else { @() }
+    $args  = @($rest) + $file
     & $exe @args
     if ($LASTEXITCODE -ne 0) { throw "Signing failed for $file (exit $LASTEXITCODE)" }
 }
