@@ -65,6 +65,29 @@ third_party/cesium-native/  # v0.61.0 clone (gitignored; see README)
 Lint before calling work done:
 `python3 ~/Documents/GitHub/displayxr-runtime/scripts/check_displayxr_app.py .`
 
+### Build (Linux — build-green only, issue #19)
+
+```bash
+# one-time cesium-native clone happens automatically inside the script
+./scripts/build_linux.sh          # loader (release-1.1.43) + cmake → build/linux/earthview_handle_vk_linux
+./scripts/run_earthview_linux.sh  # dev run vs a Linux runtime (on-screen pass only — Phase-3 gated)
+```
+
+`linux/main.cpp` is a **HOSTED-NULL, reduced harness** — Vulkan (system
+`libvulkan`) + OpenXR session + cesium tile streaming, with **no app-provided
+window** (the runtime self-creates one) and no HUD/input/MCP. This is
+BUILD-GREEN scope: `.github/workflows/build-linux.yml` (mirrors mediaplayer's,
+NOT a required check; triggers on `linux*` branches + manual dispatch) compiles
+the cross-platform scene layer on `ubuntu-latest`. **On-screen validation is a
+separate pass**, gated on the runtime's Linux Phase 1b + a GPU + an X server.
+The faithful app-window arm is `XR_EXT_xlib_window_binding` (runtime Phase 3a) —
+see the `TODO(Phase 3)` in `linux/main.cpp` and the runtime repo's
+`docs/guides/linux-demo-port.md`. The OpenXR **loader pin is `1.1.43`** (equal in
+`scripts/build_linux.sh` + `linux/CMakeLists.txt` FetchContent fallback + CI);
+the vendored `openxr_includes/` headers are newer (1.1.51) — that drift is
+expected on Linux, unlike the macOS/Windows legs which pin the loader to the
+header rev.
+
 ### Self-capture for autonomous verification (macOS vk_native)
 `xrCaptureAtlasEXT` (the **I** key) is unreliable on the macOS vk_native
 runtime and `screencapture` needs TCC the agent lacks. Use the built-in

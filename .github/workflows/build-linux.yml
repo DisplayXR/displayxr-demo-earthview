@@ -1,0 +1,109 @@
+name: Build Linux
+
+# EarthView Linux build-green dev loop (issue #19; M8 Linux epic
+# runtime#699; recipe: the runtime repo's docs/guides/linux-demo-port.md).
+#
+# DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
+# only on manual dispatch and `linux*` branches — so it can't gate unrelated
+# work while the port is in progress. Promote to a PR-triggered required check
+# (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
+# only once it passes reliably. Triggers mirror displayxr-demo-mediaplayer's
+# build-linux.yml exactly.
+#
+# Build-green scope: compile earthview_handle_vk_linux on ubuntu-latest. CI has
+# no display/GPU, so the app is never run here; on-screen validation is a
+# separate pass gated on the runtime's Linux Phase 1b + hardware.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - 'linux'
+      - 'linux-**'
+      - 'feature/linux-**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    env:
+      # Pin cesium's ezvcpkg dependency tree to a fixed path so it is
+      # deterministically cacheable (mirrors build-macos.yml).
+      EZVCPKG_BASEDIR: /home/runner/.ezvcpkg
+    steps:
+      - uses: actions/checkout@v5
+
+      # EarthView streams Google Photorealistic 3D Tiles via cesium-native,
+      # consumed by add_subdirectory(third_party/cesium-native) and bootstrapping
+      # its own deps (Draco, KTX, TLS/curl, …) through ezvcpkg on first configure
+      # (~11 min cold). Mirrors build-macos.yml's clone step. build_linux.sh also
+      # clones when absent, but do it here so the ezvcpkg cache key is stable.
+      - name: Clone cesium-native (v0.61.0)
+        run: |
+          git clone --branch v0.61.0 --depth 1 --recurse-submodules \
+            https://github.com/CesiumGS/cesium-native.git third_party/cesium-native
+
+      # Beyond the playbook's base list:
+      #  * libxxf86vm-dev + libxcb-glx0-dev: once GL/EGL headers are present the
+      #    OpenXR-SDK-Source loader build flips on GLX platform support — it
+      #    includes <xcb/glx.h> and its gfxwrapper test helper links Xxf86vm
+      #    (the GLX-flip gotcha, docs/guides/linux-demo-port.md).
+      #  * X11 / Wayland / ALSA dev headers: the app windows via the runtime
+      #    (hosted-NULL), but ezvcpkg ports + the OpenXR loader still want them.
+      #  * curl / TLS + vcpkg toolchain build tools (autoconf/automake/libtool/
+      #    nasm/zip/unzip/tar): cesium's ezvcpkg builds curl, openssl, draco, ktx
+      #    and friends FROM SOURCE via vcpkg, which needs these to configure the
+      #    ports. Missing them = a hard ezvcpkg bootstrap failure, not a silent
+      #    compile-out. libcurl4-openssl-dev is a belt-and-suspenders system
+      #    fallback for CesiumCurl.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxcb1-dev libx11-xcb-dev libxcb-glx0-dev libxxf86vm-dev \
+            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libcurl4-openssl-dev libssl-dev zlib1g-dev \
+            autoconf automake autoconf-archive libtool nasm \
+            zip unzip tar curl
+
+      # Fail loudly if the key dev packages did not land — a hollow-green guard
+      # analogous to mediaplayer's FFmpeg pkg-config assert.
+      - name: Assert required dev libraries present
+        run: |
+          set -e
+          pkg-config --exists vulkan   || { echo "::error::libvulkan-dev (vulkan.pc) missing"; exit 1; }
+          pkg-config --exists libcurl  || { echo "::error::libcurl4-openssl-dev (libcurl.pc) missing"; exit 1; }
+          command -v glslangValidator >/dev/null || { echo "::error::glslang-tools (glslangValidator) missing"; exit 1; }
+          command -v nasm >/dev/null || { echo "::error::nasm missing (needed by ezvcpkg ports)"; exit 1; }
+          echo "PASS: vulkan + libcurl + glslangValidator + nasm all present."
+
+      # Restore cesium-native's ezvcpkg dependency tree from the pinned
+      # EZVCPKG_BASEDIR. Keyed on the cesium tag + the pinned vcpkg commit —
+      # bump the suffix if either changes. Cache miss/outage is non-fatal
+      # (actions/cache only warns), so this can never break the build.
+      - name: Cache cesium vcpkg dependencies (ezvcpkg)
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.ezvcpkg
+          key: ezvcpkg-${{ runner.os }}-cesium-v0.61.0-vcpkg-afc0a2e0
+
+      - name: Build (build-green; app is not run — no display on CI)
+        env:
+          # Disable the compiler-launcher cache (empty) — cesium auto-wires
+          # sccache if found, and a GH-Actions-cache-backed sccache can hard-fail
+          # the compile. build_linux.sh forwards this so cesium's auto-detect
+          # guard skips it.
+          CMAKE_CXX_COMPILER_LAUNCHER: ""
+        run: ./scripts/build_linux.sh
+
+      - name: Assert the Linux binary built
+        run: |
+          BIN=build/linux/earthview_handle_vk_linux
+          [ -x "$BIN" ] || { echo "::error::$BIN not produced"; exit 1; }
+          echo "PASS: $BIN built."

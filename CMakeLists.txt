@@ -35,6 +35,11 @@ if(APPLE)
     add_subdirectory(macos)
 elseif(WIN32)
     add_subdirectory(windows)
+elseif(UNIX)
+    # Linux (M8 Linux epic, issue #19): hosted-NULL Vulkan+OpenXR harness.
+    # BUILD-GREEN — compiles the cross-platform scene layer on CI; on-screen
+    # validation is Phase-3 hardware-gated. See linux/CMakeLists.txt.
+    add_subdirectory(linux)
 else()
-    message(FATAL_ERROR "displayxr-demo-earthview supports macOS and Windows only (Android = M3).")
+    message(FATAL_ERROR "displayxr-demo-earthview supports macOS, Windows, and Linux (Android = M3).")
 endif()
