@@ -51,6 +51,9 @@ endif()
 
 add_executable(earthview_handle_vk_linux
     main.cpp
+    # stbi_write_png impl: displayxr-common ships it only on WIN32/APPLE, but
+    # tiles_common's TileRenderer::dumpColorTarget references it. See the TU.
+    stb_image_write_impl.cpp
 )
 
 target_include_directories(earthview_handle_vk_linux PRIVATE
