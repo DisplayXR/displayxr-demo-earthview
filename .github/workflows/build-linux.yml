@@ -3,6 +3,13 @@ name: Build Linux
 # EarthView Linux build-green dev loop (issue #19; M8 Linux epic
 # runtime#699; recipe: the runtime repo's docs/guides/linux-demo-port.md).
 #
+# TRI-LTS MATRIX (mirrors displayxr-demo-modelviewer): the deployment target is
+# Ubuntu 26.04 + Intel iGPU, but we also keep 22.04 (where render can be
+# validated on hand today) and 24.04 green — so "build-green" means "builds on
+# every supported toolchain (GCC 11 / 13 / 15)", not just whatever
+# ubuntu-latest happens to be. 22.04/24.04 use hosted runners; 26.04 runs in a
+# container (no hosted 26.04 runner yet).
+#
 # DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
 # only on manual dispatch and `linux*` branches — so it can't gate unrelated
 # work while the port is in progress. Promote to a PR-triggered required check
@@ -10,7 +17,7 @@ name: Build Linux
 # only once it passes reliably. Triggers mirror displayxr-demo-mediaplayer's
 # build-linux.yml exactly.
 #
-# Build-green scope: compile earthview_handle_vk_linux on ubuntu-latest. CI has
+# Build-green scope: compile earthview_handle_vk_linux. CI has
 # no display/GPU, so the app is never run here; on-screen validation is a
 # separate pass gated on the runtime's Linux Phase 1b + hardware.
 
@@ -28,12 +35,41 @@ concurrency:
 
 jobs:
   Build:
-    runs-on: ubuntu-latest
+    name: Build (Ubuntu ${{ matrix.lts }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04's default GCC 11 cannot build cesium's vcpkg tree (ada-url
+          # v3.3.0 needs C++20 constexpr std::string, a GCC 12 libstdc++
+          # feature) — use the official 22.04 g++-12 package. Same instruction
+          # applies to a 22.04 dev/render box.
+          - lts: "22.04"
+            runner: ubuntu-22.04
+            extra_pkgs: g++-12
+            cc: gcc-12
+            cxx: g++-12
+          - lts: "24.04"
+            runner: ubuntu-24.04
+          - lts: "26.04"
+            runner: ubuntu-latest
+            container: ubuntu:26.04
     env:
       # Pin cesium's ezvcpkg dependency tree to a fixed path so it is
-      # deterministically cacheable (mirrors build-macos.yml).
+      # deterministically cacheable (mirrors build-macos.yml). Absolute path
+      # works on hosted runners and (root-created) in the 26.04 container.
       EZVCPKG_BASEDIR: /home/runner/.ezvcpkg
     steps:
+      # In the 26.04 container we start as root with a bare image — install git
+      # BEFORE checkout (which shells out to git). No-op on the hosted runners.
+      - name: Bootstrap container (git for checkout)
+        run: |
+          if [ "$(id -u)" = "0" ] && ! command -v git >/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+          fi
+
       - uses: actions/checkout@v5
 
       # EarthView streams Google Photorealistic 3D Tiles via cesium-native,
@@ -59,15 +95,19 @@ jobs:
       #    ports. Missing them = a hard ezvcpkg bootstrap failure, not a silent
       #    compile-out. libcurl4-openssl-dev is a belt-and-suspenders system
       #    fallback for CesiumCurl.
+      # SUDO shim so the same step works on hosted runners (non-root, has sudo)
+      # and in the container (root, no sudo). Vendor-neutral libegl-dev/libgl-dev
+      # so the names resolve across 22.04/24.04/26.04.
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO=sudo
+          $SUDO apt-get update
+          $SUDO apt-get install -y ${{ matrix.extra_pkgs }} \
+            build-essential cmake ninja-build pkg-config git ca-certificates \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
             libxcb1-dev libx11-xcb-dev libxcb-glx0-dev libxxf86vm-dev \
-            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
             libcurl4-openssl-dev libssl-dev zlib1g-dev \
             autoconf automake autoconf-archive libtool nasm \
             zip unzip tar curl
@@ -84,14 +124,15 @@ jobs:
           echo "PASS: vulkan + libcurl + glslangValidator + nasm all present."
 
       # Restore cesium-native's ezvcpkg dependency tree from the pinned
-      # EZVCPKG_BASEDIR. Keyed on the cesium tag + the pinned vcpkg commit —
-      # bump the suffix if either changes. Cache miss/outage is non-fatal
-      # (actions/cache only warns), so this can never break the build.
+      # EZVCPKG_BASEDIR. Keyed on the cesium tag + the pinned vcpkg commit + the
+      # LTS release (GCC 11/13/15 artifacts are NOT interchangeable) — bump the
+      # suffix if any changes. Cache miss/outage is non-fatal (actions/cache
+      # only warns), so this can never break the build.
       - name: Cache cesium vcpkg dependencies (ezvcpkg)
         uses: actions/cache@v4
         with:
           path: /home/runner/.ezvcpkg
-          key: ezvcpkg-${{ runner.os }}-cesium-v0.61.0-vcpkg-afc0a2e0
+          key: ezvcpkg-${{ runner.os }}-${{ matrix.lts }}-cesium-v0.61.0-vcpkg-afc0a2e0
 
       - name: Build (build-green; app is not run — no display on CI)
         env:
@@ -100,7 +141,14 @@ jobs:
           # the compile. build_linux.sh forwards this so cesium's auto-detect
           # guard skips it.
           CMAKE_CXX_COMPILER_LAUNCHER: ""
-        run: ./scripts/build_linux.sh
+          MATRIX_CC: ${{ matrix.cc }}
+          MATRIX_CXX: ${{ matrix.cxx }}
+        run: |
+          if [ -n "$MATRIX_CC" ]; then
+            export CC="$MATRIX_CC" CXX="$MATRIX_CXX"
+            echo "Using matrix compiler override: CC=$CC CXX=$CXX"
+          fi
+          ./scripts/build_linux.sh
 
       - name: Assert the Linux binary built
         run: |
