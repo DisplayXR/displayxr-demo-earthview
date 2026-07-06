@@ -42,8 +42,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 22.04's default GCC 11 cannot build cesium's vcpkg tree (ada-url
+          # v3.3.0 needs C++20 constexpr std::string, a GCC 12 libstdc++
+          # feature) — use the official 22.04 g++-12 package. Same instruction
+          # applies to a 22.04 dev/render box.
           - lts: "22.04"
             runner: ubuntu-22.04
+            extra_pkgs: g++-12
+            cc: gcc-12
+            cxx: g++-12
           - lts: "24.04"
             runner: ubuntu-24.04
           - lts: "26.04"
@@ -95,7 +102,7 @@ jobs:
         run: |
           SUDO=""; [ "$(id -u)" != "0" ] && SUDO=sudo
           $SUDO apt-get update
-          $SUDO apt-get install -y \
+          $SUDO apt-get install -y ${{ matrix.extra_pkgs }} \
             build-essential cmake ninja-build pkg-config git ca-certificates \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
@@ -134,7 +141,14 @@ jobs:
           # the compile. build_linux.sh forwards this so cesium's auto-detect
           # guard skips it.
           CMAKE_CXX_COMPILER_LAUNCHER: ""
-        run: ./scripts/build_linux.sh
+          MATRIX_CC: ${{ matrix.cc }}
+          MATRIX_CXX: ${{ matrix.cxx }}
+        run: |
+          if [ -n "$MATRIX_CC" ]; then
+            export CC="$MATRIX_CC" CXX="$MATRIX_CXX"
+            echo "Using matrix compiler override: CC=$CC CXX=$CXX"
+          fi
+          ./scripts/build_linux.sh
 
       - name: Assert the Linux binary built
         run: |
