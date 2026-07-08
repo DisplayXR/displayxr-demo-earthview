@@ -1172,6 +1172,10 @@ struct AppXrSession {
     float nominalViewerX = 0, nominalViewerY = 0, nominalViewerZ = 0.5f;
     float recommendedViewScaleX = 0.5f, recommendedViewScaleY = 1.0f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
+    // XrDisplayDesktopPositionEXT (display_info v16, runtime#715): panel
+    // top-left in top-down global pixels (origin = primary top-left).
+    // (0,0) = primary/unknown — the safe default an old runtime yields.
+    int32_t displayScreenLeft = 0, displayScreenTop = 0;
 
     // Eye tracking
     float eyePositions[8][3] = {};  // [view][x,y,z] — raw per-eye positions in display space
@@ -1324,7 +1328,13 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
         XrEyeTrackingModeCapabilitiesEXT ec = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
-        di.next = &ec; sp.next = &di;
+        // INV-1.3: panel desktop position (display_info v16, runtime#715).
+        // Zero-initialized so an old runtime that ignores the unknown chain
+        // entry yields (0,0) = primary/unknown — the safe default.
+        XrDisplayDesktopPositionEXT desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        desktopPos.next = &ec;
+        di.next = &desktopPos; sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
             xr.recommendedViewScaleX = di.recommendedViewScaleX;
             xr.recommendedViewScaleY = di.recommendedViewScaleY;
@@ -1336,6 +1346,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.displayPixelWidth = di.displayPixelWidth;
             xr.displayPixelHeight = di.displayPixelHeight;
             xr.supportedEyeTrackingModes = (uint32_t)ec.supportedModes;
+            xr.displayScreenLeft = desktopPos.left;
+            xr.displayScreenTop = desktopPos.top;
+            LOG_INFO("Display desktop position: (%d, %d)", xr.displayScreenLeft, xr.displayScreenTop);
         }
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
         if (xr.supportedEyeTrackingModes != 0)
@@ -2027,6 +2040,23 @@ int main() {
     // Step 2: Initialize OpenXR
     AppXrSession xr = {};
     if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
+
+    // INV-1.3 / runtime#715: open on the 3D panel. The window is created (and
+    // centered) before the OpenXR instance, so one-shot move it to the panel's
+    // top-left before the session binds it. XrDisplayDesktopPositionEXT is
+    // top-down global pixels (origin = primary top-left); AppKit is bottom-up,
+    // so flip against the primary screen height. (0,0) = primary/unknown —
+    // keep the centered placement, matching an old runtime's behavior.
+    if (xr.displayScreenLeft != 0 || xr.displayScreenTop != 0) {
+        NSScreen *primary = [NSScreen screens].firstObject;
+        if (primary != nil) {
+            NSRect wf = [g_window frame];
+            CGFloat topY = primary.frame.size.height - (CGFloat)xr.displayScreenTop;
+            [g_window setFrameOrigin:NSMakePoint((CGFloat)xr.displayScreenLeft,
+                                                 topY - wf.size.height)];
+            LOG_INFO("Moved window to 3D panel at (%d, %d)", xr.displayScreenLeft, xr.displayScreenTop);
+        }
+    }
 
     // Try to find sim_display_set_output_mode
     { void *rtHandle = NULL;

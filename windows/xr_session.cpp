@@ -11,6 +11,10 @@
 
 bool g_hasViewRigExt = false;
 
+// XrDisplayDesktopPositionEXT (display_info v16, runtime#715) — see xr_session.h.
+int32_t g_displayDesktopLeft = 0;
+int32_t g_displayDesktopTop = 0;
+
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
@@ -124,7 +128,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
         XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
-        displayInfo.next = &eyeCaps;
+        // INV-1.3: panel desktop position (display_info v16, runtime#715).
+        // Zero-initialized so an old runtime that ignores the unknown chain
+        // entry yields (0,0) = primary/unknown — the safe default.
+        XrDisplayDesktopPositionEXT desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        desktopPos.next = &eyeCaps;
+        displayInfo.next = &desktopPos;
         sysProps.next = &displayInfo;
         XrResult diResult = xrGetSystemProperties(xr.instance, xr.systemId, &sysProps);
         if (XR_SUCCEEDED(diResult)) {
@@ -139,6 +149,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xr.displayPixelHeight = displayInfo.displayPixelHeight;
             xr.supportedEyeTrackingModes = (uint32_t)eyeCaps.supportedModes;
             xr.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
+            g_displayDesktopLeft = desktopPos.left;
+            g_displayDesktopTop = desktopPos.top;
+            LOG_INFO("Display desktop position: (%d, %d)", g_displayDesktopLeft, g_displayDesktopTop);
             LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, pixels=%ux%u, nominal=(%.0f,%.0f,%.0f)mm",
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
                 xr.displayWidthM, xr.displayHeightM,

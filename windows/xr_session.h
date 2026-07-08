@@ -19,6 +19,14 @@
 // #396 W4); set by InitializeOpenXR.
 extern bool g_hasViewRigExt;
 
+// XrDisplayDesktopPositionEXT (XR_EXT_display_info v16, runtime#715): the 3D
+// panel's top-left in virtual-desktop pixels (top-down, origin = primary
+// monitor top-left). (0, 0) = primary/unknown — the safe default an old
+// runtime yields by ignoring the chained struct. App-owned globals (common's
+// XrSessionManager carries no app-named fields); set by InitializeOpenXR.
+extern int32_t g_displayDesktopLeft;
+extern int32_t g_displayDesktopTop;
+
 // Initialize OpenXR instance with Vulkan + win32_window_binding extensions
 bool InitializeOpenXR(XrSessionManager& xr);
 
