@@ -2316,6 +2316,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
+    // INV-1.3 / runtime#715: open on the 3D panel. The window is created
+    // before the OpenXR instance (CW_USEDEFAULT), so one-shot move it to the
+    // panel's top-left (XrDisplayDesktopPositionEXT, virtual-desktop pixels)
+    // before xrCreateSession binds the HWND. (0,0) = primary/unknown — keep
+    // the default placement, which matches an old runtime's behavior.
+    if (g_displayDesktopLeft != 0 || g_displayDesktopTop != 0) {
+        SetWindowPos(hwnd, HWND_TOP, g_displayDesktopLeft, g_displayDesktopTop, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER);
+        LOG_INFO("Moved window to 3D panel at (%d, %d)", g_displayDesktopLeft, g_displayDesktopTop);
+    }
+
     // Try to load sim_display_set_output_mode
     {
         HMODULE rtModule = GetModuleHandleA("openxr_displayxr.dll");
