@@ -67,8 +67,8 @@ Docs: [3D Tiles overview](https://developers.google.com/maps/documentation/tile/
 
 | Platform | App name | OpenXR binding | Window | v1? |
 |---|---|---|---|---|
-| Windows | `earthview_handle_vk_win` | Vulkan | Win32 HWND via `XR_EXT_win32_window_binding` | ✅ |
-| macOS | `earthview_handle_vk_macos` | Vulkan (MoltenVK / CAMetalLayer) | NSWindow via `XR_EXT_cocoa_window_binding` | ✅ |
+| Windows | `earthview_handle_vk_win` | Vulkan | Win32 HWND via `XR_DXR_win32_window_binding` | ✅ |
+| macOS | `earthview_handle_vk_macos` | Vulkan (MoltenVK / CAMetalLayer) | NSWindow via `XR_DXR_cocoa_window_binding` | ✅ |
 | Android | `earthview` (NativeActivity) | Vulkan | OOP runtime via broker/service (ADR-025) | ✅ (after desktop) |
 
 Same single-Vulkan-codebase rationale as the mediaplayer PRD: `vk_native` is
@@ -111,7 +111,7 @@ Clone `displayxr-demo-modelviewer`, then:
   `macos/`, `android/` (gradle + NDK, openxr_loader AAR), `installer/`,
   `scripts/`, `openxr_includes/`.
 - All three **app shells**: window creation, OpenXR instance/session/swapchain
-  skeleton, `XR_EXT_view_rig` + `XR_EXT_display_info` + atlas-capture wiring,
+  skeleton, `XR_DXR_view_rig` + `XR_DXR_display_info` + atlas-capture wiring,
   frame loop, mode handling.
 - `model_common/model_vulkan_utils.{h,cpp}` — buffer/image upload helpers.
 
@@ -178,13 +178,13 @@ diorama scale:
      v1 ships camera-centric as default and treats the diorama rig as the
      showcase mode.
    Depth-volume mapping uses the nominal viewer distance from
-   `XR_EXT_display_info` in both models.
+   `XR_DXR_display_info` in both models.
 
 ### 6.2 Stereo + multiview invariants (from `docs/guides/displayxr-app-rules.md`)
 - **One worst-case swapchain at init** — canvas × recommended view scales,
   per-mode tiles via `subImage.imageRect`, `XrView views[8]`, never resized
   (INV-3.1 / INV-4.3; the multiview-tiling invariant).
-- **`XR_EXT_view_rig`** poses/FOVs used directly — no app-side Kooima math
+- **`XR_DXR_view_rig`** poses/FOVs used directly — no app-side Kooima math
   (W7 pattern, same as modelviewer/gauss).
 - **Tile selection runs once per frame** with a synthetic **center-eye**
   camera (midpoint of the located views, union FOV, SSE threshold computed
@@ -193,7 +193,7 @@ diorama scale:
   no per-eye traversal, no per-eye popping.
 - 2D mode (single view) renders the same scene mono — free with the above.
 - sRGB swapchain format; unlit shader writes sRGB-encoded (INV-4.6).
-- `xrCaptureAtlasEXT` for captures (INV-7.x); frame loop gated on
+- `xrCaptureAtlasDXR` for captures (INV-7.x); frame loop gated on
   session-running at READY (F-1).
 
 ### 6.3 Frame budget

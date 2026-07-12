@@ -88,9 +88,9 @@ ShowUninstDetails show
 !include "WordFunc.nsh"
 !insertmacro VersionCompare
 
-; Minimum runtime version. EarthView relies on XR_EXT_view_rig (the runtime owns
-; the off-axis Kooima + window resolve), XR_EXT_display_info, and
-; XR_EXT_atlas_capture — the same #396 consume path the modelviewer demo uses
+; Minimum runtime version. EarthView relies on XR_DXR_view_rig (the runtime owns
+; the off-axis Kooima + window resolve), XR_DXR_display_info, and
+; XR_DXR_atlas_capture — the same #396 consume path the modelviewer demo uses
 ; against runtime ≥ 1.3.0. Older runtimes lack the render-ready XrView{pose,fov}
 ; channel the tile renderer draws through, so the scene won't appear.
 !define MIN_RUNTIME_VERSION "1.3.0"
@@ -142,7 +142,7 @@ Function .onInit
         Abort
     ${EndIf}
 
-    ; Enforce the minimum runtime version for the XR_EXT_view_rig consume path
+    ; Enforce the minimum runtime version for the XR_DXR_view_rig consume path
     ; this demo renders through. The Leia SR Vulkan weaver DLL is the Leia
     ; plug-in's concern (it ships + loads SimulatedRealityVulkanBeta.dll itself)
     ; — the demo neither bundles nor depends on it being on PATH.

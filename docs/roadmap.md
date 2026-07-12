@@ -21,7 +21,7 @@ live in [`PRD.md`](../PRD.md) (§9). Rendering/coordinate internals:
   (`tile_renderer`, `IPrepareRendererResources`), double-precision geo/RTC math
   (`geo_math`), unlit sRGB shaders.
 - **macOS shell** — Cocoa + MoltenVK + OpenXR; one worst-case swapchain, per-mode
-  tiles, `XR_EXT_view_rig`; camera-centric + display-centric diorama nav;
+  tiles, `XR_DXR_view_rig`; camera-centric + display-centric diorama nav;
   center-eye double-click pick; `C` release-to-fly; bookmarks; always-on Google
   attribution strip; keyless first-run text card.
 - **Selection model** — single mono symmetric ViewState per
@@ -57,7 +57,7 @@ live in [`PRD.md`](../PRD.md) (§9). Rendering/coordinate internals:
 
 ## Then M2 / M3
 
-- **M2 Windows:** add the `windows/` shell (Win32 + `XR_EXT_win32_window_binding`),
+- **M2 Windows:** add the `windows/` shell (Win32 + `XR_DXR_win32_window_binding`),
   a `build-windows.yml`, and the Windows installer; validate weave + 60 fps on a
   Leia panel. The selection/coordinate/renderer code in `tiles_common` is
   platform-neutral and carries over.

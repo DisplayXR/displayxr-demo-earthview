@@ -7,7 +7,7 @@
 // SHARED tiles_common Vulkan renderer + cesium-native streaming (Google
 // Photorealistic 3D Tiles), exactly as the windows/ + macos/ legs do.
 //
-// Camera-centric FLY mode via XR_EXT_view_rig's camera rig (the runtime owns the
+// Camera-centric FLY mode via XR_DXR_view_rig's camera rig (the runtime owns the
 // off-axis eyes). Touch: 1-finger drag = look, 2-finger pinch = dolly. The
 // macOS-parity focus/orbit (double-tap to inspect a landmark) is a follow-up.
 //
@@ -23,8 +23,8 @@
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_view_rig.h>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -172,7 +172,7 @@ double g_poiXitFromTD = 0.0, g_poiXitToTD = 0.0;
 // unproject), set by the JNI tap with the tapped screen NDC.
 std::atomic<bool> g_pendingPick{false};
 float g_pickNdcX = 0.0f, g_pickNdcY = 0.0f;
-uint32_t g_canvas_px_w = 0, g_canvas_px_h = 0;  // from XrViewDisplayRawEXT
+uint32_t g_canvas_px_w = 0, g_canvas_px_h = 0;  // from XrViewDisplayRawDXR
 // Physical display height (m) + nominal viewer Z (m), latched from the rig raw
 // channel (canvasSizeMeters + rawEyes display-space Z) — stable nominal values
 // that drive the orthoscopic fly FOV (CamVFovRad). See docs/rendering-notes.md §5.
@@ -232,16 +232,16 @@ create_instance(struct android_app *app)
 		for (auto &p : props) { p.type = XR_TYPE_EXTENSION_PROPERTIES; p.next = nullptr; }
 		if (xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data()) == XR_SUCCESS)
 			for (uint32_t i = 0; i < n; ++i)
-				if (std::strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0)
+				if (std::strcmp(props[i].extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
 					g_has_view_rig = true;
 	}
-	LOGI("XR_EXT_view_rig advertised: %s", g_has_view_rig ? "yes" : "no");
+	LOGI("XR_DXR_view_rig advertised: %s", g_has_view_rig ? "yes" : "no");
 
 	const char *exts[4] = {XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	                       XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
-	                       XR_EXT_DISPLAY_INFO_EXTENSION_NAME};
+	                       XR_DXR_DISPLAY_INFO_EXTENSION_NAME};
 	uint32_t ext_count = 3;
-	if (g_has_view_rig) exts[ext_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+	if (g_has_view_rig) exts[ext_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 
 	XrInstanceCreateInfoAndroidKHR ainfo = {};
 	ainfo.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
@@ -730,9 +730,9 @@ render_frame()
 		// Windows model (PR #4): the world stays camera-centric, the POI is framed
 		// onto the zero-parallax plane by targetDist, and the display eye sits at
 		// the convergence anchor so the pick lands on the inspected feature.
-		XrCameraRigEXT camRig = {XR_TYPE_CAMERA_RIG_EXT};
-		XrDisplayRigEXT dispRig = {XR_TYPE_DISPLAY_RIG_EXT};
-		XrViewDisplayRawEXT raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		XrCameraRigDXR camRig = {XR_TYPE_CAMERA_RIG_DXR};
+		XrDisplayRigDXR dispRig = {XR_TYPE_DISPLAY_RIG_DXR};
+		XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 		if (g_has_view_rig) {
 			const float camVFov = CamVFovRad(g_displayHeightM, g_nominalViewerZ);
 			if (!g_focusActive) {
@@ -1131,7 +1131,7 @@ Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeResetView(JNIEnv *,
 // Double-tap at (x,y) view pixels → defer a depth-pick (resolved on the render
 // thread): hit a landmark = focus/orbit it; miss (sky) = release focus → fly.
 // (viewW,viewH) are the TOUCH SURFACE (View) dims, passed from Kotlin. We must
-// derive the pick NDC from these, NOT from XrViewDisplayRawEXT::canvasRectPx:
+// derive the pick NDC from these, NOT from XrViewDisplayRawDXR::canvasRectPx:
 // on a portrait-native panel the runtime reports canvasRectPx in the panel's
 // unrotated (portrait) basis (e.g. 1600x2560), while the app runs landscape and
 // the touch coords are in the rotated (landscape) basis (2560x1600). Dividing

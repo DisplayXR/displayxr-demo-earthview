@@ -9,7 +9,7 @@
 # needs the runtime's Linux Phase 1b (on-screen present) + a GPU + an X server.
 #
 # The Linux binary is a HOSTED-NULL app: it passes no window binding, so the
-# runtime self-creates its window (the faithful XR_EXT_xlib_window_binding arm
+# runtime self-creates its window (the faithful XR_DXR_xlib_window_binding arm
 # is Phase-3 hardware-gated). See linux/main.cpp and the runtime repo's
 # docs/guides/linux-demo-port.md.
 set -euo pipefail
