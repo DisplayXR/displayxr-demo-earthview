@@ -54,7 +54,7 @@ Files to author (mostly verbatim copies with renames):
   in the APK. The **DisplayXR runtime APK must be pre-installed** (owns the weave
   SurfaceView / MonadoView, the vendor DP, eye tracking).
 - The app does **not** create or hand a surface to the runtime, and uses **no
-  `XR_EXT_android_surface_binding`**. It renders into OpenXR swapchain images the
+  `XR_DXR_android_surface_binding`**. It renders into OpenXR swapchain images the
   runtime composites OOP. `app->window` is only a "can render" gate.
 - `xrCreateInstance` chains `XrInstanceCreateInfoAndroidKHR{VM, activity}` and
   **retries on `XR_ERROR_RUNTIME_UNAVAILABLE`** (cold service start).
