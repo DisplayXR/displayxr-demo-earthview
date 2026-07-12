@@ -71,7 +71,7 @@ far_z  = ez + 1000 * rigVH;        // unchanged
 
 ## 4. Self-verification (no user screenshot, no TCC)
 
-`xrCaptureAtlasEXT` is unreliable on macOS vk_native and `screencapture` needs
+`xrCaptureAtlasDXR` is unreliable on macOS vk_native and `screencapture` needs
 TCC the agent lacks. `TileRenderer::dumpColorTarget()` copies the internal
 colour target → `stbi_write_png`; the frame loop fires it once via
 **`DXR_DUMP=N`** → `/tmp/earthview_dump.png` (mono eye 0 — clearer than an
@@ -82,19 +82,19 @@ See `CLAUDE.md` → "Self-capture".
 
 ## 5. Two rigs: FLY = camera rig, FOCUS/orbit = display rig
 
-EarthView submits poses through **`XR_EXT_view_rig`** (the runtime owns the
+EarthView submits poses through **`XR_DXR_view_rig`** (the runtime owns the
 off-axis eyes). There are two rig parameterizations and the app switches between
 them; **the world (cesium tiles) is always mapped camera-centric**, anchored at
 the **XR origin**, via `xrFromEcefCamera(g_geoNav.cam, origin, s)` with
 `s = kTargetXrDist / targetDist`. Both rigs only change how the runtime places
 the eyes; **neither rig moves the world anchor.**
 
-- **FLY → camera rig** (`XrCameraRigEXT`): a plain perspective camera at the XR
+- **FLY → camera rig** (`XrCameraRigDXR`): a plain perspective camera at the XR
   origin. Identity pose; the runtime perturbs the *tracked* eyes around it.
   **Never anchor the world to the tracked-eye centroid** — that re-introduced
   off-centre / zoom-on-rotate on a real tracked panel. The cam rig owns the
   stereo via `verticalFov` + `convergenceDiopters`.
-- **FOCUS/orbit → display rig** (`XrDisplayRigEXT`): a portal locked to the
+- **FOCUS/orbit → display rig** (`XrDisplayRigDXR`): a portal locked to the
   physical display. On a double-click the app converts the *live* camera rig →
   display rig with `dxr_view_rig_camera_to_display` so the switch is
   **disturbance-free** (the converter is exact — monkey-tested; do not "fix" it).

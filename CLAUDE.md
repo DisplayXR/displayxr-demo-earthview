@@ -80,7 +80,7 @@ BUILD-GREEN scope: `.github/workflows/build-linux.yml` (mirrors mediaplayer's,
 NOT a required check; triggers on `linux*` branches + manual dispatch) compiles
 the cross-platform scene layer on `ubuntu-latest`. **On-screen validation is a
 separate pass**, gated on the runtime's Linux Phase 1b + a GPU + an X server.
-The faithful app-window arm is `XR_EXT_xlib_window_binding` (runtime Phase 3a) —
+The faithful app-window arm is `XR_DXR_xlib_window_binding` (runtime Phase 3a) —
 see the `TODO(Phase 3)` in `linux/main.cpp` and the runtime repo's
 `docs/guides/linux-demo-port.md`. The OpenXR **loader pin is `1.1.43`** (equal in
 `scripts/build_linux.sh` + `linux/CMakeLists.txt` FetchContent fallback + CI);
@@ -89,7 +89,7 @@ expected on Linux, unlike the macOS/Windows legs which pin the loader to the
 header rev.
 
 ### Self-capture for autonomous verification (macOS vk_native)
-`xrCaptureAtlasEXT` (the **I** key) is unreliable on the macOS vk_native
+`xrCaptureAtlasDXR` (the **I** key) is unreliable on the macOS vk_native
 runtime and `screencapture` needs TCC the agent lacks. Use the built-in
 **in-app PNG dump** instead:
 ```bash
@@ -110,7 +110,7 @@ env vars force a bookmark framing to reproduce a reported pose.
 
 - DisplayXR app invariants: `displayxr-runtime/docs/guides/displayxr-app-rules.md`
   (one worst-case swapchain, per-mode tiles via `subImage.imageRect`,
-  `XR_EXT_view_rig` poses used directly, sRGB).
+  `XR_DXR_view_rig` poses used directly, sRGB).
 - Tile selection runs ONCE per frame with a center-eye camera; both views draw
   the same selected set.
 - Doubles live in `geo_math` only; the frame loop sees per-tile `float[16]`.

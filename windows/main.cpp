@@ -6,7 +6,7 @@
  *         tracked 3D display via OpenXR (Vulkan).
  *
  * Windows shell for the EarthView demo. Cloned from displayxr-demo-modelviewer's
- * windows/main.cpp (the Win32 + XR_EXT_win32_window_binding + Vulkan/OpenXR +
+ * windows/main.cpp (the Win32 + XR_DXR_win32_window_binding + Vulkan/OpenXR +
  * D2D window-space-layer HUD scaffold) with the ModelRenderer call sites
  * retargeted to tiles_common (TileEngine + TileRenderer), mirroring macos/main.mm
  * 1:1. The streaming / selection / coordinate / renderer code in tiles_common/
@@ -123,7 +123,7 @@ static inline float BtnBarHeightFraction(uint32_t windowW, uint32_t windowH) {
 }
 
 
-// ── XR_EXT_view_rig consume-path math (#396 W7) ──────────────────────────────
+// ── XR_DXR_view_rig consume-path math (#396 W7) ──────────────────────────────
 // View/projection builders for the runtime's render-ready XrView{pose, fov}:
 // GL convention, column-major float[16], matching the macOS main.mm helpers
 // (per-platform duplication is the accepted pattern for these ~20 lines).
@@ -290,7 +290,7 @@ static inline float CamVFovRad(float physHeightM, float nominalZ) {
 static float g_convDiopters = 1.0f;
 static constexpr double kConvSmoothTau = 0.15;    // s — exp filter time constant
 static float g_viewDistXR = 0.0f;                  // frustum-source eye->focus distance
-// Runtime-resolved canvas size (m), from XrViewDisplayRawEXT::canvasSizeMeters.
+// Runtime-resolved canvas size (m), from XrViewDisplayRawDXR::canvasSizeMeters.
 static float g_canvasWM = 0.0f, g_canvasHM = 0.0f;
 
 // Double-click "focus" model (macOS parity, commit c95b624): seamless cam->display
@@ -330,7 +330,7 @@ static std::atomic<bool> g_keySubmitRequested{false};
 static int   g_lastDragX = 0, g_lastDragY = 0;
 static bool  g_dragValid = false;
 
-// 'I' key: capture the multi-view atlas region via xrCaptureAtlasEXT. Skipped
+// 'I' key: capture the multi-view atlas region via xrCaptureAtlasDXR. Skipped
 // for 1×1 (mono) layouts. Helper lives in common/atlas_capture*.
 static std::atomic<bool> g_captureAtlasRequested{false};
 // 'X' key cycles tile-renderer supersampling 1→2→4→1 for live A/B (default 1 =
@@ -607,7 +607,7 @@ static bool IsClickOnCityButton(int mouseX, int mouseY, int windowW, int windowH
         ANIM_BTN_WIDTH_FRACTION, BtnBarHeightFraction(windowW, windowH));
 }
 
-// Atlas capture is runtime-owned via xrCaptureAtlasEXT (XR_EXT_atlas_capture).
+// Atlas capture is runtime-owned via xrCaptureAtlasDXR (XR_DXR_atlas_capture).
 // App-side helpers (filename numbering + flash overlay) live in
 // common/atlas_capture* — see dxr_capture::MakeCaptureAtlasPrefix /
 // TriggerCaptureFlash / PostFlashRequest.
@@ -1121,7 +1121,7 @@ static void RenderThreadFunc(
 
         // Rendering mode requests (V/mode-button=cycle, 0-8=absolute) through the
         // shared ModeSwitch sequencer: eases viewParams.ipdFactor around the switch
-        // and fires xrRequestDisplayRenderingModeEXT on the right frame. Ramped ipd
+        // and fires xrRequestDisplayRenderingModeDXR on the right frame. Ramped ipd
         // lands on inputSnapshot.viewParams.ipdFactor (what the render path reads).
         // Runtime owns current mode via xr->currentModeIndex.
         XrSessionUpdateModeSwitch(*xr, inputSnapshot, perfStats.deltaTime);
@@ -1129,11 +1129,11 @@ static void RenderThreadFunc(
         // Handle eye tracking mode toggle (T key)
         if (inputSnapshot.eyeTrackingModeToggleRequested) {
             if (xr->pfnRequestEyeTrackingModeEXT && xr->session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+                XrEyeTrackingModeDXR newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
                 XrResult etResult = xr->pfnRequestEyeTrackingModeEXT(xr->session, newMode);
                 LOG_INFO("Eye tracking mode -> %s (%s)",
-                    newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
+                    newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
                     XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
             }
         }
@@ -1224,7 +1224,7 @@ static void RenderThreadFunc(
                         const float rigVH = inputSnapshot.viewParams.virtualDisplayHeight
                             / inputSnapshot.viewParams.scaleFactor;
 
-                        // XR_EXT_view_rig (#396 W7): chain a rig so the runtime owns the
+                        // XR_DXR_view_rig (#396 W7): chain a rig so the runtime owns the
                         // off-axis eyes + window resolve, returning render-ready
                         // XrView{pose, fov}. FLY (camera-centric) uses the CAMERA rig: a
                         // plain perspective camera the runtime perturbs with eye tracking,
@@ -1238,9 +1238,9 @@ static void RenderThreadFunc(
                         const bool naturalRigCamera = useRig && !g_geoNav.orbitAcquired;
                         // Focus mode forces the display rig; the world stays camera-centric.
                         const bool rigCamera = naturalRigCamera && !g_focusActive;
-                        XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
-                        XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
-                        XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                        XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
+                        XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                        XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                         if (useRig) {
                             // physical_height_m MUST be the runtime's CANVAS height (window
                             // client area), NOT the full display height (canvas vs display =
@@ -1351,7 +1351,7 @@ static void RenderThreadFunc(
 
                         // HUD eye readout. Under the rig, rawViews[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel
-                        // (XrViewDisplayRawEXT); without the rig, the fill from the common
+                        // (XrViewDisplayRawDXR); without the rig, the fill from the common
                         // LocateViews call above stands.
                         if (useRig && viewRigRaw.eyeCountOutput > 0) {
                             for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
@@ -1819,7 +1819,7 @@ static void RenderThreadFunc(
                                     (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
                             }
 
-                            // 'I' key: snapshot the multi-view atlas via xrCaptureAtlasEXT
+                            // 'I' key: snapshot the multi-view atlas via xrCaptureAtlasDXR
                             // (runtime-owned readback). Skipped for mono (1×1). Stem =
                             // the active city bookmark.
                             if (g_captureAtlasRequested.exchange(false)) {
@@ -1837,9 +1837,9 @@ static void RenderThreadFunc(
                                     for (auto& c : stem) if (c == ' ') c = '_';
                                     std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                                         stem, cols, rows);
-                                    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                    XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                                     info.next = nullptr;
-                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
                                     strncpy_s(info.pathPrefix, prefix.c_str(), _TRUNCATE);
                                     XrResult cr = xr->pfnCaptureAtlasEXT(xr->session, &info, nullptr);
                                     if (XR_SUCCEEDED(cr)) {
@@ -1847,10 +1847,10 @@ static void RenderThreadFunc(
                                                  prefix.c_str());
                                         dxr_capture::PostFlashRequest(hwnd);
                                     } else {
-                                        LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                                        LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
                                     }
                                 } else {
-                                    LOG_WARN("Capture skipped: XR_EXT_atlas_capture not available");
+                                    LOG_WARN("Capture skipped: XR_DXR_atlas_capture not available");
                                 }
                             }
 
@@ -1896,8 +1896,8 @@ static void RenderThreadFunc(
                                 sessionText += L"\nSession: ";
                                 sessionText += FormatSessionState((int)xr->sessionState);
                                 std::wstring modeText = xr->hasWin32WindowBindingExt ?
-                                    L"XR_EXT_win32_window_binding: ACTIVE (Vulkan + 3D Tiles)" :
-                                    L"XR_EXT_win32_window_binding: NOT AVAILABLE";
+                                    L"XR_DXR_win32_window_binding: ACTIVE (Vulkan + 3D Tiles)" :
+                                    L"XR_DXR_win32_window_binding: NOT AVAILABLE";
 
                                 // EarthView info + Google attribution (Map Tiles API
                                 // policy, PRD §7.3). NOTE: the attribution must be ALWAYS
@@ -2078,7 +2078,7 @@ static void RenderThreadFunc(
                 //    when the model has clips. Reuses the window-space-layer
                 //    machinery (own swapchain / text renderer / staging) widened
                 //    to a bar — see runtime issue #389. ──
-                XrCompositionLayerWindowSpaceEXT barLayer = {};
+                XrCompositionLayerWindowSpaceDXR barLayer = {};
                 bool barLayerReady = false;
                 if (g_animBtnReady && g_hasAnimBtnSwapchain) {
                     const float mxf = (g_windowWidth > 0)
@@ -2178,7 +2178,7 @@ static void RenderThreadFunc(
                         vkFreeCommandBuffers(vkDevice, g_animBtnCmdPool, 1, &cb);
                         ReleaseWindowSpaceImage(g_animBtnSwapchain);
 
-                        barLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+                        barLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
                         barLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                         barLayer.subImage.swapchain = g_animBtnSwapchain.swapchain;
                         barLayer.subImage.imageRect.offset = {0, 0};
@@ -2318,7 +2318,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // INV-1.3 / runtime#715: open on the 3D panel. The window is created
     // before the OpenXR instance (CW_USEDEFAULT), so one-shot move it to the
-    // panel's top-left (XrDisplayDesktopPositionEXT, virtual-desktop pixels)
+    // panel's top-left (XrDisplayDesktopPositionDXR, virtual-desktop pixels)
     // before xrCreateSession binds the HWND. (0,0) = primary/unknown — keep
     // the default placement, which matches an old runtime's behavior.
     if (g_displayDesktopLeft != 0 || g_displayDesktopTop != 0) {
@@ -2615,7 +2615,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_inputState.renderingModeCount = xr.renderingModeCount;
     // Align runtime active rendering mode with app's default (mode 1 = first 3D mode).
     // The main loop's dispatch picks this up on the first frame and calls
-    // xrRequestDisplayRenderingModeEXT(1); the runtime event drives xr.currentModeIndex.
+    // xrRequestDisplayRenderingModeDXR(1); the runtime event drives xr.currentModeIndex.
     g_inputState.absoluteRenderingModeRequested = 1;
     g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
     g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle

@@ -9,10 +9,10 @@
  * the model_common/ModelRenderer PBR pipeline.  Features a "Load…" button overlay.
  *
  * Features:
- * - App creates and owns the NSWindow (XR_EXT_cocoa_window_binding)
+ * - App creates and owns the NSWindow (XR_DXR_cocoa_window_binding)
  * - Mouse drag camera, WASD/QE movement, scroll zoom
- * - XR_EXT_display_info: Kooima projection, display metrics
- * - V key cycles rendering modes via xrRequestDisplayRenderingModeEXT
+ * - XR_DXR_display_info: Kooima projection, display metrics
+ * - V key cycles rendering modes via xrRequestDisplayRenderingModeDXR
  * - 0-3 keys select rendering mode directly
  * - L key or button click: NSOpenPanel to load .glb/.gltf models
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
@@ -27,11 +27,11 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_cocoa_window_binding.h>
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_atlas_capture.h>
-#include <openxr/XR_EXT_view_rig.h>
-#include <openxr/XR_EXT_mcp_tools.h>
+#include <openxr/XR_DXR_cocoa_window_binding.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_atlas_capture.h>
+#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_mcp_tools.h>
 
 #include <cmath>
 #include <csignal>
@@ -132,7 +132,7 @@ struct InputState {
 
     // Unified rendering mode (V key cycles, 0-8 keys select directly)
     uint32_t currentRenderingMode = 1;   // Default: mode 1 (first 3D mode)
-    uint32_t renderingModeCount = 0;     // Set from xrEnumerateDisplayRenderingModesEXT
+    uint32_t renderingModeCount = 0;     // Set from xrEnumerateDisplayRenderingModesDXR
     bool renderingModeChangeRequested = false;
 };
 
@@ -1165,14 +1165,14 @@ struct AppXrSession {
     // Swapchain
     struct { XrSwapchain swapchain; uint32_t width, height, imageCount; int64_t format; } swapchain = {};
 
-    // Display info from XR_EXT_display_info
+    // Display info from XR_DXR_display_info
     bool hasDisplayInfoExt = false;
     bool hasCocoaWindowBinding = false;
     float displayWidthM = 0, displayHeightM = 0;
     float nominalViewerX = 0, nominalViewerY = 0, nominalViewerZ = 0.5f;
     float recommendedViewScaleX = 0.5f, recommendedViewScaleY = 1.0f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
-    // XrDisplayDesktopPositionEXT (display_info v16, runtime#715): panel
+    // XrDisplayDesktopPositionDXR (display_info v16, runtime#715): panel
     // top-left in top-down global pixels (origin = primary top-left).
     // (0,0) = primary/unknown — the safe default an old runtime yields.
     int32_t displayScreenLeft = 0, displayScreenTop = 0;
@@ -1185,28 +1185,28 @@ struct AppXrSession {
     uint32_t supportedEyeTrackingModes = 0;
 
     // Function pointers
-    PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
-    PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;
-    PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+    PFN_xrRequestDisplayModeDXR pfnRequestDisplayModeEXT = nullptr;
+    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingModeEXT = nullptr;
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
-    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I' key capture.
+    // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I' key capture.
     bool hasAtlasCaptureExt = false;
-    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+    PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
 
-    // XR_EXT_view_rig (W7 of #396): runtime owns the off-axis Kooima and returns
+    // XR_DXR_view_rig (W7 of #396): runtime owns the off-axis Kooima and returns
     // render-ready XrView{pose, fov}; the app deletes its own.
     bool hasViewRigExt = false;
 
-    // XR_EXT_mcp_tools (#22): app-defined agent tools on the runtime-hosted
+    // XR_DXR_mcp_tools (#22): app-defined agent tools on the runtime-hosted
     // per-process MCP server. The whole path is inert when the extension or
     // the MCP capability gate is absent — never load-bearing.
     bool hasMcpToolsExt = false;
-    PFN_xrSetMCPAppInfoEXT pfnSetMCPAppInfo = nullptr;
-    PFN_xrRegisterMCPToolEXT pfnRegisterMCPTool = nullptr;
-    PFN_xrUnregisterMCPToolEXT pfnUnregisterMCPTool = nullptr;
-    PFN_xrGetMCPToolCallArgsEXT pfnGetMCPToolCallArgs = nullptr;
-    PFN_xrSubmitMCPToolResultEXT pfnSubmitMCPToolResult = nullptr;
+    PFN_xrSetMCPAppInfoDXR pfnSetMCPAppInfo = nullptr;
+    PFN_xrRegisterMCPToolDXR pfnRegisterMCPTool = nullptr;
+    PFN_xrUnregisterMCPToolDXR pfnUnregisterMCPTool = nullptr;
+    PFN_xrGetMCPToolCallArgsDXR pfnGetMCPToolCallArgs = nullptr;
+    PFN_xrSubmitMCPToolResultDXR pfnSubmitMCPToolResult = nullptr;
     bool mcpToolsReady = false;           // appId declared + base tools registered
     bool mcpAnimToolsRegistered = false;  // list/play/stop_animation currently live
 
@@ -1289,23 +1289,23 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasVulkan = false;
     for (const auto& ext : exts) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
-        if (strcmp(ext.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasCocoaWindowBinding = true;
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
-        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
-        if (strcmp(ext.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
-        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasCocoaWindowBinding = true;
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
 
     std::vector<const char*> enabled;
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
-    if (xr.hasCocoaWindowBinding) enabled.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
-    if (xr.hasDisplayInfoExt) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
-    if (xr.hasAtlasCaptureExt) enabled.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
-    if (xr.hasMcpToolsExt) enabled.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
-    if (xr.hasViewRigExt) enabled.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
-    LOG_INFO("XR_EXT_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    if (xr.hasCocoaWindowBinding) enabled.push_back(XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME);
+    if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+    if (xr.hasAtlasCaptureExt) enabled.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
+    if (xr.hasMcpToolsExt) enabled.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
+    if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "DisplayXRModelViewerMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -1326,13 +1326,13 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-        XrEyeTrackingModeCapabilitiesEXT ec = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrEyeTrackingModeCapabilitiesDXR ec = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
         // INV-1.3: panel desktop position (display_info v16, runtime#715).
         // Zero-initialized so an old runtime that ignores the unknown chain
         // entry yields (0,0) = primary/unknown — the safe default.
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         desktopPos.next = &ec;
         di.next = &desktopPos; sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
@@ -1350,35 +1350,35 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.displayScreenTop = desktopPos.top;
             LOG_INFO("Display desktop position: (%d, %d)", xr.displayScreenLeft, xr.displayScreenTop);
         }
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
         if (xr.supportedEyeTrackingModes != 0)
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT", (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
 
         // Load unified rendering mode function pointers (v7)
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT", (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR", (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
 
-    // XR_EXT_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
+    // XR_DXR_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
     if (xr.hasAtlasCaptureExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT", (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
-        LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR", (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
+        LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
 
-    // XR_EXT_mcp_tools (#22): resolve the agent-tool entry points. Tools are
+    // XR_DXR_mcp_tools (#22): resolve the agent-tool entry points. Tools are
     // registered after session create (CreateSession) and dispatched from
     // PollEvents.
     if (xr.hasMcpToolsExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoEXT", (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfo);
-        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolEXT", (PFN_xrVoidFunction*)&xr.pfnRegisterMCPTool);
-        xrGetInstanceProcAddr(xr.instance, "xrUnregisterMCPToolEXT", (PFN_xrVoidFunction*)&xr.pfnUnregisterMCPTool);
-        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsEXT", (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgs);
-        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultEXT", (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResult);
+        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoDXR", (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfo);
+        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolDXR", (PFN_xrVoidFunction*)&xr.pfnRegisterMCPTool);
+        xrGetInstanceProcAddr(xr.instance, "xrUnregisterMCPToolDXR", (PFN_xrVoidFunction*)&xr.pfnUnregisterMCPTool);
+        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsDXR", (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgs);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultDXR", (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResult);
         const bool resolved = xr.pfnSetMCPAppInfo && xr.pfnRegisterMCPTool &&
             xr.pfnUnregisterMCPTool && xr.pfnGetMCPToolCallArgs && xr.pfnSubmitMCPToolResult;
-        LOG_INFO("XR_EXT_mcp_tools entry points: %s", resolved ? "resolved" : "NULL");
+        LOG_INFO("XR_DXR_mcp_tools entry points: %s", resolved ? "resolved" : "NULL");
     } else {
-        LOG_INFO("XR_EXT_mcp_tools: not advertised by runtime");
+        LOG_INFO("XR_DXR_mcp_tools: not advertised by runtime");
     }
 
     LOG_INFO("OpenXR initialized: %s", xr.systemName);
@@ -1505,28 +1505,28 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueFamilyIndex = qfi;
     vkBinding.queueIndex = 0;
 
-    XrCocoaWindowBindingCreateInfoEXT macBinding = {(XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT};
+    XrCocoaWindowBindingCreateInfoDXR macBinding = {(XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR};
     macBinding.viewHandle = (__bridge void*)g_metalView;
     if (xr.hasCocoaWindowBinding && g_metalView) {
         vkBinding.next = &macBinding;
-        LOG_INFO("Using XR_EXT_cocoa_window_binding");
+        LOG_INFO("Using XR_DXR_cocoa_window_binding");
     }
 
     XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
     si.next = &vkBinding; si.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &si, &xr.session));
 
-    // XR_EXT_mcp_tools (#22): declare identity + register the base agent
+    // XR_DXR_mcp_tools (#22): declare identity + register the base agent
     // tools. The appId MUST match `id` in
     // displayxr/earthview_handle_vk_macos.displayxr.json (INV-10.1).
     // Failure is non-fatal by design — the MCP capability gate may simply be
     // off on this machine; EarthView runs identically without an agent surface.
     if (xr.hasMcpToolsExt && xr.pfnSetMCPAppInfo && xr.pfnRegisterMCPTool) {
-        XrMCPAppInfoEXT mcpAppInfo = {XR_TYPE_MCP_APP_INFO_EXT};
+        XrMCPAppInfoDXR mcpAppInfo = {XR_TYPE_MCP_APP_INFO_DXR};
         strncpy(mcpAppInfo.appId, "earthview", sizeof(mcpAppInfo.appId) - 1);
         XrResult ar = xr.pfnSetMCPAppInfo(xr.session, &mcpAppInfo);
         if (XR_SUCCEEDED(ar)) {
-            XrMCPToolInfoEXT statusTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR statusTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
             statusTool.name = "get_status";
             statusTool.description =
                 "Read EarthView's live state: active city bookmark, whether an "
@@ -1536,7 +1536,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
             statusTool.inputSchemaJson = "{\"type\":\"object\"}";
             XrResult t1 = xr.pfnRegisterMCPTool(xr.session, &statusTool);
 
-            XrMCPToolInfoEXT bookmarkTool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR bookmarkTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
             bookmarkTool.name = "set_bookmark";
             bookmarkTool.description =
                 "Fly to a city bookmark by 'index' or 'name' (Paris, San "
@@ -1550,10 +1550,10 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
             XrResult t2 = xr.pfnRegisterMCPTool(xr.session, &bookmarkTool);
 
             xr.mcpToolsReady = true;
-            LOG_INFO("XR_EXT_mcp_tools: appId=earthview get_status=%d set_bookmark=%d",
+            LOG_INFO("XR_DXR_mcp_tools: appId=earthview get_status=%d set_bookmark=%d",
                      t1, t2);
         } else {
-            LOG_INFO("XR_EXT_mcp_tools: appId not accepted (%d) — no agent surface", ar);
+            LOG_INFO("XR_DXR_mcp_tools: appId not accepted (%d) — no agent surface", ar);
         }
     }
 
@@ -1562,9 +1562,9 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
@@ -1671,7 +1671,7 @@ static bool CreateSwapchains(AppXrSession& xr) {
 }
 
 // ============================================================================
-// XR_EXT_mcp_tools dispatch (#22)
+// XR_DXR_mcp_tools dispatch (#22)
 // ============================================================================
 // Minimal JSON helpers — hand-rolled on purpose, matching the runtime
 // reference adopter (cube_handle_metal_macos): tool args are tiny one-level
@@ -1777,7 +1777,7 @@ static bool JsonGetNumber(const char* json, const char* key, double& out) {
 // PollEvents), where app state is naturally consistent — no locking. EVERY
 // call is answered — success=XR_FALSE + {"error":…} for bad args — because an
 // unanswered call only fails to the agent after the runtime's ~5 s timeout.
-static void HandleMcpToolCall(AppXrSession& xr, const XrEventDataMCPToolCallEXT* call) {
+static void HandleMcpToolCall(AppXrSession& xr, const XrEventDataMCPToolCallDXR* call) {
     // Two-call idiom: argsSize from the event is the required capacity incl. NUL.
     std::string args;
     if (xr.pfnGetMCPToolCallArgs && call->argsSize > 0) {
@@ -1868,9 +1868,9 @@ static void PollEvents(AppXrSession& xr) {
             } else if (ssc->state == XR_SESSION_STATE_EXITING) {
                 xr.exitRequested = true;
             }
-        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
             // Runtime (or another client / shell) switched rendering mode on us.
-            auto* rmc = (XrEventDataRenderingModeChangedEXT*)&event;
+            auto* rmc = (XrEventDataRenderingModeChangedDXR*)&event;
             if (rmc->currentModeIndex < xr.renderingModeCount) {
                 g_input.currentRenderingMode = rmc->currentModeIndex;
                 g_msLastMode = rmc->currentModeIndex; // keep the ramp's from-mode in sync
@@ -1879,9 +1879,9 @@ static void PollEvents(AppXrSession& xr) {
                     rmc->previousModeIndex, rmc->currentModeIndex,
                     xr.renderingModeNames[rmc->currentModeIndex]);
             }
-        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT) {
-            // An agent invoked one of our XR_EXT_mcp_tools tools (#22).
-            HandleMcpToolCall(xr, (const XrEventDataMCPToolCallEXT*)&event);
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR) {
+            // An agent invoked one of our XR_DXR_mcp_tools tools (#22).
+            HandleMcpToolCall(xr, (const XrEventDataMCPToolCallDXR*)&event);
         }
         event.type = XR_TYPE_EVENT_DATA_BUFFER;
     }
@@ -2043,7 +2043,7 @@ int main() {
 
     // INV-1.3 / runtime#715: open on the 3D panel. The window is created (and
     // centered) before the OpenXR instance, so one-shot move it to the panel's
-    // top-left before the session binds it. XrDisplayDesktopPositionEXT is
+    // top-left before the session binds it. XrDisplayDesktopPositionDXR is
     // top-down global pixels (origin = primary top-left); AppKit is bottom-up,
     // so flip against the primary screen height. (0,0) = primary/unknown —
     // keep the centered placement, matching an old runtime's behavior.
@@ -2098,7 +2098,7 @@ int main() {
         CleanupOpenXR(xr); return 1; }
 
     // Model-load paths can now flip the agent animation-tool registration
-    // (XR_EXT_mcp_tools late registration, #22). Set before the bundled-scene
+    // (XR_DXR_mcp_tools late registration, #22). Set before the bundled-scene
     // auto-load below so it too funnels through UpdateMcpAnimationTools.
     g_xrForMcp = &xr;
 
@@ -2266,8 +2266,8 @@ int main() {
         if (g_input.eyeTrackingModeToggleRequested) {
             g_input.eyeTrackingModeToggleRequested = false;
             if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+                XrEyeTrackingModeDXR newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
                 xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
             }
         }
@@ -2287,8 +2287,8 @@ int main() {
                     locateInfo.space = xr.localSpace;
 
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                    XrViewEyeTrackingStateEXT eyeTrackingState = {};
-                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
+                    XrViewEyeTrackingStateDXR eyeTrackingState = {};
+                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR;
                     viewState.next = &eyeTrackingState;
 
                     // Clean +Y-up world camera pose (no Y negation — the ModelRenderer
@@ -2304,7 +2304,7 @@ int main() {
                     const float rigVH =
                         g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
-                    // XR_EXT_view_rig (#396 W7): chain a rig so the runtime owns the
+                    // XR_DXR_view_rig (#396 W7): chain a rig so the runtime owns the
                     // off-axis eyes. FLY (camera-centric) uses the CAMERA rig — a plain
                     // perspective camera the runtime perturbs with eye tracking, converging
                     // at convergenceDiopters; the app never anchors content to the tracked
@@ -2315,9 +2315,9 @@ int main() {
                     const bool naturalRigCamera = useRig && !g_geoNav.orbitAcquired;
                     // Focus mode forces the display rig; the world stays camera-centric.
                     const bool rigCamera = naturalRigCamera && !g_focusActive;
-                    XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
-                    XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
-                    XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
+                    XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                    XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                     if (useRig) {
                         // physical_height_m MUST be the runtime's CANVAS height (window
                         // client area), NOT the full display height — the cube C-toggle
@@ -2442,7 +2442,7 @@ int main() {
 
                         // HUD eye readout. Under the rig, views[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel
-                        // (XrViewDisplayRawEXT); without the rig, fall back to views[].
+                        // (XrViewDisplayRawDXR); without the rig, fall back to views[].
                         // Capture the runtime-resolved CANVAS size (window client area in
                         // meters) — the physical height the runtime runs the Kooima/rig
                         // math on. The cam<->display converter MUST be fed this (not the
@@ -2822,8 +2822,8 @@ int main() {
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime
-                            // composes for this session via xrCaptureAtlasEXT
-                            // (XR_EXT_atlas_capture, W6 of #396). The runtime owns
+                            // composes for this session via xrCaptureAtlasDXR
+                            // (XR_DXR_atlas_capture, W6 of #396). The runtime owns
                             // the readback — no app-side staging texture. Skipped
                             // for mono (1×1). The prefix has no ".png"; the runtime
                             // appends "_atlas.png".
@@ -2853,11 +2853,11 @@ int main() {
                                     for (auto& c : stem) if (c == ' ') c = '_';
                                     std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                                         stem, cols, rows);
-                                    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                    XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                                     info.next = nullptr;
-                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
                                     strncpy(info.pathPrefix, prefix.c_str(),
-                                            XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+                                            XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1);
                                     XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
                                     if (XR_SUCCEEDED(cr)) {
                                         LOG_INFO("Atlas capture requested -> %s_atlas.png",
@@ -2865,10 +2865,10 @@ int main() {
                                         dxr_capture::TriggerCaptureFlash(
                                             (__bridge void*)g_metalView);
                                     } else {
-                                        LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                                        LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
                                     }
                                 } else {
-                                    LOG_WARN("Capture skipped: XR_EXT_atlas_capture not available");
+                                    LOG_WARN("Capture skipped: XR_DXR_atlas_capture not available");
                                 }
                             }
 

@@ -91,7 +91,7 @@ glm::dmat4
 xrFromEcefCamera(const GeoCamera &cam, const glm::dvec3 &viewerPosXr, double s);
 
 // Comfortable stereo scale: target distance maps to the viewer-to-display
-// distance (zdpDist, from XR_EXT_display_info nominal viewer), clamped.
+// distance (zdpDist, from XR_DXR_display_info nominal viewer), clamped.
 double
 stereoScaleForDistance(double targetDistM, double zdpDistXr);
 

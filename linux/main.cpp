@@ -9,14 +9,14 @@
 // + an X server, so nothing here is eyeball-verified yet.
 //
 // Windowing model: HOSTED-NULL. Unlike macos/main.mm (Cocoa window +
-// XR_EXT_cocoa_window_binding) and windows/main.cpp (Win32 HWND +
-// XR_EXT_win32_window_binding), this harness passes NO window binding — the
+// XR_DXR_cocoa_window_binding) and windows/main.cpp (Win32 HWND +
+// XR_DXR_win32_window_binding), this harness passes NO window binding — the
 // runtime self-creates a window at native resolution. This is deliberate: the
-// faithful app-provided-window arm on Linux is XR_EXT_xlib_window_binding
+// faithful app-provided-window arm on Linux is XR_DXR_xlib_window_binding
 // (runtime Phase 3a), which is Phase-3 hardware-gated. See
 // docs/guides/linux-demo-port.md (the runtime repo).
 //   TODO(Phase 3): when on-screen validation lands, add an SDL/xlib window and
-//   chain XrXlibWindowBindingCreateInfoEXT onto the session, mirroring the
+//   chain XrXlibWindowBindingCreateInfoDXR onto the session, mirroring the
 //   cocoa/win32 legs. Until then hosted-NULL is the correct interim.
 //
 // This is a REDUCED harness: no HUD, no input, no MCP tools, no atlas capture,
@@ -34,7 +34,7 @@
 
 // DisplayXR extension headers (vendored openxr_includes/, refreshed from
 // displayxr-extensions). Only the ones this reduced harness enables.
-#include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_DXR_display_info.h>
 
 #include "geo_math.h"
 #include "tile_engine.h"
@@ -178,7 +178,7 @@ InitializeOpenXR(AppXrSession &xr)
 	for (const auto &e : exts) {
 		if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0)
 			hasVulkan = true;
-		if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0)
+		if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0)
 			xr.hasDisplayInfoExt = true;
 	}
 	if (!hasVulkan) {
@@ -189,7 +189,7 @@ InitializeOpenXR(AppXrSession &xr)
 	std::vector<const char *> enabled;
 	enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
 	if (xr.hasDisplayInfoExt)
-		enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 
 	XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
 	strncpy(ci.applicationInfo.applicationName, "DisplayXREarthViewLinux",
@@ -214,7 +214,7 @@ InitializeOpenXR(AppXrSession &xr)
 
 	if (xr.hasDisplayInfoExt) {
 		XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
-		XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+		XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
 		sp.next = &di;
 		if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
 			xr.displayWidthM = di.displaySizeMeters.width;

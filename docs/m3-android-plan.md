@@ -25,7 +25,7 @@ EarthView's desktop legs are `_handle_vk` (Vulkan), and the entire scene layer i
 These compile into the Android NDK build **by relative path**, no fork — exactly
 how modelviewer's `android/` leg pulls in `model_common/*.cpp`.
 
-The desktop window/UI legs (`windows/main.cpp` Win32 + `XR_EXT_win32_window_binding`,
+The desktop window/UI legs (`windows/main.cpp` Win32 + `XR_DXR_win32_window_binding`,
 `macos/main.mm` Cocoa) do **not** port; Android gets its own `android/` leg.
 
 ---
@@ -198,7 +198,7 @@ rather than the structure), and on repeated re-focus the world slowly drifts in
 depth.
 
 **What was fixed in this PR (real bugs, resolved):**
-1. **Tap→NDC transpose.** The pick NDC was divided by `XrViewDisplayRawEXT::canvasRectPx`,
+1. **Tap→NDC transpose.** The pick NDC was divided by `XrViewDisplayRawDXR::canvasRectPx`,
    which the OOP runtime reports in the panel's *unrotated* (portrait, 1600×2560)
    basis, while touch coords are landscape (2560×1600). A centre tap mapped to
    `ndc=(0.6, 0.375)`. Fixed by deriving the NDC from the **View (decorView) dims**

@@ -66,7 +66,9 @@ find_package(OpenXR REQUIRED CONFIG)
 include(FetchContent)
 FetchContent_Declare(displayxr_common_dxr
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v1.0.8 GIT_SHALLOW TRUE)
+    # TEMPORARY (#734): dxr-rename branch SHA — swap to released tag before merge
+    # (and restore GIT_SHALLOW TRUE, removed because shallow + SHA pins misbehave)
+    GIT_TAG 28d6eb7b9898cde447d90bfecda8b6734be83db1)
 FetchContent_GetProperties(displayxr_common_dxr)
 if(NOT displayxr_common_dxr_POPULATED)
     FetchContent_Populate(displayxr_common_dxr)

@@ -54,8 +54,8 @@ Read first, in order:
 3. **Coordinate model:** `geo_math.{h,cpp}` — ECEF anchor + RTC doubles (PRD
    §6.1). Default bookmark **Paris / Eiffel Tower**; camera-centric nav default.
 4. **OpenXR wiring (from modelviewer macos shell):** Cocoa NSWindow +
-   `XR_EXT_cocoa_window_binding`, one worst-case swapchain (INV-3.1/4.3),
-   per-mode tiles via `subImage.imageRect`, `XR_EXT_view_rig` poses/FOVs used
+   `XR_DXR_cocoa_window_binding`, one worst-case swapchain (INV-3.1/4.3),
+   per-mode tiles via `subImage.imageRect`, `XR_DXR_view_rig` poses/FOVs used
    directly. **Select tiles once/frame with a center-eye camera** (~0.9× SSE),
    draw the same set into both views (PRD §6.2).
 5. **Attribution HUD (policy, launch-blocking):** Google logo + frequency-sorted

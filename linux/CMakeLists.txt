@@ -12,7 +12,7 @@
 # cesium tile streaming, with NO app-provided window (the runtime self-creates
 # one) and no HUD/input. BUILD-GREEN scope — see docs/roadmap.md (M8) and the
 # runtime repo's docs/guides/linux-demo-port.md. The faithful window arm
-# (XR_EXT_xlib_window_binding) is Phase-3 hardware-gated.
+# (XR_DXR_xlib_window_binding) is Phase-3 hardware-gated.
 
 cmake_minimum_required(VERSION 3.25)
 

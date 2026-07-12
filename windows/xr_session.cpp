@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  OpenXR session management for Vulkan with XR_EXT_win32_window_binding
+ * @brief  OpenXR session management for Vulkan with XR_DXR_win32_window_binding
  */
 
 #include "xr_session.h"
@@ -11,7 +11,7 @@
 
 bool g_hasViewRigExt = false;
 
-// XrDisplayDesktopPositionEXT (display_info v16, runtime#715) — see xr_session.h.
+// XrDisplayDesktopPositionDXR (display_info v16, runtime#715) — see xr_session.h.
 int32_t g_displayDesktopLeft = 0;
 int32_t g_displayDesktopTop = 0;
 
@@ -50,29 +50,29 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) {
             hasVulkan = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             xr.hasWin32WindowBindingExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0) {
             xr.hasFileDialogExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
             xr.hasAtlasCaptureExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
         }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -82,19 +82,19 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (xr.hasWin32WindowBindingExt) {
-        enabledExtensions.push_back(XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (xr.hasDisplayInfoExt) {
-        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
     if (xr.hasFileDialogExt) {
-        enabledExtensions.push_back(XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
     }
     if (xr.hasAtlasCaptureExt) {
-        enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     }
     if (g_hasViewRigExt) {
-        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -123,16 +123,16 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
     }
 
-    // Query display info via XR_EXT_display_info
+    // Query display info via XR_DXR_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
         // INV-1.3: panel desktop position (display_info v16, runtime#715).
         // Zero-initialized so an old runtime that ignores the unknown chain
         // entry yields (0,0) = primary/unknown — the safe default.
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         desktopPos.next = &eyeCaps;
         displayInfo.next = &desktopPos;
         sysProps.next = &displayInfo;
@@ -161,20 +161,20 @@ bool InitializeOpenXR(XrSessionManager& xr) {
                 xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
         }
 
-        // Load xrRequestDisplayModeEXT function pointer
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT",
+        // Load xrRequestDisplayModeDXR function pointer
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
 
-        // Load xrRequestEyeTrackingModeEXT function pointer
+        // Load xrRequestEyeTrackingModeDXR function pointer
         if (xr.supportedEyeTrackingModes != 0) {
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
 
         // Load unified rendering mode function pointers (v7)
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
 
@@ -182,17 +182,17 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     // when the extension is enabled. Resolution failure is non-fatal: we
     // just fall through to the Win32 GetOpenFileNameA path at call time.
     if (xr.hasFileDialogExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrRequestFilePickerEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestFilePickerDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestFilePickerEXT);
-        LOG_INFO("xrRequestFilePickerEXT: %s",
+        LOG_INFO("xrRequestFilePickerDXR: %s",
             xr.pfnRequestFilePickerEXT ? "resolved" : "NULL");
     }
 
-    // XR_EXT_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
+    // XR_DXR_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
     if (xr.hasAtlasCaptureExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",
             (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
-        LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+        LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
 
     uint32_t viewCount = 0;
@@ -471,7 +471,7 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
 bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, HWND hwnd)
 {
-    LOG_INFO("Creating OpenXR session with Vulkan + XR_EXT_win32_window_binding...");
+    LOG_INFO("Creating OpenXR session with Vulkan + XR_DXR_win32_window_binding...");
 
     xr.windowHandle = hwnd;
 
@@ -482,7 +482,7 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
     vkBinding.queueFamilyIndex = queueFamilyIndex;
     vkBinding.queueIndex = queueIndex;
 
-    XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+    XrWin32WindowBindingCreateInfoDXR sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
     sessionTarget.windowHandle = hwnd;
     // Always-on transparent-window support. The runtime wires DComp + the
     // KMT-shared-texture bridge based on these fields at xrCreateSession;
@@ -495,7 +495,7 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
 
     if (xr.hasWin32WindowBindingExt && hwnd) {
         vkBinding.next = &sessionTarget;
-        LOG_INFO("Using XR_EXT_win32_window_binding with window handle (transparent-bg ENABLED)");
+        LOG_INFO("Using XR_DXR_win32_window_binding with window handle (transparent-bg ENABLED)");
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
@@ -510,9 +510,9 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
