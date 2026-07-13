@@ -59,7 +59,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1033,6 +1035,311 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
 }
 
+// ============================================================================
+// XR_DXR_mcp_tools dispatch (#26)
+// ============================================================================
+// Windows port of the macOS agent-tool surface (macos/main.mm). Same appId
+// (earthview) and same tool set (get_status, set_bookmark) with descriptions +
+// schemas copied verbatim, so the two platforms present an identical agent API.
+//
+// Registration + PFN resolution live in xr_session.cpp (InitializeOpenXR /
+// CreateSession); this block owns the *dispatch*. The shared displayxr-common
+// PollEvents (pinned v2.0.0) hard-codes the cube-demo tool set (set_spin /
+// get_status) with no per-app hook, so EarthView cannot route its own tools
+// through it. Instead we own a full event drain here — a faithful replica of
+// common's PollEvents with the MCP case swapped for HandleMcpToolCall — and the
+// render thread calls it instead of the shared PollEvents. Everything else
+// (session state machine, rendering-mode / eye-tracking / file-picker events)
+// is preserved byte-for-byte from common v2.0.0. Delete this once common gains
+// an app-supplied MCP handler hook (then just repin + register).
+//
+// Minimal JSON helpers — hand-rolled on purpose, matching the macOS demo and the
+// runtime reference adopter: tool args are tiny one-level objects, so a JSON
+// dependency isn't warranted. MSVC/Win32-clean (strstr/strchr/strtod only).
+
+static std::string McpJsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// Extract "key":"value" (string) with backslash-escape handling, incl. a basic
+// \uXXXX → UTF-8 decode (no surrogate pairs). False when the key is absent or
+// its value is not a string.
+static bool McpJsonGetString(const char* json, const char* key, std::string& out) {
+    std::string pat = "\"" + std::string(key) + "\"";
+    const char* k = strstr(json, pat.c_str());
+    if (!k) return false;
+    const char* c = strchr(k + pat.size(), ':');
+    if (!c) return false;
+    c++;
+    while (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r') c++;
+    if (*c != '"') return false;
+    c++;
+    out.clear();
+    while (*c && *c != '"') {
+        if (*c == '\\' && c[1]) {
+            c++;
+            switch (*c) {
+                case 'n': out += '\n'; break;
+                case 't': out += '\t'; break;
+                case 'r': out += '\r'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'u': {
+                    unsigned cp = 0;
+                    int ndig = 0;
+                    while (ndig < 4 && c[1]) {
+                        char h = c[1];
+                        unsigned v;
+                        if (h >= '0' && h <= '9') v = (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') v = (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') v = (unsigned)(h - 'A' + 10);
+                        else break;
+                        cp = (cp << 4) | v;
+                        c++;
+                        ndig++;
+                    }
+                    if (cp < 0x80) out += (char)cp;
+                    else if (cp < 0x800) {
+                        out += (char)(0xC0 | (cp >> 6));
+                        out += (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        out += (char)(0xE0 | (cp >> 12));
+                        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out += (char)(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+                default: out += *c; break;  // \" \\ \/
+            }
+        } else {
+            out += *c;
+        }
+        c++;
+    }
+    return *c == '"';
+}
+
+// Extract "key": <number>. False when absent or not numeric (strtod refuses a
+// leading quote, so string values correctly fail).
+static bool McpJsonGetNumber(const char* json, const char* key, double& out) {
+    std::string pat = "\"" + std::string(key) + "\"";
+    const char* k = strstr(json, pat.c_str());
+    if (!k) return false;
+    const char* c = strchr(k + pat.size(), ':');
+    if (!c) return false;
+    char* end = nullptr;
+    double v = strtod(c + 1, &end);
+    if (end == c + 1) return false;
+    out = v;
+    return true;
+}
+
+// Dispatch one agent tool call. Runs on the render thread (called from
+// PollXrEvents), which is also where UpdateGeoNav mutates g_geoNav — so app
+// state is naturally consistent, no locking on the geo camera. EVERY call is
+// answered — success=XR_FALSE + {"error":…} for bad args — because an
+// unanswered call only fails to the agent after the runtime's ~5 s timeout.
+static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* call) {
+    // Two-call idiom: argsSize from the event is the required capacity incl. NUL.
+    std::string args;
+    if (xr.pfnGetMCPToolCallArgsEXT && call->argsSize > 0) {
+        std::vector<char> buf(call->argsSize, '\0');
+        uint32_t needed = 0;
+        if (XR_SUCCEEDED(xr.pfnGetMCPToolCallArgsEXT(xr.session, call->callId,
+                                                     (uint32_t)buf.size(), &needed, buf.data())))
+            args.assign(buf.data());
+    }
+    const char* a = args.c_str();
+    std::string result;
+    XrBool32 ok = XR_TRUE;
+    char buf[1024];
+
+    size_t bmCount = 0;
+    const geo::Bookmark* bm = geo::bookmarks(&bmCount);
+
+    if (strcmp(call->toolName, "get_status") == 0) {
+        snprintf(buf, sizeof(buf),
+                 "{\"bookmark\":\"%s\",\"bookmark_index\":%d,"
+                 "\"orbit_acquired\":%s,\"target_distance_m\":%.1f,"
+                 "\"tiles_active\":%s,\"render_tiles\":%s,"
+                 "\"gpu_resident_mb\":%.1f,"
+                 "\"rendering_mode\":%u,\"session_running\":%s}",
+                 bm[g_geoNav.bookmarkIndex].name, g_geoNav.bookmarkIndex,
+                 g_geoNav.orbitAcquired ? "true" : "false",
+                 g_geoNav.targetDist,
+                 g_tilesActive.load() ? "true" : "false",
+                 g_tileEngine.hasRenderableContent() ? "true" : "false",
+                 g_tileRenderer.gpuResidentMB(),
+                 xr.currentModeIndex,
+                 xr.sessionRunning ? "true" : "false");
+        result = buf;
+    } else if (strcmp(call->toolName, "set_bookmark") == 0) {
+        int target = -1;
+        double idx; std::string nm;
+        if (McpJsonGetNumber(a, "index", idx)) {
+            target = (int)idx;
+            if (target < 0 || target >= (int)bmCount) {
+                ok = XR_FALSE;
+                snprintf(buf, sizeof(buf), "{\"error\":\"index out of range (0..%d)\"}",
+                         (int)bmCount - 1);
+                result = buf;
+            }
+        } else if (McpJsonGetString(a, "name", nm)) {
+            for (int i = 0; i < (int)bmCount && target < 0; i++) {
+                if (nm == bm[i].name) target = i;
+            }
+            if (target < 0) {
+                ok = XR_FALSE;
+                result = "{\"error\":\"no bookmark named '" + McpJsonEscape(nm) + "'\"}";
+            }
+        } else {
+            target = (g_geoNav.bookmarkIndex + 1) % (int)bmCount;  // cycle
+        }
+        if (ok == XR_TRUE) {
+            g_geoNav.frameBookmark(target);
+            {
+                // agent input is input: reset the idle timer (g_inputState is
+                // written under g_inputMutex on the window thread).
+                std::lock_guard<std::mutex> lock(g_inputMutex);
+                MarkUserInput(g_inputState);
+            }
+            snprintf(buf, sizeof(buf), "{\"bookmark\":\"%s\",\"index\":%d}",
+                     bm[target].name, target);
+            result = buf;
+        }
+    } else {
+        ok = XR_FALSE;
+        result = "{\"error\":\"unhandled tool\"}";
+    }
+
+    if (xr.pfnSubmitMCPToolResultEXT)
+        xr.pfnSubmitMCPToolResultEXT(xr.session, call->callId, ok, result.c_str());
+}
+
+// EarthView-owned OpenXR event drain. Faithful replica of displayxr-common
+// v2.0.0 PollEvents (session state machine + rendering-mode / eye-tracking /
+// file-picker events, byte-for-byte) with the MCP tool-call case routed to
+// HandleMcpToolCall so EarthView's own tools dispatch instead of the shared
+// cube-demo handler. Called from the render thread in place of the shared
+// PollEvents(). See the header comment on this block.
+static void PollXrEvents(XrSessionManager& xr) {
+    XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
+
+    while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
+        switch (event.type) {
+        case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+            auto* stateEvent = (XrEventDataSessionStateChanged*)&event;
+            XrSessionState oldState = xr.sessionState;
+            xr.sessionState = stateEvent->state;
+
+            LOG_INFO("Session state changed: %s -> %s",
+                GetSessionStateString(oldState),
+                GetSessionStateString(xr.sessionState));
+
+            switch (xr.sessionState) {
+            case XR_SESSION_STATE_READY: {
+                LOG_INFO("Session READY - calling xrBeginSession...");
+                XrSessionBeginInfo beginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
+                beginInfo.primaryViewConfigurationType = xr.viewConfigType;
+                XrResult result = xrBeginSession(xr.session, &beginInfo);
+                LogXrResult("xrBeginSession", result);
+                if (XR_SUCCEEDED(result)) {
+                    xr.sessionRunning = true;
+                    LOG_INFO("Session is now running");
+                }
+                break;
+            }
+            case XR_SESSION_STATE_STOPPING:
+                LOG_INFO("Session STOPPING - calling xrEndSession...");
+                xrEndSession(xr.session);
+                xr.sessionRunning = false;
+                LOG_INFO("Session stopped");
+                break;
+            case XR_SESSION_STATE_EXITING:
+                LOG_INFO("Session EXITING - requesting exit");
+                xr.exitRequested = true;
+                break;
+            case XR_SESSION_STATE_LOSS_PENDING:
+                LOG_WARN("Session LOSS_PENDING - requesting exit");
+                xr.exitRequested = true;
+                break;
+            default:
+                break;
+            }
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+            LOG_WARN("Instance loss pending - requesting exit");
+            xr.exitRequested = true;
+            break;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
+            LOG_INFO("Rendering mode changed: %u -> %u",
+                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
+            xr.currentModeIndex = modeEvent->currentModeIndex;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
+            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
+                etEvent->isTracking == XR_TRUE ? "YES" : "NO",
+                (uint32_t)etEvent->activeMode);
+            xr.isEyeTracking = (etEvent->isTracking == XR_TRUE);
+            xr.activeEyeTrackingMode = (uint32_t)etEvent->activeMode;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR: {
+            auto* pickEvent = (XrEventDataFilePickerCompleteDXR*)&event;
+            if (pickEvent->requestId == xr.filePickerRequestId) {
+                xr.filePickerLastResult = pickEvent->result;
+                strncpy(xr.filePickerLastPath, pickEvent->path, sizeof(xr.filePickerLastPath) - 1);
+                xr.filePickerLastPath[sizeof(xr.filePickerLastPath) - 1] = '\0';
+                xr.filePickerInFlight = false;
+                xr.filePickerHasResult = true;
+                LOG_INFO("[#228] File picker complete: requestId=%llu result=%d path=\"%s\"",
+                    (unsigned long long)pickEvent->requestId,
+                    (int)pickEvent->result,
+                    pickEvent->path);
+            } else {
+                LOG_WARN("[#228] Ignoring file picker event for stale requestId=%llu (current=%llu)",
+                    (unsigned long long)pickEvent->requestId,
+                    (unsigned long long)xr.filePickerRequestId);
+            }
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
+            // An agent invoked one of our XR_DXR_mcp_tools tools (#26).
+            HandleMcpToolCall(xr, (const XrEventDataMCPToolCallDXR*)&event);
+            break;
+        }
+        default:
+            LOG_DEBUG("Received event type: %d", event.type);
+            break;
+        }
+
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+}
+
 static void RenderThreadFunc(
     HWND hwnd,
     XrSessionManager* xr,
@@ -1162,7 +1469,10 @@ static void RenderThreadFunc(
             }
         }
 
-        PollEvents(*xr);
+        // EarthView-owned drain (adds XR_DXR_mcp_tools dispatch, #26). Replaces
+        // the shared displayxr-common PollEvents, whose MCP handler hard-codes
+        // the cube-demo tool set; every other event is handled identically.
+        PollXrEvents(*xr);
 
         if (xr->sessionRunning) {
             XrFrameState frameState;
