@@ -12,6 +12,7 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include "xr_session_common.h"
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_mcp_tools.h>
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
 // returns render-ready XrView{pose, fov}; the app deletes its own. App-owned

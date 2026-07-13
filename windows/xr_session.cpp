@@ -65,6 +65,12 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
         }
+        // XR_DXR_mcp_tools (#26): app-defined agent tools on the runtime-hosted
+        // per-process MCP server. The whole path is inert when the extension or
+        // the MCP capability gate is absent — never load-bearing.
+        if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
+            xr.hasMcpToolsExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -73,6 +79,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -95,6 +102,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasViewRigExt) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (xr.hasMcpToolsExt) {
+        enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -193,6 +203,34 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",
             (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
         LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+    }
+
+    // XR_DXR_mcp_tools (#26): resolve the agent-tool entry points. Tools are
+    // registered after xrCreateSession (see CreateSession) and dispatched from
+    // the render thread's event drain (PollEventsMcp in main.cpp). Defensive:
+    // a NULL PFN just leaves the whole feature inert — never a crash. These
+    // reuse the shared XrSessionManager MCP PFN members (common v2.0.0); the
+    // shared PollEvents is bypassed for a per-app handler (main.cpp) because
+    // that generic handler hardcodes the cube-demo tool set.
+    if (xr.hasMcpToolsExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoDXR",
+            (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfoEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolDXR",
+            (PFN_xrVoidFunction*)&xr.pfnRegisterMCPToolEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsDXR",
+            (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgsEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultDXR",
+            (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResultEXT);
+        const bool resolved = xr.pfnSetMCPAppInfoEXT && xr.pfnRegisterMCPToolEXT &&
+            xr.pfnGetMCPToolCallArgsEXT && xr.pfnSubmitMCPToolResultEXT;
+        LOG_INFO("XR_DXR_mcp_tools entry points: %s", resolved ? "resolved" : "NULL");
+        // Any NULL entry point ⇒ disable the feature so nothing downstream tries
+        // to register or dispatch through a half-resolved surface.
+        if (!resolved) {
+            xr.hasMcpToolsExt = false;
+        }
+    } else {
+        LOG_INFO("XR_DXR_mcp_tools: not advertised by runtime");
     }
 
     uint32_t viewCount = 0;
@@ -503,6 +541,49 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
 
     XR_CHECK_LOG(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created: 0x%p", (void*)xr.session);
+
+    // XR_DXR_mcp_tools (#26): declare identity + register the base agent tools.
+    // The appId MUST match `id` in
+    // displayxr/earthview_handle_vk_win.displayxr.json (INV-10.1). Failure is
+    // non-fatal by design — the MCP capability gate may simply be off on this
+    // machine; EarthView runs identically without an agent surface. Descriptions
+    // + schemas are copied verbatim from macos/main.mm so the tool set is
+    // identical across platforms.
+    if (xr.hasMcpToolsExt && xr.pfnSetMCPAppInfoEXT && xr.pfnRegisterMCPToolEXT) {
+        XrMCPAppInfoDXR mcpAppInfo = {XR_TYPE_MCP_APP_INFO_DXR};
+        strncpy(mcpAppInfo.appId, "earthview", sizeof(mcpAppInfo.appId) - 1);
+        XrResult ar = xr.pfnSetMCPAppInfoEXT(xr.session, &mcpAppInfo);
+        if (XR_SUCCEEDED(ar)) {
+            XrMCPToolInfoDXR statusTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+            statusTool.name = "get_status";
+            statusTool.description =
+                "Read EarthView's live state: active city bookmark, whether an "
+                "orbit center is acquired (diorama mode), camera target distance "
+                "in meters, render-tile count + GPU-resident MB, active "
+                "rendering-mode index, and whether the XR session is running.";
+            statusTool.inputSchemaJson = "{\"type\":\"object\"}";
+            XrResult t1 = xr.pfnRegisterMCPToolEXT(xr.session, &statusTool);
+
+            XrMCPToolInfoDXR bookmarkTool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+            bookmarkTool.name = "set_bookmark";
+            bookmarkTool.description =
+                "Fly to a city bookmark by 'index' or 'name' (Paris, San "
+                "Francisco, New York, Tokyo, Sydney). Omit both to cycle to the "
+                "next city. Releases any acquired orbit center. Verify visually "
+                "with capture_frame.";
+            bookmarkTool.inputSchemaJson =
+                "{\"type\":\"object\",\"properties\":{"
+                "\"index\":{\"type\":\"integer\",\"description\":\"Bookmark index, 0-based.\"},"
+                "\"name\":{\"type\":\"string\",\"description\":\"Bookmark city name.\"}}}";
+            XrResult t2 = xr.pfnRegisterMCPToolEXT(xr.session, &bookmarkTool);
+
+            LOG_INFO("XR_DXR_mcp_tools: appId=earthview get_status=%d set_bookmark=%d",
+                     (int)t1, (int)t2);
+        } else {
+            LOG_INFO("XR_DXR_mcp_tools: appId not accepted (%d) — no agent surface", (int)ar);
+            xr.hasMcpToolsExt = false;
+        }
+    }
 
     // Enumerate available rendering modes and store names
     if (xr.pfnEnumerateDisplayRenderingModesEXT && xr.session != XR_NULL_HANDLE) {
