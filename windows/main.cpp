@@ -1043,15 +1043,15 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
 // schemas copied verbatim, so the two platforms present an identical agent API.
 //
 // Registration + PFN resolution live in xr_session.cpp (InitializeOpenXR /
-// CreateSession); this block owns the *dispatch*. The shared displayxr-common
-// PollEvents (pinned v2.0.0) hard-codes the cube-demo tool set (set_spin /
-// get_status) with no per-app hook, so EarthView cannot route its own tools
-// through it. Instead we own a full event drain here — a faithful replica of
-// common's PollEvents with the MCP case swapped for HandleMcpToolCall — and the
-// render thread calls it instead of the shared PollEvents. Everything else
-// (session state machine, rendering-mode / eye-tracking / file-picker events)
-// is preserved byte-for-byte from common v2.0.0. Delete this once common gains
-// an app-supplied MCP handler hook (then just repin + register).
+// CreateSession); this block owns the *dispatch*. displayxr-common v2.1.0 adds
+// an app-supplied hook (XrSessionManager::mcpToolHandler): the shared PollEvents
+// fetches the call args, invokes the handler, and submits the returned JSON
+// (success gates the ok flag). So EarthView routes its own tools through the
+// shared drain — no forked event loop. HandleMcpToolCall below is that hook; it
+// just maps (toolName, argsJson) -> resultJson and must NOT touch
+// xrGetMCPToolCallArgsDXR / xrSubmitMCPToolResultDXR (PollEvents does both). The
+// render thread calls the shared PollEvents() again. It is installed on the
+// session in WinMain right after CreateSession registers the tools.
 //
 // Minimal JSON helpers — hand-rolled on purpose, matching the macOS demo and the
 // runtime reference adopter: tool args are tiny one-level objects, so a JSON
@@ -1153,30 +1153,27 @@ static bool McpJsonGetNumber(const char* json, const char* key, double& out) {
     return true;
 }
 
-// Dispatch one agent tool call. Runs on the render thread (called from
-// PollXrEvents), which is also where UpdateGeoNav mutates g_geoNav — so app
+// XrSessionManager::mcpToolHandler hook (displayxr-common v2.1.0): map one agent
+// tool call (toolName, argsJson) -> result JSON, setting `success`. The shared
+// PollEvents fetches the args and submits the result — this handler must NOT call
+// xrGetMCPToolCallArgsDXR / xrSubmitMCPToolResultDXR. Runs on the render thread
+// (from PollEvents), which is also where UpdateGeoNav mutates g_geoNav — so app
 // state is naturally consistent, no locking on the geo camera. EVERY call is
-// answered — success=XR_FALSE + {"error":…} for bad args — because an
-// unanswered call only fails to the agent after the runtime's ~5 s timeout.
-static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* call) {
-    // Two-call idiom: argsSize from the event is the required capacity incl. NUL.
-    std::string args;
-    if (xr.pfnGetMCPToolCallArgsEXT && call->argsSize > 0) {
-        std::vector<char> buf(call->argsSize, '\0');
-        uint32_t needed = 0;
-        if (XR_SUCCEEDED(xr.pfnGetMCPToolCallArgsEXT(xr.session, call->callId,
-                                                     (uint32_t)buf.size(), &needed, buf.data())))
-            args.assign(buf.data());
-    }
-    const char* a = args.c_str();
+// answered — success=false + {"error":…} for bad args — because an unanswered
+// call only fails to the agent after the runtime's ~5 s timeout. The `xr`
+// context (currentModeIndex / sessionRunning for get_status) is bound by the
+// registering lambda in WinMain, since the hook signature carries no session.
+static std::string HandleMcpToolCall(XrSessionManager& xr, const std::string& toolName,
+                                     const std::string& argsJson, bool& success) {
+    const char* a = argsJson.c_str();
     std::string result;
-    XrBool32 ok = XR_TRUE;
+    success = true;
     char buf[1024];
 
     size_t bmCount = 0;
     const geo::Bookmark* bm = geo::bookmarks(&bmCount);
 
-    if (strcmp(call->toolName, "get_status") == 0) {
+    if (toolName == "get_status") {
         snprintf(buf, sizeof(buf),
                  "{\"bookmark\":\"%s\",\"bookmark_index\":%d,"
                  "\"orbit_acquired\":%s,\"target_distance_m\":%.1f,"
@@ -1192,13 +1189,13 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
                  xr.currentModeIndex,
                  xr.sessionRunning ? "true" : "false");
         result = buf;
-    } else if (strcmp(call->toolName, "set_bookmark") == 0) {
+    } else if (toolName == "set_bookmark") {
         int target = -1;
         double idx; std::string nm;
         if (McpJsonGetNumber(a, "index", idx)) {
             target = (int)idx;
             if (target < 0 || target >= (int)bmCount) {
-                ok = XR_FALSE;
+                success = false;
                 snprintf(buf, sizeof(buf), "{\"error\":\"index out of range (0..%d)\"}",
                          (int)bmCount - 1);
                 result = buf;
@@ -1208,13 +1205,13 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
                 if (nm == bm[i].name) target = i;
             }
             if (target < 0) {
-                ok = XR_FALSE;
+                success = false;
                 result = "{\"error\":\"no bookmark named '" + McpJsonEscape(nm) + "'\"}";
             }
         } else {
             target = (g_geoNav.bookmarkIndex + 1) % (int)bmCount;  // cycle
         }
-        if (ok == XR_TRUE) {
+        if (success) {
             g_geoNav.frameBookmark(target);
             {
                 // agent input is input: reset the idle timer (g_inputState is
@@ -1227,117 +1224,11 @@ static void HandleMcpToolCall(XrSessionManager& xr, const XrEventDataMCPToolCall
             result = buf;
         }
     } else {
-        ok = XR_FALSE;
+        success = false;
         result = "{\"error\":\"unhandled tool\"}";
     }
 
-    if (xr.pfnSubmitMCPToolResultEXT)
-        xr.pfnSubmitMCPToolResultEXT(xr.session, call->callId, ok, result.c_str());
-}
-
-// EarthView-owned OpenXR event drain. Faithful replica of displayxr-common
-// v2.0.0 PollEvents (session state machine + rendering-mode / eye-tracking /
-// file-picker events, byte-for-byte) with the MCP tool-call case routed to
-// HandleMcpToolCall so EarthView's own tools dispatch instead of the shared
-// cube-demo handler. Called from the render thread in place of the shared
-// PollEvents(). See the header comment on this block.
-static void PollXrEvents(XrSessionManager& xr) {
-    XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
-
-    while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
-        switch (event.type) {
-        case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
-            auto* stateEvent = (XrEventDataSessionStateChanged*)&event;
-            XrSessionState oldState = xr.sessionState;
-            xr.sessionState = stateEvent->state;
-
-            LOG_INFO("Session state changed: %s -> %s",
-                GetSessionStateString(oldState),
-                GetSessionStateString(xr.sessionState));
-
-            switch (xr.sessionState) {
-            case XR_SESSION_STATE_READY: {
-                LOG_INFO("Session READY - calling xrBeginSession...");
-                XrSessionBeginInfo beginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
-                beginInfo.primaryViewConfigurationType = xr.viewConfigType;
-                XrResult result = xrBeginSession(xr.session, &beginInfo);
-                LogXrResult("xrBeginSession", result);
-                if (XR_SUCCEEDED(result)) {
-                    xr.sessionRunning = true;
-                    LOG_INFO("Session is now running");
-                }
-                break;
-            }
-            case XR_SESSION_STATE_STOPPING:
-                LOG_INFO("Session STOPPING - calling xrEndSession...");
-                xrEndSession(xr.session);
-                xr.sessionRunning = false;
-                LOG_INFO("Session stopped");
-                break;
-            case XR_SESSION_STATE_EXITING:
-                LOG_INFO("Session EXITING - requesting exit");
-                xr.exitRequested = true;
-                break;
-            case XR_SESSION_STATE_LOSS_PENDING:
-                LOG_WARN("Session LOSS_PENDING - requesting exit");
-                xr.exitRequested = true;
-                break;
-            default:
-                break;
-            }
-            break;
-        }
-        case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
-            LOG_WARN("Instance loss pending - requesting exit");
-            xr.exitRequested = true;
-            break;
-        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
-            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
-            LOG_INFO("Rendering mode changed: %u -> %u",
-                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
-            xr.currentModeIndex = modeEvent->currentModeIndex;
-            break;
-        }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
-            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
-            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
-                etEvent->isTracking == XR_TRUE ? "YES" : "NO",
-                (uint32_t)etEvent->activeMode);
-            xr.isEyeTracking = (etEvent->isTracking == XR_TRUE);
-            xr.activeEyeTrackingMode = (uint32_t)etEvent->activeMode;
-            break;
-        }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR: {
-            auto* pickEvent = (XrEventDataFilePickerCompleteDXR*)&event;
-            if (pickEvent->requestId == xr.filePickerRequestId) {
-                xr.filePickerLastResult = pickEvent->result;
-                strncpy(xr.filePickerLastPath, pickEvent->path, sizeof(xr.filePickerLastPath) - 1);
-                xr.filePickerLastPath[sizeof(xr.filePickerLastPath) - 1] = '\0';
-                xr.filePickerInFlight = false;
-                xr.filePickerHasResult = true;
-                LOG_INFO("[#228] File picker complete: requestId=%llu result=%d path=\"%s\"",
-                    (unsigned long long)pickEvent->requestId,
-                    (int)pickEvent->result,
-                    pickEvent->path);
-            } else {
-                LOG_WARN("[#228] Ignoring file picker event for stale requestId=%llu (current=%llu)",
-                    (unsigned long long)pickEvent->requestId,
-                    (unsigned long long)xr.filePickerRequestId);
-            }
-            break;
-        }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
-            // An agent invoked one of our XR_DXR_mcp_tools tools (#26).
-            HandleMcpToolCall(xr, (const XrEventDataMCPToolCallDXR*)&event);
-            break;
-        }
-        default:
-            LOG_DEBUG("Received event type: %d", event.type);
-            break;
-        }
-
-        event = {XR_TYPE_EVENT_DATA_BUFFER};
-    }
+    return result;
 }
 
 static void RenderThreadFunc(
@@ -1469,10 +1360,10 @@ static void RenderThreadFunc(
             }
         }
 
-        // EarthView-owned drain (adds XR_DXR_mcp_tools dispatch, #26). Replaces
-        // the shared displayxr-common PollEvents, whose MCP handler hard-codes
-        // the cube-demo tool set; every other event is handled identically.
-        PollXrEvents(*xr);
+        // Shared displayxr-common drain. XR_DXR_mcp_tools calls (#26) route to
+        // our xr->mcpToolHandler hook (installed after CreateSession, common
+        // v2.1.0); PollEvents fetches the args and submits the result.
+        PollEvents(*xr);
 
         if (xr->sessionRunning) {
             XrFrameState frameState;
@@ -2715,6 +2606,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ShutdownLogging();
         return 1;
     }
+
+    // XR_DXR_mcp_tools (#26): install the app's agent-tool dispatch hook on the
+    // session (displayxr-common v2.1.0). CreateSession registered the tools
+    // (get_status, set_bookmark); the shared PollEvents fetches each call's args,
+    // invokes this handler, and submits the returned JSON. The lambda binds `xr`
+    // (get_status reads currentModeIndex / sessionRunning) since the hook
+    // signature carries no session. Harmless when the feature is inert.
+    xr.mcpToolHandler = [&xr](const std::string& toolName,
+                              const std::string& argsJson, bool& success) {
+        return HandleMcpToolCall(xr, toolName, argsJson, success);
+    };
 
     if (!CreateSpaces(xr)) {
         LOG_ERROR("Reference space creation failed");

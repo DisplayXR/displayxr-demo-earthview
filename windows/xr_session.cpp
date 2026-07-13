@@ -206,12 +206,12 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
 
     // XR_DXR_mcp_tools (#26): resolve the agent-tool entry points. Tools are
-    // registered after xrCreateSession (see CreateSession) and dispatched from
-    // the render thread's event drain (PollEventsMcp in main.cpp). Defensive:
-    // a NULL PFN just leaves the whole feature inert — never a crash. These
-    // reuse the shared XrSessionManager MCP PFN members (common v2.0.0); the
-    // shared PollEvents is bypassed for a per-app handler (main.cpp) because
-    // that generic handler hardcodes the cube-demo tool set.
+    // registered after xrCreateSession (see CreateSession) and dispatched by the
+    // shared displayxr-common PollEvents, which fetches the call args and submits
+    // the result — it invokes the app's XrSessionManager::mcpToolHandler hook
+    // (installed in WinMain, common v2.1.0). These PFN members feed that shared
+    // fetch/submit. Defensive: a NULL PFN just leaves the feature inert — never a
+    // crash.
     if (xr.hasMcpToolsExt) {
         xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoDXR",
             (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfoEXT);
