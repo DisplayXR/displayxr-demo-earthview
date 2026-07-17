@@ -634,6 +634,37 @@ HWND g_dlgStatus = nullptr;
 bool g_dlgSaved = false;
 bool g_dlgDone = false;
 
+// The app manifest declares PerMonitorV2 DPI awareness, so Windows does NOT
+// bitmap-stretch our UI — every pixel we hand to CreateWindow is a *physical*
+// pixel. The dialog's layout below is authored at 96 DPI (100% scale); on a
+// high-DPI monitor (150%/200%) unscaled pixels render the whole panel at a
+// fraction of its intended size (the "super small, can't interact" report).
+// Resolve the target monitor's DPI and scale every dimension + the font.
+// GetDpiForWindow is Win10 1607+; load it dynamically and fall back to the
+// system DPI so older toolchains/OSes still build and run.
+static UINT DlgGetDpi(HWND w) {
+    using GetDpiForWindowFn = UINT(WINAPI *)(HWND);
+    using GetDpiForSystemFn = UINT(WINAPI *)(void);
+    static GetDpiForWindowFn pGetDpiForWindow = nullptr;
+    static GetDpiForSystemFn pGetDpiForSystem = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+            pGetDpiForWindow = (GetDpiForWindowFn)GetProcAddress(user32, "GetDpiForWindow");
+            pGetDpiForSystem = (GetDpiForSystemFn)GetProcAddress(user32, "GetDpiForSystem");
+        }
+        resolved = true;
+    }
+    UINT dpi = 0;
+    if (w && pGetDpiForWindow) dpi = pGetDpiForWindow(w);
+    if (!dpi && pGetDpiForSystem) dpi = pGetDpiForSystem();
+    if (!dpi) {  // last-resort fallback for pre-1607
+        HDC dc = GetDC(nullptr);
+        if (dc) { dpi = (UINT)GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(nullptr, dc); }
+    }
+    return dpi ? dpi : 96;
+}
+
 // API keys are ASCII — narrow the edit text directly.
 static std::string DlgGetKey() {
     wchar_t buf[512] = {0};
@@ -712,7 +743,12 @@ static bool ShowApiKeyDialog(HWND parent) {
     g_dlgSaved = false;
     g_dlgDone = false;
 
-    const int W = 470, H = 250;
+    // Scale the 96-DPI-authored layout to the parent monitor's DPI. S() maps a
+    // logical (100%-scale) pixel to a physical one; MulDiv rounds correctly.
+    const UINT dpi = DlgGetDpi(parent);
+    auto S = [dpi](int v) { return MulDiv(v, (int)dpi, 96); };
+
+    const int W = S(470), H = S(250);
     RECT pr;
     GetWindowRect(parent ? parent : GetDesktopWindow(), &pr);
     int x = pr.left + ((pr.right - pr.left) - W) / 2;
@@ -722,24 +758,32 @@ static bool ShowApiKeyDialog(HWND parent) {
         x, y, W, H, parent, nullptr, hi, nullptr);
     if (!dlg) return false;
 
-    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    // DEFAULT_GUI_FONT is a fixed ~96-DPI bitmap font — it would render tiny on
+    // a high-DPI panel. Create a DPI-scaled UI font instead (deleted below).
+    HFONT font = CreateFontW(-MulDiv(9, (int)dpi, 72), 0, 0, 0, FW_NORMAL,
+        FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        L"Segoe UI");
+    if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     auto mk = [&](const wchar_t *cls, const wchar_t *txt, DWORD style,
                   int cx, int cy, int cw, int ch, int id) -> HWND {
         HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
-            cx, cy, cw, ch, dlg, (HMENU)(INT_PTR)id, hi, nullptr);
+            S(cx), S(cy), S(cw), S(ch), dlg, (HMENU)(INT_PTR)id, hi, nullptr);
         SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
         return c;
     };
+    // Layout coords stay in logical (96-DPI) pixels; mk() scales them via S().
+    // Client-relative widths use 470 (the logical W), not the scaled W.
     mk(L"STATIC",
        L"EarthView needs your own Google Map Tiles API key. Paste it below, or get "
        L"one from the Google Cloud Console (enable the “Map Tiles API”).",
-       0, 16, 12, W - 40, 52, 0);
-    g_dlgEdit = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 16, 72, W - 40, 24, 100);
-    g_dlgStatus = mk(L"STATIC", L"", 0, 16, 104, W - 40, 18, 0);
+       0, 16, 12, 470 - 40, 52, 0);
+    g_dlgEdit = mk(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 16, 72, 470 - 40, 24, 100);
+    g_dlgStatus = mk(L"STATIC", L"", 0, 16, 104, 470 - 40, 18, 0);
     mk(L"BUTTON", L"Get a Key…", BS_PUSHBUTTON, 16, 160, 96, 30, 2);
     mk(L"BUTTON", L"Remove key", BS_PUSHBUTTON, 118, 160, 96, 30, 3);
     mk(L"BUTTON", L"Close", BS_PUSHBUTTON, 220, 160, 64, 30, 4);
-    mk(L"BUTTON", L"Save && Start", BS_DEFPUSHBUTTON, W - 134, 160, 114, 30, 1);
+    mk(L"BUTTON", L"Save && Start", BS_DEFPUSHBUTTON, 470 - 134, 160, 114, 30, 1);
     SetFocus(g_dlgEdit);
 
     if (parent) EnableWindow(parent, FALSE);
@@ -754,6 +798,7 @@ static bool ShowApiKeyDialog(HWND parent) {
         EnableWindow(parent, TRUE);
         SetForegroundWindow(parent);
     }
+    if (font && font != (HFONT)GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(font);
     return g_dlgSaved;
 }
 
