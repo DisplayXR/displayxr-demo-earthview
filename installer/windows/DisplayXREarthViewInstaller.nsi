@@ -99,6 +99,10 @@ ShowUninstDetails show
 ; UI
 
 !define MUI_ABORTWARNING
+
+; Installer / wizard / uninstaller icon — the demo's own (rounded) app logo.
+!define MUI_ICON   "${SOURCE_DIR}\windows\displayxr\earthview_icon.ico"
+!define MUI_UNICON "${SOURCE_DIR}\windows\displayxr\earthview_icon.ico"
 !define MUI_WELCOMEPAGE_TITLE "DisplayXR EarthView Demo Setup"
 !define MUI_WELCOMEPAGE_TEXT "This will install the EarthView reference demo for the DisplayXR runtime.$\r$\n$\r$\nEarthView streams Google Photorealistic 3D Tiles and needs your own Google Map Tiles API key at runtime.$\r$\n$\r$\nThe DisplayXR runtime must be installed first."
 
