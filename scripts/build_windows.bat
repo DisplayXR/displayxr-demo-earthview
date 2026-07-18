@@ -40,6 +40,13 @@ if "%VULKAN_SDK_PREFIX%"=="" if "%VULKAN_SDK%"=="" (
     goto :error
 )
 
+REM --- glslangValidator on PATH ------------------------------------------------
+REM Put the SDK's Bin on PATH so CMake's find_program(glslangValidator) resolves
+REM (the bare find_program searches PATH only; some installs set the SDK env
+REM without adding Bin to PATH, e.g. the winget Vulkan SDK package).
+if not "%VULKAN_SDK%"=="" set "PATH=%VULKAN_SDK%\Bin;%PATH%"
+if not "%VULKAN_SDK_PREFIX%"=="" set "PATH=%VULKAN_SDK_PREFIX%\Bin;%PATH%"
+
 REM --- OpenXR loader -------------------------------------------------------------
 REM If OpenXR_ROOT isn't overridden, auto-provision the prebuilt Khronos loader,
 REM pinned to the same spec revision as the vendored openxr_includes/ headers
