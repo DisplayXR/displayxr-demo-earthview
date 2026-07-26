@@ -14,8 +14,8 @@
  * - XR_DXR_display_info: Kooima projection, display metrics
  * - V key cycles rendering modes via xrRequestDisplayRenderingModeDXR
  * - 0-3 keys select rendering mode directly
- * - L key or button click: NSOpenPanel to load .glb/.gltf models
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
+ * (No file-open: EarthView streams tiles — there is no model/scene to load.)
  */
 
 #import <Cocoa/Cocoa.h>

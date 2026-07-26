@@ -1,40 +1,51 @@
 // Copyright 2026, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// linux/main.cpp — the Linux entry point for the EarthView demo (issue #19,
-// M8 Linux epic runtime#699). BUILD-GREEN scope: this compiles and links the
-// full cross-platform scene layer (tiles_common cesium streaming + Vulkan tile
-// renderer) against the OpenXR loader on ubuntu-latest CI. On-screen
-// validation is a SEPARATE pass, gated on the runtime's Linux Phase 1b + a GPU
-// + an X server, so nothing here is eyeball-verified yet.
+// linux/main.cpp — the Linux entry point for the EarthView demo (#19
+// build-green harness, upgraded to a real handle app by #34).
 //
-// Windowing model: HOSTED-NULL. Unlike macos/main.mm (Cocoa window +
-// XR_DXR_cocoa_window_binding) and windows/main.cpp (Win32 HWND +
-// XR_DXR_win32_window_binding), this harness passes NO window binding — the
-// runtime self-creates a window at native resolution. This is deliberate: the
-// faithful app-provided-window arm on Linux is XR_DXR_xlib_window_binding
-// (runtime Phase 3a), which is Phase-3 hardware-gated. See
-// docs/guides/linux-demo-port.md (the runtime repo).
-//   TODO(Phase 3): when on-screen validation lands, add an SDL/xlib window and
-//   chain XrXlibWindowBindingCreateInfoDXR onto the session, mirroring the
-//   cocoa/win32 legs. Until then hosted-NULL is the correct interim.
+// WINDOWING — HANDLE app (matching the binary name and the other platforms):
+// the app owns a decorated X11 window centered on the 3D panel and passes it
+// via XR_DXR_xlib_window_binding, so the runtime weaves window-relative
+// (runtime#729/#730) and the app receives keyboard input. The window defaults
+// to 1920x1080 centered on the panel (XR_DXR_display_info desktop rect, else
+// Xrandr); EARTHVIEW_WINDOW="WxH+X+Y" overrides (X,Y absolute virtual-desktop
+// px). When no X server is available (or window creation fails) the app falls
+// back to the previous hosted-NULL path — which also keeps this compiling and
+// startable on the build-green CI runner.
 //
-// This is a REDUCED harness: no HUD, no input, no MCP tools, no atlas capture,
-// no view-rig / eye-tracking, no double-click picking. Those live in the
-// per-platform mains and are UI concerns that require on-screen work anyway.
-// The point of this file is that the Vulkan + OpenXR + cesium tile pipeline
-// compiles and links on Linux.
+// RENDERING — extension app: enumerates + requests display rendering modes,
+// tiles = window x recommendedViewScaleXY, chains the XR_DXR_view_rig CAMERA
+// rig on xrLocateViews (the default camera-centric FLY view — the runtime owns
+// the off-axis eyes; convergence auto-focuses on the forward ground ray), and
+// remaps the GL projection to Vulkan [0,1] depth. Mirrors the windows/main.cpp
+// fly path; orbit/focus/HUD/MCP/atlas-capture remain per-platform UI concerns.
+//
+// INPUT — B cycles city bookmarks (Windows parity); close button exits. NO
+// file-open by design: EarthView streams tiles, there is no model to load.
 
 #define XR_USE_GRAPHICS_API_VULKAN
 
 #include <vulkan/vulkan.h>
 
+// X11 window + input (handle app) — before the OpenXR platform header so the
+// xlib binding struct sees the real Display/Window types.
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/keysym.h>
+#include <X11/extensions/Xrandr.h>
+
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
 // DisplayXR extension headers (vendored openxr_includes/, refreshed from
-// displayxr-extensions). Only the ones this reduced harness enables.
+// displayxr-extensions).
 #include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_xlib_window_binding.h>
+
+#include "projection_depth.h"
 
 #include "geo_math.h"
 #include "tile_engine.h"
@@ -43,6 +54,7 @@
 #include <glm/glm.hpp>
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
@@ -155,9 +167,30 @@ struct AppXrSession
 	} swapchain;
 
 	bool hasDisplayInfoExt = false;
+	bool hasViewRigExt = false;
+	bool hasXlibBindingExt = false;
 	uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
 	float displayWidthM = 0, displayHeightM = 0;
 	float nominalViewerZ = 0.5f;
+	int32_t displayScreenLeft = 0; // 3D-panel top-left in virtual-desktop px
+	int32_t displayScreenTop = 0;
+
+	// App-owned X11 window (handle app). Null display = hosted-NULL fallback.
+	Display *xDisplay = nullptr;
+	::Window xWindow = 0;
+	unsigned int xWinW = 0, xWinH = 0;
+
+	PFN_xrRequestDisplayRenderingModeDXR pfnRequestMode = nullptr;
+	PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateModes = nullptr;
+
+	uint32_t renderingModeCount = 0;
+	uint32_t renderingModeViewCounts[8] = {};
+	float renderingModeScaleX[8] = {};
+	float renderingModeScaleY[8] = {};
+	bool renderingModeDisplay3D[8] = {};
+	uint32_t renderingModeTileColumns[8] = {};
+	uint32_t renderingModeTileRows[8] = {};
+	uint32_t currentRenderingMode = 1; // default: first 3D mode
 
 	uint32_t maxViewCount = 2;
 };
@@ -180,6 +213,10 @@ InitializeOpenXR(AppXrSession &xr)
 			hasVulkan = true;
 		if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0)
 			xr.hasDisplayInfoExt = true;
+		if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
+			xr.hasViewRigExt = true;
+		if (strcmp(e.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0)
+			xr.hasXlibBindingExt = true;
 	}
 	if (!hasVulkan) {
 		LOG_ERROR("XR_KHR_vulkan_enable not available");
@@ -190,6 +227,10 @@ InitializeOpenXR(AppXrSession &xr)
 	enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
 	if (xr.hasDisplayInfoExt)
 		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+	if (xr.hasViewRigExt)
+		enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+	if (xr.hasXlibBindingExt)
+		enabled.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
 
 	XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
 	strncpy(ci.applicationInfo.applicationName, "DisplayXREarthViewLinux",
@@ -215,6 +256,9 @@ InitializeOpenXR(AppXrSession &xr)
 	if (xr.hasDisplayInfoExt) {
 		XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
 		XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+		XrDisplayDesktopPositionDXR desktopPos = {};
+		desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+		di.next = &desktopPos;
 		sp.next = &di;
 		if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
 			xr.displayWidthM = di.displaySizeMeters.width;
@@ -222,7 +266,13 @@ InitializeOpenXR(AppXrSession &xr)
 			xr.nominalViewerZ = di.nominalViewerPositionInDisplaySpace.z;
 			xr.displayPixelWidth = di.displayPixelWidth;
 			xr.displayPixelHeight = di.displayPixelHeight;
+			xr.displayScreenLeft = desktopPos.left;
+			xr.displayScreenTop = desktopPos.top;
 		}
+		xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
+		                      (PFN_xrVoidFunction *)&xr.pfnRequestMode);
+		xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
+		                      (PFN_xrVoidFunction *)&xr.pfnEnumerateModes);
 	}
 
 	LOG_INFO("OpenXR initialized: %s", xr.systemName);
@@ -378,9 +428,6 @@ static bool
 CreateSession(AppXrSession &xr, VkInstance vkInstance, VkPhysicalDevice pd,
               VkDevice dev, uint32_t qfi)
 {
-	// HOSTED-NULL: XrGraphicsBindingVulkanKHR with NO window binding chained.
-	// The runtime self-creates its own window at native resolution. See the
-	// TODO(Phase 3) at the top of this file for the xlib window-binding arm.
 	XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
 	vkBinding.instance = vkInstance;
 	vkBinding.physicalDevice = pd;
@@ -388,10 +435,57 @@ CreateSession(AppXrSession &xr, VkInstance vkInstance, VkPhysicalDevice pd,
 	vkBinding.queueFamilyIndex = qfi;
 	vkBinding.queueIndex = 0;
 
+	// Handle app: pass the app-owned X11 window via XR_DXR_xlib_window_binding
+	// so the runtime weaves window-relative (runtime#729/#730). Falls back to
+	// hosted-NULL (no window binding — the runtime self-creates a window at
+	// native resolution) when CreateAppWindow didn't run.
+	XrXlibWindowBindingCreateInfoDXR xlibBinding = {
+	    XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
+	xlibBinding.next = &vkBinding;
+	xlibBinding.xDisplay = xr.xDisplay;
+	xlibBinding.window = xr.xWindow;
+	xlibBinding.transparentBackgroundEnabled = XR_FALSE;
+	const bool useAppWindow =
+	    (xr.hasXlibBindingExt && xr.xDisplay != nullptr && xr.xWindow != 0);
+
 	XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
-	si.next = &vkBinding;
+	si.next = useAppWindow ? (const void *)&xlibBinding : (const void *)&vkBinding;
 	si.systemId = xr.systemId;
 	XR_CHECK(xrCreateSession(xr.instance, &si, &xr.session));
+	LOG_INFO("Session created (%s)",
+	         useAppWindow ? "app-owned window, handle app" : "hosted-NULL");
+
+	if (xr.pfnEnumerateModes && xr.session != XR_NULL_HANDLE) {
+		uint32_t modeCount = 0;
+		if (XR_SUCCEEDED(xr.pfnEnumerateModes(xr.session, 0, &modeCount, nullptr)) &&
+		    modeCount > 0) {
+			std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
+			for (auto &m : modes) {
+				m.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
+				m.next = nullptr;
+			}
+			if (XR_SUCCEEDED(xr.pfnEnumerateModes(xr.session, modeCount, &modeCount,
+			                                      modes.data()))) {
+				xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+				LOG_INFO("Display rendering modes (%u):", modeCount);
+				for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+					xr.renderingModeViewCounts[i] = modes[i].viewCount;
+					xr.renderingModeScaleX[i] = modes[i].viewScaleX;
+					xr.renderingModeScaleY[i] = modes[i].viewScaleY;
+					xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
+					xr.renderingModeTileColumns[i] =
+					    modes[i].tileColumns ? modes[i].tileColumns : 1;
+					xr.renderingModeTileRows[i] =
+					    modes[i].tileRows ? modes[i].tileRows : 1;
+					LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
+					         modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
+					         modes[i].viewScaleX, modes[i].viewScaleY,
+					         xr.renderingModeTileColumns[i], xr.renderingModeTileRows[i],
+					         modes[i].hardwareDisplay3D);
+				}
+			}
+		}
+	}
 	return true;
 }
 
@@ -433,11 +527,24 @@ CreateSwapchains(AppXrSession &xr)
 			selectedFmt = f;
 	}
 
+	// Worst-case-size across advertised modes (see swapchain-model.md).
 	uint32_t w = (views.empty() ? 1024 : views[0].recommendedImageRectWidth) * 2;
 	uint32_t h = views.empty() ? 1024 : views[0].recommendedImageRectHeight;
 	if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
 		w = xr.displayPixelWidth;
 		h = xr.displayPixelHeight;
+		for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+			uint32_t aw = (uint32_t)((double)xr.renderingModeTileColumns[i] *
+			                         xr.renderingModeScaleX[i] *
+			                         (double)xr.displayPixelWidth);
+			uint32_t ah = (uint32_t)((double)xr.renderingModeTileRows[i] *
+			                         xr.renderingModeScaleY[i] *
+			                         (double)xr.displayPixelHeight);
+			if (aw > w)
+				w = aw;
+			if (ah > h)
+				h = ah;
+		}
 	}
 
 	XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -498,6 +605,13 @@ CleanupOpenXR(AppXrSession &xr)
 		xrDestroySession(xr.session);
 	if (xr.instance)
 		xrDestroyInstance(xr.instance);
+	// Tear down the app-owned X11 window after the runtime has released it.
+	if (xr.xWindow != 0 && xr.xDisplay != nullptr)
+		XDestroyWindow(xr.xDisplay, xr.xWindow);
+	if (xr.xDisplay != nullptr)
+		XCloseDisplay(xr.xDisplay);
+	xr.xWindow = 0;
+	xr.xDisplay = nullptr;
 }
 
 // ── EarthView scene state ────────────────────────────────────────────────
@@ -506,6 +620,250 @@ static TileEngine g_tileEngine;
 static geo::GeoNav g_geoNav;
 static bool g_tilesActive = false;
 static std::vector<TileRenderer::DrawItem> g_drawList;
+
+// Tile basis for a handle app: the app window (window × viewScale, #729-style).
+// Falls back to the display size on the hosted-NULL path.
+static uint32_t g_windowW = 1920, g_windowH = 1080;
+
+// ── app-owned X11 window (handle app) ────────────────────────────────────
+static const unsigned int kDefaultWindowW = 1920;
+static const unsigned int kDefaultWindowH = 1080;
+static Atom g_wmDeleteAtom = None;
+
+// Find the target panel rect (virtual-desktop px). Prefer the RandR PRIMARY
+// output; else the largest connected NON-eDP/LVDS output (the 3D display is
+// an external panel, not the laptop's built-in). Same helper as the other
+// demos.
+static bool
+GetPanelRect(Display *dpy, ::Window root, int &x, int &y, int &w, int &h)
+{
+	XRRScreenResources *res = XRRGetScreenResources(dpy, root);
+	if (res == nullptr)
+		return false;
+
+	auto tryOutput = [&](RROutput out) -> bool {
+		XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, out);
+		if (oi == nullptr)
+			return false;
+		bool ok = false;
+		if (oi->connection == RR_Connected && oi->crtc != 0) {
+			XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
+			if (ci != nullptr && ci->width > 0 && ci->height > 0) {
+				x = ci->x;
+				y = ci->y;
+				w = (int)ci->width;
+				h = (int)ci->height;
+				ok = true;
+			}
+			if (ci != nullptr)
+				XRRFreeCrtcInfo(ci);
+		}
+		XRRFreeOutputInfo(oi);
+		return ok;
+	};
+
+	bool found = false;
+	RROutput primary = XRRGetOutputPrimary(dpy, root);
+	if (primary != 0 && tryOutput(primary))
+		found = true;
+	if (!found) {
+		long bestArea = 0;
+		for (int i = 0; i < res->noutput; i++) {
+			XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, res->outputs[i]);
+			if (oi == nullptr)
+				continue;
+			const bool isBuiltin =
+			    oi->name != nullptr && (strncasecmp(oi->name, "eDP", 3) == 0 ||
+			                            strncasecmp(oi->name, "LVDS", 4) == 0);
+			if (oi->connection == RR_Connected && oi->crtc != 0 && !isBuiltin) {
+				XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
+				if (ci != nullptr && ci->width > 0 && ci->height > 0) {
+					const long area = (long)ci->width * (long)ci->height;
+					if (area > bestArea) {
+						bestArea = area;
+						x = ci->x;
+						y = ci->y;
+						w = (int)ci->width;
+						h = (int)ci->height;
+						found = true;
+					}
+				}
+				if (ci != nullptr)
+					XRRFreeCrtcInfo(ci);
+			}
+			XRRFreeOutputInfo(oi);
+		}
+	}
+	XRRFreeScreenResources(res);
+	return found;
+}
+
+// Create a normal decorated X11 window (opaque, default visual), landscape
+// 1920x1080 centered on the 3D panel — the app passes it via
+// XR_DXR_xlib_window_binding so the runtime weaves window-relative. Override
+// with EARTHVIEW_WINDOW="WxH+X+Y" (X,Y absolute virtual-desktop px; WxH alone
+// re-centers). Returns false (xDisplay left null) when no X server is
+// available, so the caller falls back to hosted-NULL (also the CI-safe path).
+static bool
+CreateAppWindow(AppXrSession &xr)
+{
+	Display *dpy = XOpenDisplay(nullptr);
+	if (dpy == nullptr) {
+		LOG_INFO("XOpenDisplay failed (no X server) — using hosted-NULL windowing");
+		return false;
+	}
+	int screen = DefaultScreen(dpy);
+	::Window root = RootWindow(dpy, screen);
+
+	XSetWindowAttributes attrs = {};
+	attrs.background_pixel = BlackPixel(dpy, screen);
+	attrs.event_mask = StructureNotifyMask | KeyPressMask;
+
+	unsigned int w = kDefaultWindowW, h = kDefaultWindowH;
+	int px = 0, py = 0;
+	int prx = 0, pry = 0, prw = 0, prh = 0;
+	if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+		// Authoritative: XR_DXR_display_info reports the 3D panel's desktop
+		// rect. Prefer it — on a multi-monitor box the RandR PRIMARY is often
+		// NOT the 3D panel.
+		prx = xr.displayScreenLeft;
+		pry = xr.displayScreenTop;
+		prw = (int)xr.displayPixelWidth;
+		prh = (int)xr.displayPixelHeight;
+		px = prx + (prw - (int)w) / 2;
+		py = pry + (prh - (int)h) / 2;
+		LOG_INFO("3D panel (display_info) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
+		         prw, prh, prx, pry, w, h, px, py);
+	} else if (GetPanelRect(dpy, root, prx, pry, prw, prh)) {
+		px = prx + (prw - (int)w) / 2;
+		py = pry + (prh - (int)h) / 2;
+		LOG_INFO("Panel rect (Xrandr) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
+		         prw, prh, prx, pry, w, h, px, py);
+	} else {
+		const int sw = DisplayWidth(dpy, screen), sh = DisplayHeight(dpy, screen);
+		px = (sw - (int)w) / 2;
+		py = (sh - (int)h) / 2;
+		LOG_INFO("Xrandr panel query failed — centering %ux%u on default screen %dx%d at (%d,%d)",
+		         w, h, sw, sh, px, py);
+	}
+
+	// EARTHVIEW_WINDOW="WxH+X+Y" override (X,Y absolute virtual-desktop px);
+	// WxH alone re-centers on the same panel/screen origin.
+	if (const char *wenv = getenv("EARTHVIEW_WINDOW")) {
+		unsigned int ow = 0, oh = 0;
+		int ox = 0, oy = 0;
+		int n = sscanf(wenv, "%ux%u+%d+%d", &ow, &oh, &ox, &oy);
+		if (n >= 2 && ow > 0 && oh > 0) {
+			w = ow;
+			h = oh;
+			if (n >= 4) {
+				px = ox;
+				py = oy;
+				LOG_INFO("EARTHVIEW_WINDOW override: %ux%u at absolute (%d,%d)", w, h, px, py);
+			} else {
+				if (prw > 0 && prh > 0) {
+					px = prx + (prw - (int)w) / 2;
+					py = pry + (prh - (int)h) / 2;
+				}
+				LOG_INFO("EARTHVIEW_WINDOW override: %ux%u (re-centered at %d,%d)", w, h, px, py);
+			}
+		}
+	}
+
+	::Window win = XCreateWindow(dpy, root, px, py, w, h, 0, CopyFromParent,
+	                             InputOutput, CopyFromParent,
+	                             CWBackPixel | CWEventMask, &attrs);
+	if (win == 0) {
+		LOG_ERROR("XCreateWindow failed — using hosted-NULL windowing");
+		XCloseDisplay(dpy);
+		return false;
+	}
+	XStoreName(dpy, win, "DisplayXR EarthView");
+
+	// Close button → clean exit (ClientMessage in the event pump).
+	g_wmDeleteAtom = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+	if (g_wmDeleteAtom != None)
+		XSetWMProtocols(dpy, win, &g_wmDeleteAtom, 1);
+
+	// WM_NORMAL_HINTS with USPosition|PPosition so the WM honors the
+	// create-time position instead of auto-placing (GNOME/Mutter).
+	{
+		XSizeHints hints = {};
+		hints.flags = USPosition | PPosition;
+		hints.x = px;
+		hints.y = py;
+		XSetWMNormalHints(dpy, win, &hints);
+	}
+
+	XMapWindow(dpy, win);
+	XFlush(dpy);
+	// Re-assert the position after mapping — Mutter ignores the create-time
+	// x/y of a freshly-mapped toplevel but honors a post-map move.
+	XMoveWindow(dpy, win, px, py);
+	XFlush(dpy);
+
+	xr.xDisplay = dpy;
+	xr.xWindow = win;
+	xr.xWinW = w;
+	xr.xWinH = h;
+	LOG_INFO("Created %ux%u app window at (%d,%d) — XR_DXR_xlib_window_binding",
+	         w, h, px, py);
+	return true;
+}
+
+// Pump the app window's X11 events: B = cycle city bookmarks (Windows
+// parity), close button = clean exit, ConfigureNotify = track live window
+// size. NO file-open by design (EarthView streams tiles).
+static void
+PumpXEvents(AppXrSession &xr)
+{
+	if (xr.xDisplay == nullptr)
+		return;
+	while (XPending(xr.xDisplay) > 0) {
+		XEvent ev;
+		XNextEvent(xr.xDisplay, &ev);
+		switch (ev.type) {
+		case KeyPress: {
+			KeySym sym = XLookupKeysym(&ev.xkey, 0);
+			if (sym == XK_b || sym == XK_B) {
+				g_geoNav.cycleBookmark();
+				size_t n = 0;
+				const geo::Bookmark *bm = geo::bookmarks(&n);
+				if (n > 0)
+					LOG_INFO("Bookmark: %s", bm[g_geoNav.bookmarkIndex].name);
+			}
+			break;
+		}
+		case ConfigureNotify:
+			if (ev.xconfigure.width > 0 && ev.xconfigure.height > 0) {
+				xr.xWinW = (unsigned int)ev.xconfigure.width;
+				xr.xWinH = (unsigned int)ev.xconfigure.height;
+				g_windowW = xr.xWinW;
+				g_windowH = xr.xWinH;
+			}
+			break;
+		case ClientMessage:
+			if (g_wmDeleteAtom != None && (Atom)ev.xclient.data.l[0] == g_wmDeleteAtom) {
+				LOG_INFO("Window closed — exiting");
+				g_running = 0;
+			}
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+// Orthoscopic camera-rig vFOV: the FULL display's physical subtense
+// (displayH / nominalZ) — matches windows/main.cpp CamVFovRad.
+static constexpr float kCameraVFovRad = 0.6498f; // ~37.2° fallback
+static inline float
+CamVFovRad(float physHeightM, float nominalZ)
+{
+	return (physHeightM > 1.0e-6f && nominalZ > 1.0e-6f)
+	           ? 2.0f * atanf(physHeightM / (2.0f * nominalZ))
+	           : kCameraVFovRad;
+}
 
 int
 main()
@@ -571,11 +929,28 @@ main()
 		CleanupOpenXR(xr);
 		return 1;
 	}
+	// Handle app: own an X11 window on the 3D panel (display_info queried in
+	// InitializeOpenXR gives the panel rect). Falls back to hosted-NULL when
+	// no X server is available (also the CI-safe path — CI never runs this).
+	CreateAppWindow(xr);
+
 	if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
 		vkDestroyDevice(vkDevice, nullptr);
 		vkDestroyInstance(vkInstance, nullptr);
 		CleanupOpenXR(xr);
 		return 1;
+	}
+
+	// Tile basis: the app window when we own one (window × scaleXY,
+	// runtime#729); else the full panel (hosted-NULL renders display-sized).
+	if (xr.xWinW > 0 && xr.xWinH > 0) {
+		g_windowW = xr.xWinW;
+		g_windowH = xr.xWinH;
+	} else {
+		if (xr.displayPixelWidth > 0)
+			g_windowW = xr.displayPixelWidth;
+		if (xr.displayPixelHeight > 0)
+			g_windowH = xr.displayPixelHeight;
 	}
 	if (!CreateSpaces(xr) || !CreateSwapchains(xr)) {
 		CleanupOpenXR(xr);
@@ -618,11 +993,31 @@ main()
 	long maxFrames = getenv("EV_MAX_FRAMES") ? atol(getenv("EV_MAX_FRAMES")) : 0;
 	long frame = 0;
 
+	// Convergence auto-focus state (mirrors windows/main.cpp): forward ray →
+	// ground distance in geo metres, scaled to XR metres, exp-smoothed.
+	float convDiopters = 1.0f; // 1/m; default = 1/kTargetXrDist
+	constexpr double kConvSmoothTau = 0.15;
+	auto lastTime = std::chrono::high_resolution_clock::now();
+
 	while (g_running && !xr.exitRequested) {
 		PollEvents(xr);
+		PumpXEvents(xr); // B = cycle bookmark; close button = exit
+
+		// Assert the app's default 3D rendering mode once the session runs.
+		if (xr.sessionRunning && xr.pfnRequestMode && xr.session != XR_NULL_HANDLE) {
+			uint32_t mode = xr.currentRenderingMode < xr.renderingModeCount
+			                    ? xr.currentRenderingMode
+			                    : 0;
+			xr.pfnRequestMode(xr.session, mode);
+		}
+
 		if (!xr.sessionRunning) {
 			continue;
 		}
+
+		auto now = std::chrono::high_resolution_clock::now();
+		double deltaTime = std::chrono::duration<double>(now - lastTime).count();
+		lastTime = now;
 
 		XrFrameState frameState = {XR_TYPE_FRAME_STATE};
 		if (XR_FAILED(xrWaitFrame(xr.session, nullptr, &frameState)))
@@ -638,27 +1033,147 @@ main()
 			locateInfo.displayTime = frameState.predictedDisplayTime;
 			locateInfo.space = xr.localSpace;
 
+			// XR_DXR_view_rig CAMERA rig (camera-centric FLY, the default
+			// view): a plain perspective camera at the XR origin looking -Z;
+			// the runtime owns the off-axis eyes + window resolve and returns
+			// render-ready XrView{pose, fov}. Mirrors windows/main.cpp's fly
+			// path (orbit/focus are per-platform UI, not ported here).
+			const bool useRig =
+			    xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
+			XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
+			if (useRig) {
+				cameraRig.pose = {{0, 0, 0, 1}, {0, 0, 0}};
+				cameraRig.ipdFactor = 1.0f;
+				cameraRig.parallaxFactor = 1.0f;
+				cameraRig.convergenceDiopters = convDiopters;
+				cameraRig.verticalFov =
+				    CamVFovRad(xr.displayHeightM, xr.nominalViewerZ);
+				locateInfo.next = &cameraRig;
+			}
+
 			XrViewState viewState = {XR_TYPE_VIEW_STATE};
-			uint32_t viewCap = xr.maxViewCount;
+			// Over-allocate to the runtime's max view count (sim_display Quad
+			// reports 4); hardcoding 2 fails with XR_ERROR_SIZE_INSUFFICIENT.
+			uint32_t viewCap = xr.maxViewCount > 8 ? 8 : (xr.maxViewCount ? xr.maxViewCount : 2);
 			std::vector<XrView> xrViews(viewCap, {XR_TYPE_VIEW});
 			uint32_t viewCount = 0;
 			XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState,
 			                            viewCap, &viewCount, xrViews.data());
 
 			if (XR_SUCCEEDED(lr) && viewCount > 0) {
-				// Camera-centric world mapping (PRD §6.1): map the full-scale
-				// ECEF world so the geo camera sits at the viewer position.
-				double zdp = (xr.nominalViewerZ > 1e-3f) ? xr.nominalViewerZ
-				                                          : 0.5;
-				double s = geo::stereoScaleForDistance(g_geoNav.targetDist, zdp);
-				glm::dvec3 viewerPosXr(0.0, 0.1, zdp);
-				glm::dmat4 xrFromEcef =
-				    geo::xrFromEcefCamera(g_geoNav.cam, viewerPosXr, s);
+				// Active rendering mode → eye count + per-view tile extent
+				// (window × viewScale, runtime#729).
+				uint32_t mode = xr.currentRenderingMode < xr.renderingModeCount
+				                    ? xr.currentRenderingMode
+				                    : 0;
+				bool monoMode = (xr.renderingModeCount > 0 &&
+				                 !xr.renderingModeDisplay3D[mode]);
+				uint32_t activeViewCount = (xr.renderingModeCount > 0)
+				                               ? xr.renderingModeViewCounts[mode]
+				                               : 2u;
+				if (activeViewCount == 0)
+					activeViewCount = 1;
+				if (activeViewCount > viewCount)
+					activeViewCount = viewCount;
+				const uint32_t eyeCount = monoMode ? 1 : activeViewCount;
+				float scaleX = 1.0f, scaleY = 1.0f;
+				uint32_t cols = monoMode ? 1u : 2u;
+				if (xr.renderingModeCount > 0) {
+					scaleX = xr.renderingModeScaleX[mode];
+					scaleY = xr.renderingModeScaleY[mode];
+					cols = xr.renderingModeTileColumns[mode];
+					if (cols == 0)
+						cols = 1;
+				}
+				uint32_t renderW = (uint32_t)((double)g_windowW * scaleX);
+				uint32_t renderH = (uint32_t)((double)g_windowH * scaleY);
+				if (renderW == 0)
+					renderW = 1;
+				if (renderH == 0)
+					renderH = 1;
 
+				// Per-eye view/projection from the render-ready views. Camera
+				// rig: fixed tight near/far around the ~1 XR-m scene scale
+				// (depth precision — see windows/main.cpp). GL → [0,1] depth
+				// remap (the tile mesh uses the depth buffer).
+				struct EyeView {
+					std::array<float, 16> viewMat{}, projMat{};
+					XrView src;
+				};
+				std::vector<EyeView> eyes((size_t)eyeCount);
+				for (uint32_t e = 0; e < eyeCount; e++) {
+					XrView sv = xrViews[e < viewCount ? e : 0];
+					if (monoMode && viewCount > 1) {
+						// Collapse the located views to their centroid.
+						XrVector3f c = {0, 0, 0};
+						XrFovf f = {0, 0, 0, 0};
+						for (uint32_t v = 0; v < activeViewCount; v++) {
+							c.x += xrViews[v].pose.position.x;
+							c.y += xrViews[v].pose.position.y;
+							c.z += xrViews[v].pose.position.z;
+							f.angleLeft += xrViews[v].fov.angleLeft;
+							f.angleRight += xrViews[v].fov.angleRight;
+							f.angleUp += xrViews[v].fov.angleUp;
+							f.angleDown += xrViews[v].fov.angleDown;
+						}
+						float inv = 1.0f / (float)activeViewCount;
+						sv.pose.position = {c.x * inv, c.y * inv, c.z * inv};
+						sv.fov = {f.angleLeft * inv, f.angleRight * inv,
+						          f.angleUp * inv, f.angleDown * inv};
+					}
+					const float near_z = 0.05f, far_z = 200.0f;
+					mat4_view_from_xr_pose(eyes[e].viewMat.data(), sv.pose);
+					mat4_from_xr_fov(eyes[e].projMat.data(), sv.fov, near_z, far_z);
+					if (useRig)
+						convert_projection_gl_to_zero_to_one(eyes[e].projMat.data());
+					eyes[e].src = sv;
+				}
+
+				// Camera-centric FLY world mapping: anchor the geo camera at
+				// the XR origin, target a fixed kTargetXrDist in front
+				// (s = kTargetXrDist/targetDist). Selection camera = the
+				// head camera in ECEF from the inverse mapping; frustum = the
+				// cam-rig vFOV widened to the tile aspect, +15% margin.
 				if (g_tilesActive) {
+					const double kTargetXrDist = 1.0;
+					glm::dvec3 anchorXr(0.0);
+					double s = kTargetXrDist / std::max(g_geoNav.targetDist, 1.0);
+					glm::dmat4 xrFromEcef =
+					    geo::xrFromEcefCamera(g_geoNav.cam, anchorXr, s);
+
+					double camVFov =
+					    (double)CamVFovRad(xr.displayHeightM, xr.nominalViewerZ);
+					double aspect =
+					    (renderH > 0) ? (double)renderW / (double)renderH : 1.0;
+					double vfov = camVFov * 1.15;
+					double hfov =
+					    2.0 * std::atan(std::tan(0.5 * camVFov) * aspect) * 1.15;
+
+					// Convergence auto-focus: forward ray → ground distance,
+					// scaled to XR metres, clamped, exp-smoothed.
+					double groundM =
+					    geo::rayGroundDistanceM(g_geoNav.cam.pos, g_geoNav.cam.dir);
+					if (groundM > 0.0) {
+						double xrDist = groundM * s;
+						if (xrDist < 0.2)
+							xrDist = 0.2;
+						if (xrDist > 50.0)
+							xrDist = 50.0;
+						float tgt = (float)(1.0 / xrDist);
+						double a = 1.0 - std::exp(-deltaTime / kConvSmoothTau);
+						convDiopters += (tgt - convDiopters) * (float)a;
+					}
+
+					geo::GeoCamera selCam;
+					{
+						glm::dmat4 invWorld = glm::inverse(xrFromEcef);
+						glm::dmat3 invRot = glm::dmat3(invWorld);
+						selCam.pos = glm::dvec3(invWorld * glm::dvec4(anchorXr, 1.0));
+						selCam.dir = glm::normalize(invRot * glm::dvec3(0.0, 0.0, -1.0));
+						selCam.up = glm::normalize(invRot * glm::dvec3(0.0, 1.0, 0.0));
+					}
 					const auto &tiles = g_tileEngine.update(
-					    g_geoNav.cam, (double)xr.swapchain.width,
-					    (double)xr.swapchain.height, 1.2, 0.8);
+					    selCam, (double)renderW, (double)renderH, hfov, vfov);
 					g_drawList = g_tileRenderer.buildDrawList(tiles, xrFromEcef);
 				}
 
@@ -672,38 +1187,34 @@ main()
 					wi.timeout = XR_INFINITE_DURATION;
 					xrWaitSwapchainImage(xr.swapchain.swapchain, &wi);
 
-					uint32_t renderW =
-					    xr.swapchain.width / (viewCount ? viewCount : 1);
-					uint32_t renderH = xr.swapchain.height;
 					VkImage targetImage = swapchainImages[imageIndex].image;
 					VkFormat swapFormat = (VkFormat)xr.swapchain.format;
 
 					projectionViews.assign(
-					    (size_t)viewCount,
+					    (size_t)eyeCount,
 					    {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
-					for (uint32_t v = 0; v < viewCount; v++) {
-						std::array<float, 16> viewMat{}, projMat{};
-						mat4_view_from_xr_pose(viewMat.data(), xrViews[v].pose);
-						mat4_from_xr_fov(projMat.data(), xrViews[v].fov, 0.01f,
-						                 100.0f);
-
-						uint32_t vpX = v * renderW;
+					for (uint32_t e = 0; e < eyeCount; e++) {
+						uint32_t tileX = e % cols;
+						uint32_t tileY = e / cols;
+						uint32_t vpX = tileX * renderW;
+						uint32_t vpY = tileY * renderH;
 						if (g_tilesActive) {
 							g_tileRenderer.renderEye(
 							    targetImage, swapFormat, xr.swapchain.width,
-							    xr.swapchain.height, vpX, 0, renderW, renderH,
-							    viewMat.data(), projMat.data(), g_drawList);
+							    xr.swapchain.height, vpX, vpY, renderW, renderH,
+							    eyes[e].viewMat.data(), eyes[e].projMat.data(),
+							    g_drawList);
 						}
 
-						projectionViews[v].subImage.swapchain =
+						projectionViews[e].subImage.swapchain =
 						    xr.swapchain.swapchain;
-						projectionViews[v].subImage.imageRect.offset = {
-						    (int32_t)vpX, 0};
-						projectionViews[v].subImage.imageRect.extent = {
+						projectionViews[e].subImage.imageRect.offset = {
+						    (int32_t)vpX, (int32_t)vpY};
+						projectionViews[e].subImage.imageRect.extent = {
 						    (int32_t)renderW, (int32_t)renderH};
-						projectionViews[v].subImage.imageArrayIndex = 0;
-						projectionViews[v].pose = xrViews[v].pose;
-						projectionViews[v].fov = xrViews[v].fov;
+						projectionViews[e].subImage.imageArrayIndex = 0;
+						projectionViews[e].pose = eyes[e].src.pose;
+						projectionViews[e].fov = eyes[e].src.fov;
 					}
 
 					XrSwapchainImageReleaseInfo ri = {
