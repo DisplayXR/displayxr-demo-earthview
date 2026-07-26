@@ -35,6 +35,11 @@ DESCRIPTION="Google Photorealistic 3D Tiles globe viewer for glasses-free 3D dis
 BINARY="earthview_handle_vk_linux"                  # build/linux/<BINARY>
 DESKTOP_CATEGORIES="Graphics;Education;"
 ASSETS_SUBDIR=""                                    # repo dir to bundle, "" if none
+# Staged flat next to the binary: the Google attribution wordmark (Map Tiles
+# API policy — the renderer resolves it via /proc/self/exe, like the other
+# platforms). NEVER stage an API key: the user supplies their own
+# (GOOGLE_MAPS_API_KEY env / per-user config / earthview.ini).
+DEFAULT_ASSETS=("macos/assets/google_logo.png:google_logo.png")
 
 set -euo pipefail
 
@@ -85,6 +90,19 @@ done
 if [ -n "$ASSETS_SUBDIR" ] && [ -d "$ROOT/$ASSETS_SUBDIR" ]; then
   cp -aR "$ROOT/$ASSETS_SUBDIR" "$APPDIR/assets"
 fi
+
+# Default assets, staged FLAT next to the binary (the app resolves them via
+# /proc/self/exe — see the modelviewer template).
+for pair in "${DEFAULT_ASSETS[@]:-}"; do
+  [ -n "$pair" ] || continue
+  src="$ROOT/${pair%%:*}"; dst="${pair##*:}"
+  if [ -f "$src" ]; then
+    install -m 0644 "$src" "$APPDIR/$dst"
+    echo "==> default asset staged: $dst ($(du -h "$src" | cut -f1))"
+  else
+    echo "warn: default asset '${pair%%:*}' not found." >&2
+  fi
+done
 
 # Launcher wrapper on PATH.
 cat > "$STAGE/usr/bin/$PKG" <<EOF

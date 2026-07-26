@@ -7,12 +7,11 @@
 # added ../common and ../tiles_common as subdirectories (and cesium-native),
 # exposing the `sr_common_base` and `tile_renderer` targets.
 #
-# linux/main.cpp is the Linux entry point (issue #19, M8 Linux epic). It is a
-# HOSTED-NULL, reduced harness: Vulkan (system libvulkan) + OpenXR session +
-# cesium tile streaming, with NO app-provided window (the runtime self-creates
-# one) and no HUD/input. BUILD-GREEN scope — see docs/roadmap.md (M8) and the
-# runtime repo's docs/guides/linux-demo-port.md. The faithful window arm
-# (XR_DXR_xlib_window_binding) is Phase-3 hardware-gated.
+# linux/main.cpp is the Linux entry point (#19 harness → #34 handle app):
+# Vulkan (system libvulkan) + OpenXR session + cesium tile streaming, with an
+# app-owned X11 window centered on the 3D panel and passed via
+# XR_DXR_xlib_window_binding (hosted-NULL fallback when no X server, which
+# keeps the CI runner build-green).
 
 cmake_minimum_required(VERSION 3.25)
 
@@ -22,6 +21,12 @@ endif()
 
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
+
+# X11 window + Xrandr panel query (handle app).
+find_package(X11 REQUIRED)
+if(NOT X11_Xrandr_LIB)
+    message(FATAL_ERROR "libXrandr not found (apt install libxrandr-dev) — needed for 3D-panel window centering.")
+endif()
 
 # OpenXR loader — prefer an installed/dev loader (build_linux.sh installs one
 # under /tmp/openxr-install and points CMAKE_PREFIX_PATH at it), else build the
@@ -67,6 +72,8 @@ target_link_libraries(earthview_handle_vk_linux PRIVATE
     tile_renderer
     ${EV_OPENXR_LOADER}
     Vulkan::Vulkan
+    X11::X11
+    ${X11_Xrandr_LIB}
 )
 
 # Copy the OpenXR loader .so next to the binary when it's an imported target,
