@@ -36,6 +36,18 @@
 #include <X11/keysym.h>
 #include <X11/extensions/Xrandr.h>
 
+// X11's headers #define plain words: None/Success (X.h) and Bool/Status
+// (Xlib.h). Those collide with cesium-native + rapidjson identifiers
+// (CesiumUtility::JsonValue::Bool, CreditReferencer::None, ...), so capture
+// the one constant this file needs and drop the macros before any cesium
+// header is pulled in. The X11 function signatures were already parsed above,
+// so the calls below are unaffected.
+static const Atom kXAtomNone = None;
+#undef None
+#undef Bool
+#undef Status
+#undef Success
+
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
@@ -628,7 +640,7 @@ static uint32_t g_windowW = 1920, g_windowH = 1080;
 // ── app-owned X11 window (handle app) ────────────────────────────────────
 static const unsigned int kDefaultWindowW = 1920;
 static const unsigned int kDefaultWindowH = 1080;
-static Atom g_wmDeleteAtom = None;
+static Atom g_wmDeleteAtom = kXAtomNone;
 
 // Find the target panel rect (virtual-desktop px). Prefer the RandR PRIMARY
 // output; else the largest connected NON-eDP/LVDS output (the 3D display is
@@ -782,7 +794,7 @@ CreateAppWindow(AppXrSession &xr)
 
 	// Close button → clean exit (ClientMessage in the event pump).
 	g_wmDeleteAtom = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-	if (g_wmDeleteAtom != None)
+	if (g_wmDeleteAtom != kXAtomNone)
 		XSetWMProtocols(dpy, win, &g_wmDeleteAtom, 1);
 
 	// WM_NORMAL_HINTS with USPosition|PPosition so the WM honors the
@@ -843,7 +855,7 @@ PumpXEvents(AppXrSession &xr)
 			}
 			break;
 		case ClientMessage:
-			if (g_wmDeleteAtom != None && (Atom)ev.xclient.data.l[0] == g_wmDeleteAtom) {
+			if (g_wmDeleteAtom != kXAtomNone && (Atom)ev.xclient.data.l[0] == g_wmDeleteAtom) {
 				LOG_INFO("Window closed — exiting");
 				g_running = 0;
 			}
