@@ -23,8 +23,13 @@ never exposed, and the planned in-app key-entry flow.
 - **Windows:** the Win32 entry dialog (`ShowApiKeyDialog` in `windows/main.cpp`)
   mirrors the macOS card using the same shared functions — first-run keyless +
   Ctrl+K, modal, Save validates then defers the late-init to the render thread.
-  Implemented; **pending live validation on a Windows machine** (compile-checked
-  by `build-windows.yml`).
+  Implemented. The **key-resolution** path is live-verified on Windows
+  (2026-08-01: streams tiles via step 1 and step 2). The **keyless entry
+  dialog** itself is still **pending live validation** — every Windows run so
+  far has had a key already present, so the first-run card has never actually
+  been shown. To exercise it, temporarily move
+  `%APPDATA%\DisplayXR\EarthView\earthview.ini` aside and launch with
+  `GOOGLE_MAPS_API_KEY` unset.
 
 ## Key resolution order (never a baked-in default)
 
@@ -42,8 +47,13 @@ never exposed, and the planned in-app key-entry flow.
 so the local dev key “just works” without hand-exporting. `.env.local`,
 `.env`, and `.env.*` are gitignored and never staged into the `.pkg`.
 
-`earthviewGetApiKey()` (`tiles_common/tile_engine.cpp`) currently implements 1+3;
-extend it with 2, and add a writer for the app-support path.
+All four steps are implemented in `tiles_common/tile_engine.cpp`:
+`earthviewKeyConfigPath()` resolves the per-user path (`%APPDATA%\DisplayXR\
+EarthView\earthview.ini` on Windows, `~/Library/Application Support/...` on
+macOS), `earthviewGetApiKey()` walks env → per-user ini → cwd ini,
+`earthviewSaveApiKey()` writes the per-user ini (creating the directory, and
+`chmod 0600` on POSIX — Windows inherits the default `%APPDATA%` ACL), and
+`earthviewClearApiKey()` deletes only that file, leaving the dev stores alone.
 
 ## First-run entry UI (macOS, Cocoa)
 
