@@ -23,13 +23,14 @@ never exposed, and the planned in-app key-entry flow.
 - **Windows:** the Win32 entry dialog (`ShowApiKeyDialog` in `windows/main.cpp`)
   mirrors the macOS card using the same shared functions — first-run keyless +
   Ctrl+K, modal, Save validates then defers the late-init to the render thread.
-  Implemented. The **key-resolution** path is live-verified on Windows
-  (2026-08-01: streams tiles via step 1 and step 2). The **keyless entry
-  dialog** itself is still **pending live validation** — every Windows run so
-  far has had a key already present, so the first-run card has never actually
-  been shown. To exercise it, temporarily move
-  `%APPDATA%\DisplayXR\EarthView\earthview.ini` aside and launch with
-  `GOOGLE_MAPS_API_KEY` unset.
+  Implemented and **live-validated on Windows (2026-08-01)** — the last
+  outstanding item on this design. Verified end to end: with all three
+  resolution steps cleared (no env var, no per-user ini, no cwd ini) the
+  first-run card is shown; pasting a key and saving probes it, late-inits the
+  tile engine on the render thread so tiles stream **without a relaunch**, and
+  persists `%APPDATA%\DisplayXR\EarthView\earthview.ini` — byte-identical to a
+  known-good ini from an earlier session. To re-exercise it, move that ini
+  aside and launch with `GOOGLE_MAPS_API_KEY` unset.
 
 ## Key resolution order (never a baked-in default)
 
