@@ -255,18 +255,18 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 bool GetVulkanGraphicsRequirements(XrSessionManager& xr) {
     LOG_INFO("Getting Vulkan graphics requirements...");
 
-    PFN_xrGetVulkanGraphicsRequirementsKHR xrGetVulkanGraphicsRequirementsKHR = nullptr;
-    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsRequirementsKHR",
-        (PFN_xrVoidFunction*)&xrGetVulkanGraphicsRequirementsKHR);
-    if (XR_FAILED(result) || !xrGetVulkanGraphicsRequirementsKHR) {
-        LOG_ERROR("Failed to get xrGetVulkanGraphicsRequirementsKHR function pointer");
+    PFN_xrGetVulkanGraphicsRequirements2KHR xrGetVulkanGraphicsRequirements2KHR = nullptr;
+    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsRequirements2KHR",
+        (PFN_xrVoidFunction*)&xrGetVulkanGraphicsRequirements2KHR);
+    if (XR_FAILED(result) || !xrGetVulkanGraphicsRequirements2KHR) {
+        LOG_ERROR("Failed to get xrGetVulkanGraphicsRequirements2KHR function pointer");
         return false;
     }
 
     XrGraphicsRequirementsVulkanKHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
-    result = xrGetVulkanGraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq);
+    result = xrGetVulkanGraphicsRequirements2KHR(xr.instance, xr.systemId, &graphicsReq);
     if (XR_FAILED(result)) {
-        LogXrResult("xrGetVulkanGraphicsRequirementsKHR", result);
+        LogXrResult("xrGetVulkanGraphicsRequirements2KHR", result);
         return false;
     }
 
