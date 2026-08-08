@@ -191,6 +191,15 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
+          # ONLY this workflow may set generate_release_notes in this repo (it
+          # is earthview's primary release workflow — see the /dxr-release
+          # component map). The action folds the flag into `body` before
+          # calling the API, and on update does `body = existing + "\n\n" +
+          # notes` — so flagging the Windows/Linux/Android workflows too would
+          # repeat the notes once per job. Gives every release a
+          # "## What's Changed" floor; /dxr-release PHASE 3.6 prepends curated
+          # "## Highlights" above it, which the website's news feed parses.
+          generate_release_notes: true
 
   # Auto-bump versions.json[earthview_demo] on displayxr-runtime on a v* tag,
   # via the displayxr-publish-bot app (org secrets). NOT wired into the
