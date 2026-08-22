@@ -35,6 +35,13 @@
         <intent>
             <action android:name="org.freedesktop.monado.ipc.CONNECT" />
         </intent>
+        <!-- ADR-036 D2 / ADR-025: in-process vendor DP calls getPackageInfo()
+             on these vendor services during head-tracking bring-up; without
+             per-UID package visibility the loader hits NameNotFoundException and
+             the next JNI call trips CheckJNI, aborting the app (in-process only).
+             Removed once the vendor service advertises a neutral action (L7). -->
+        <package android:name="com.leialoft.display.config" />
+        <package android:name="com.leia.headtrackingservice" />
     </queries>
 
     <uses-feature
