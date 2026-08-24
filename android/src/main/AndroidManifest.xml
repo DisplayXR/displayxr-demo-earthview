@@ -27,8 +27,14 @@
         <provider
             android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker"
             tools:replace="android:authorities" />
-        <!-- Both runtime flavors so the same APK runs against either:
-             out_of_process (production, ADR-025) or in_process (dev). -->
+        <!-- Both runtime packages, so the same APK runs against either.
+             NOTE: the old reading of these two names — out_of_process as
+             "production" and in_process as "dev" — is WRONG since
+             displayxr-runtime#1031 merged the flavors into ONE hybrid runtime
+             APK: IN-PROCESS IS THE DEFAULT, and IPC is opted into per app via
+             manifest meta-data (or `setprop debug.dxr.force_ipc 1` for a
+             one-off). Getting this backwards mis-triaged a real user-facing
+             judder as dev-only for a day (displayxr-runtime#1196). -->
         <package android:name="org.freedesktop.monado.openxr_runtime.out_of_process" />
         <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
         <!-- IPC bind to the out-of-process runtime service. -->
