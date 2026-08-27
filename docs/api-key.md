@@ -32,6 +32,35 @@ never exposed, and the planned in-app key-entry flow.
   known-good ini from an earlier session. To re-exercise it, move that ini
   aside and launch with `GOOGLE_MAPS_API_KEY` unset.
 
+## Android (#46)
+
+Android has no shell env and no writable per-user config dir, so the desktop
+chain does not apply. Resolution order, first hit wins:
+
+1. **In-app dialog → `SharedPreferences`** (what users do). Validated against
+   Google before it is saved, like the macOS card and the Win32 dialog — a key
+   Google rejects is refused inline instead of producing an empty blue sphere.
+   If the device cannot *reach* Google the key is saved with a "not verified"
+   notice rather than blocked, so a correct key is still enterable offline.
+2. **`debug.dxr.ev.key`** — survives uninstall, cleared by reboot.
+3. **`persist.dxr.ev.key`** — survives uninstall **and** reboot.
+
+```bash
+adb shell setprop persist.dxr.ev.key <YOUR_KEY>   # reinstall- and reboot-proof
+```
+
+Why 2/3 exist: `SharedPreferences` is app-private and the OS wipes it on
+uninstall, so `install-android.sh --force-reinstall` (and any clean-install
+validation or automated E2E pass) loses the key every time. A plain
+`adb install -r` upgrade preserves it. The props let a device keep a key across
+wipes without re-entering a secret each pass.
+
+Entry note: the key field sets `IME_FLAG_NO_EXTRACT_UI`. Without it the IME
+opens a fullscreen extract view in landscape that covers the dialog's Save
+button with its own candidate strip — tapping there commits a suggestion and
+appends a character, storing a 40-char key that fails exactly like a missing
+one. Whitespace is stripped from pasted keys for the same reason.
+
 ## Key resolution order (never a baked-in default)
 
 1. `GOOGLE_MAPS_API_KEY` environment variable — dev override.

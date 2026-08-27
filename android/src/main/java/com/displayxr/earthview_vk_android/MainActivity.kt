@@ -42,6 +42,7 @@ import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -91,6 +92,10 @@ class MainActivity : NativeActivity() {
 
     // The user's Map Tiles API key (re-creates the tileset native-side).
     private external fun nativeSetApiKey(key: String)
+
+    // Validate a key against Google before saving it. "" = OK, else the reason.
+    // BLOCKING network call — never call on the main thread (#46).
+    private external fun nativeProbeApiKey(key: String): String
 
     // True once the tileset is streaming (false ⇒ keyless ⇒ show the dialog).
     private external fun nativeTilesActive(): Boolean
@@ -259,6 +264,13 @@ class MainActivity : NativeActivity() {
             val field = EditText(this).apply {
                 hint = "AIza…  (paste your Map Tiles API key)"
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                // NO_EXTRACT_UI: in landscape the IME otherwise opens a FULLSCREEN
+                // extract view that covers this dialog — including the Save button —
+                // and puts its own candidate strip where Save used to be. Tapping
+                // there commits a suggestion and appends a character, producing a
+                // 40-char key that fails exactly like a missing one (#46, observed).
+                imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_DONE
+                setSingleLine()
                 setText(current ?: "")
             }
             val container = LinearLayout(this).apply {
@@ -276,11 +288,10 @@ class MainActivity : NativeActivity() {
                 .setView(container)
                 .setCancelable(current != null)
                 .setPositiveButton("Save") { _, _ ->
-                    val key = field.text.toString().trim()
-                    if (key.isNotEmpty()) {
-                        prefs.edit().putString(PREF_API_KEY, key).apply()
-                        try { nativeSetApiKey(key) } catch (_: Throwable) {}
-                    }
+                    // Strip ALL whitespace, not just the ends: a pasted key can carry
+                    // a stray space from the clipboard or an IME candidate (#46).
+                    val key = field.text.toString().filterNot { it.isWhitespace() }
+                    if (key.isNotEmpty()) saveKeyValidated(key)
                 }
                 .setNeutralButton("Get a key") { _, _ ->
                     try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(KEY_HELP_URL))) } catch (_: Throwable) {}
@@ -290,6 +301,52 @@ class MainActivity : NativeActivity() {
                 .apply { if (current != null) setNegativeButton("Cancel", null) }
                 .show()
         } catch (_: Throwable) {}
+    }
+
+    // Validate against Google BEFORE persisting, like the macOS card and the Win32
+    // dialog do (#45/#46): Android used to save whatever was typed, so a wrong key
+    // produced an empty blue sphere with no error anywhere. The probe is a network
+    // call, so it runs off the main thread; on failure the dialog comes back with
+    // the text intact so the user can fix it rather than retype it.
+    private fun persistKey(key: String) {
+        prefs.edit().putString(PREF_API_KEY, key).apply()
+        try { nativeSetApiKey(key) } catch (_: Throwable) {}
+    }
+
+    private fun saveKeyValidated(key: String) {
+        Toast.makeText(this, "Checking key…", Toast.LENGTH_SHORT).show()
+        Thread {
+            val err = try {
+                nativeProbeApiKey(key)
+            } catch (_: Throwable) {
+                ""   // native not bound (or probe unavailable) — don't block the user
+            }
+            Handler(Looper.getMainLooper()).post {
+                if (isFinishing) return@post
+                when {
+                    // Validated, or the probe was unavailable — accept.
+                    err.isEmpty() -> {
+                        persistKey(key)
+                        Toast.makeText(this, "API key saved", Toast.LENGTH_SHORT).show()
+                    }
+                    // Couldn't REACH Google: keep the key. Blocking here would make
+                    // a correct key unenterable offline — worse than not validating.
+                    err.startsWith("NET:") -> {
+                        persistKey(key)
+                        Toast.makeText(
+                            this,
+                            "Saved, but not verified — " + err.removePrefix("NET:"),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                    // Google actively rejected it: don't persist a key that cannot work.
+                    else -> {
+                        Toast.makeText(this, err.removePrefix("BAD:"), Toast.LENGTH_LONG).show()
+                        showKeyDialog(key)
+                    }
+                }
+            }
+        }.start()
     }
 
     // ── Google attribution overlay (required by the Map Tiles ToS) ──────────
