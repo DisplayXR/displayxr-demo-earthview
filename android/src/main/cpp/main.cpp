@@ -436,13 +436,31 @@ seed_api_key()
 		if (!g_pending_key.empty()) {
 			setenv("GOOGLE_MAPS_API_KEY", g_pending_key.c_str(), 1);
 			LOGI("API key from app (len %zu)", g_pending_key.size());
+			// A key of the wrong shape fails EXACTLY like a missing one —
+			// no error, no tiles, empty blue sphere. Say so once (#46): a
+			// stray character from a landscape IME suggestion strip is the
+			// observed cause, and it cost a debugging session to spot.
+			if (g_pending_key.size() != 39 || g_pending_key.rfind("AIza", 0) != 0) {
+				LOGW("API key has an unexpected shape (len %zu, expected 39 and an "
+				     "\"AIza\" prefix) — if no tiles appear, long-press to re-enter it",
+				     g_pending_key.size());
+			}
 			return;
 		}
 	}
+	// (2) `debug.dxr.ev.key` — volatile, cleared by reboot.
+	// (3) `persist.dxr.ev.key` — survives BOTH uninstall and reboot, which is
+	//     what makes clean-install validation and automated E2E runs stop
+	//     re-entering a secret every pass (#46). SharedPreferences is
+	//     app-private and the OS wipes it on uninstall; Android has no
+	//     equivalent of the desktop env → app-support-ini chain.
 	char prop[PROP_VALUE_MAX] = {};
-	if (__system_property_get("debug.dxr.ev.key", prop) > 0 && prop[0]) {
-		setenv("GOOGLE_MAPS_API_KEY", prop, 1);
-		LOGI("API key seeded from debug.dxr.ev.key (len %zu)", strlen(prop));
+	for (const char *name : {"debug.dxr.ev.key", "persist.dxr.ev.key"}) {
+		if (__system_property_get(name, prop) > 0 && prop[0]) {
+			setenv("GOOGLE_MAPS_API_KEY", prop, 1);
+			LOGI("API key seeded from %s (len %zu)", name, strlen(prop));
+			return;
+		}
 	}
 }
 
@@ -1166,6 +1184,48 @@ Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeSetApiKey(
 	}
 	if (k) env->ReleaseStringUTFChars(key, k);
 	g_apply_key.store(true, std::memory_order_relaxed);
+}
+
+// Validate a pasted key against Google BEFORE Kotlin persists it, using the
+// same shared TileEngine::probeKey() that the macOS card and the Win32 dialog
+// gate their saves on (#45/#46 — Android was the one platform that saved
+// unvalidated). Returns "" on success, else a user-facing reason. BLOCKING
+// network call: Kotlin must call this off the main thread.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_displayxr_earthview_1vk_1android_MainActivity_nativeProbeApiKey(
+    JNIEnv *env, jobject, jstring key)
+{
+	std::string k;
+	if (key != nullptr) {
+		const char *c = env->GetStringUTFChars(key, nullptr);
+		if (c != nullptr) {
+			k = c;
+			env->ReleaseStringUTFChars(key, c);
+		}
+	}
+	// Result contract with Kotlin:
+	//   ""          -> validated OK, save it
+	//   "NET:<why>" -> could not REACH Google; save anyway and warn. Rejecting
+	//                  here would make a correct key unenterable on an offline
+	//                  device — the exact regression this validation could have
+	//                  introduced (found while testing on a phone with no
+	//                  network, #46).
+	//   "BAD:<why>" -> Google actively rejected it; refuse and re-prompt.
+	// probeKey() reports both cases as bool+string, so the transport cases are
+	// recognised by their message here rather than by changing the SHARED
+	// tiles_common signature, which macOS and Windows also compile.
+	std::string err, out;
+	if (k.empty()) {
+		out = "BAD:paste a key first";
+	} else if (g_tile_engine.probeKey(k, err)) {
+		out.clear();
+	} else {
+		const bool unreachable = err.find("Could not reach Google") != std::string::npos ||
+		                         err.rfind("Validation error:", 0) == 0;
+		out = (unreachable ? "NET:" : "BAD:") + err;
+	}
+	LOGI("probeApiKey: len %zu -> %s", k.size(), out.empty() ? "OK" : out.c_str());
+	return env->NewStringUTF(out.c_str());
 }
 
 // True once the tileset is streaming (Kotlin shows the key dialog if false).
