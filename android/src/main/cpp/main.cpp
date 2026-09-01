@@ -723,7 +723,19 @@ render_frame()
 	XrFrameState fs = {XR_TYPE_FRAME_STATE};
 	if (xrWaitFrame(g_session, &wi, &fs) != XR_SUCCESS) return false;
 	XrFrameBeginInfo bi = {XR_TYPE_FRAME_BEGIN_INFO};
-	if (xrBeginFrame(g_session, &bi) != XR_SUCCESS) return false;
+	/*
+	 * XR_FRAME_DISCARDED is a SUCCESS code (+9), not an error. Testing
+	 * `!= XR_SUCCESS` returned here WITHOUT calling xrEndFrame — and the
+	 * runtime clears its `frame_started` flag ONLY in xrEndFrame. So one
+	 * discarded frame latched the session permanently: every later
+	 * xrBeginFrame returned XR_FRAME_DISCARDED, this line skipped xrEndFrame
+	 * again, and the loop spun at ~375 calls/sec pegging a core with nothing
+	 * reaching the screen — a hard "app froze" with no crash and no error.
+	 *
+	 * XR_FAILED() tests result < 0, so a discard now falls through and we
+	 * still reach xrEndFrame, which is what lets the runtime recover.
+	 */
+	if (XR_FAILED(xrBeginFrame(g_session, &bi))) return false;
 
 	auto now = std::chrono::steady_clock::now();
 	float dt = std::chrono::duration<float>(now - g_last_t).count();
