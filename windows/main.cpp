@@ -557,29 +557,41 @@ static RECT g_savedWindowRect = {};
 static DWORD g_savedWindowStyle = 0;
 
 static void ToggleFullscreen(HWND hwnd) {
+    // F11 must never change whether this window is on screen. Under the
+    // DisplayXR workspace the runtime hides this HWND at xrCreateSession (its
+    // pixels reach the panel through the composed atlas); writing WS_VISIBLE
+    // here un-hid it and the z-order change then put it on top of the shell.
+    // Keep the WS_VISIBLE / WS_MINIMIZE bits exactly as they are, and only
+    // touch the z-order while the window is actually on screen.
+    const LONG cur = GetWindowLong(hwnd, GWL_STYLE);
+    const LONG keep = cur & (WS_VISIBLE | WS_MINIMIZE);
+    const bool onScreen = (cur & WS_VISIBLE) != 0 && (cur & WS_MINIMIZE) == 0;
+    HWND zOrder = onScreen ? HWND_TOP : nullptr;
+    UINT swpFlags = SWP_FRAMECHANGED | (onScreen ? 0u : SWP_NOZORDER);
     if (g_fullscreen) {
-        SetWindowLong(hwnd, GWL_STYLE, g_savedWindowStyle);
-        SetWindowPos(hwnd, HWND_TOP,
+        SetWindowLong(hwnd, GWL_STYLE,
+            (LONG)((g_savedWindowStyle & ~(DWORD)(WS_VISIBLE | WS_MINIMIZE)) | (DWORD)keep));
+        SetWindowPos(hwnd, zOrder,
             g_savedWindowRect.left, g_savedWindowRect.top,
             g_savedWindowRect.right - g_savedWindowRect.left,
             g_savedWindowRect.bottom - g_savedWindowRect.top,
-            SWP_FRAMECHANGED);
+            swpFlags);
         g_fullscreen = false;
         LOG_INFO("Exited fullscreen mode");
     } else {
-        g_savedWindowStyle = GetWindowLong(hwnd, GWL_STYLE);
+        g_savedWindowStyle = (DWORD)cur;
         GetWindowRect(hwnd, &g_savedWindowRect);
 
         HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi = { sizeof(mi) };
         GetMonitorInfo(hMonitor, &mi);
 
-        SetWindowLong(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-        SetWindowPos(hwnd, HWND_TOP,
+        SetWindowLong(hwnd, GWL_STYLE, (LONG)(WS_POPUP | (DWORD)keep));
+        SetWindowPos(hwnd, zOrder,
             mi.rcMonitor.left, mi.rcMonitor.top,
             mi.rcMonitor.right - mi.rcMonitor.left,
             mi.rcMonitor.bottom - mi.rcMonitor.top,
-            SWP_FRAMECHANGED);
+            swpFlags);
         g_fullscreen = true;
         LOG_INFO("Entered fullscreen mode");
     }
