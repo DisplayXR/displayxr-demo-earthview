@@ -79,10 +79,19 @@
             configChanges keeps the NativeActivity alive across rotations
             (the surface resizes instead of the activity recreating).
         -->
+        <!--
+            screenLayout + smallestScreenSize also change when the task goes
+            FREEFORM (recents "freeform" button); without them Android relaunches
+            the activity, and the relaunch runs xrDestroySession while the main
+            thread is blocked in NativeActivity.onDestroy — a vendor-SDK shutdown
+            hang (CNSDK <= 0.10.66, LeiaInc/CNSDK#730) then wedges the app for
+            good. Declaring them (+ resizeableActivity) makes the toggle a resize.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode"
+            android:resizeableActivity="true"
             android:screenOrientation="sensorLandscape"
             android:launchMode="singleTask">
             <meta-data
