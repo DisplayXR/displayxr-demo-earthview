@@ -113,6 +113,17 @@ env vars force a bookmark framing to reproduce a reported pose.
   `XR_DXR_view_rig` poses used directly, sRGB).
 - Tile selection runs ONCE per frame with a center-eye camera; both views draw
   the same selected set.
+- **ADOPT the runtime's active rendering mode; never force one at startup.**
+  `windows/main.cpp` reads `XrDisplayRenderingModeInfoDXR::isActive`
+  (`XR_DXR_display_info` v13, captured into `xr.currentModeIndex` by
+  `windows/xr_session.cpp`) and takes it, logging `Startup rendering mode: N (…)`.
+  It used to seed `absoluteRenderingModeRequested = 1` unconditionally, which
+  fired `xrRequestDisplayRenderingModeDXR(1)` on the first frame and OVERRODE the
+  panel — a display in Quad logged `Rendering mode changed 4 -> 1` and the 4-view
+  path never ran. Adoption is gated on the active mode being 3D (a panel commonly
+  reports 2D active at startup and stays there until asked for 3D; adopting that
+  would open this 3D demo in mono), falling back to mode 1 otherwise.
+  **The macOS and Linux legs still force mode 1** — same fix, not yet applied.
 - Doubles live in `geo_math` only; the frame loop sees per-tile `float[16]`.
 - Releases: `/dxr-release earthview vX.Y.Z` from the runtime hub repo (M4).
 - **Dev-build dependency rule (don't regress).** `scripts/build_windows.bat` +
