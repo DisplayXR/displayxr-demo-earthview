@@ -33,7 +33,8 @@ Pins in force:
 | Runtime commit | Headers |
 |---|---|
 | `220e9393511aab23c1ef2c6bb796d452f4fe3060`<br>220e93935 (2026-09-07) feat(android): XR_DXR_android_surface_binding v2 — mini-window layout hint (#1396) (#1398) | `XR_DXR_xlib_window_binding.h`, `XR_MNDX_ball_on_a_stick_controller.h`, `XR_MNDX_blubur_s1.h`, `XR_MNDX_hydra.h`, `XR_MNDX_oculus_remote.h`, `XR_MNDX_system_buttons.h`, `XR_MNDX_xdev_space.h`, `openxr.h`, `openxr_extension_helpers.h`, `openxr_loader_negotiation.h`, `openxr_platform.h`, `openxr_platform_defines.h`, `openxr_reflection.h`, `openxr_reflection_parent_structs.h`, `openxr_reflection_structs.h` |
-| `a71979a4d1385841a224eccd64ae973385300b1f`<br>a71979a4d (2026-07-12) feat(#734): fold planned XR_EXT_android_surface_binding → XR_DXR_ (docs/comments); post-rename-safe map regen | `XR_DXR_atlas_capture.h`, `XR_DXR_cocoa_window_binding.h`, `XR_DXR_display_info.h`, `XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h`, `XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h`, `XR_DXR_view_rig.h`, `XR_DXR_weave.h`, `XR_DXR_win32_window_binding.h`, `XR_DXR_workspace_file_dialog.h` |
+| `c1e4fe00da0f189122eca14e61e9faaa88e4b38e`<br>c1e4fe00d (2026-09-18) chore(cts): drop the by-name exclusion of xrLocateSpace_xrLocateViews — #1502 landed<br>(the commit the demo-opt-in brief pins for `XR_DXR_display_info` spec v19 + `dxr_view_config.h`) | `XR_DXR_display_info.h` |
+| `a71979a4d1385841a224eccd64ae973385300b1f`<br>a71979a4d (2026-07-12) feat(#734): fold planned XR_EXT_android_surface_binding → XR_DXR_ (docs/comments); post-rename-safe map regen | `XR_DXR_atlas_capture.h`, `XR_DXR_cocoa_window_binding.h`, `XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h`, `XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h`, `XR_DXR_view_rig.h`, `XR_DXR_weave.h`, `XR_DXR_win32_window_binding.h`, `XR_DXR_workspace_file_dialog.h` |
 
 ## Known drift vs runtime `main`
 
@@ -46,7 +47,6 @@ passes over the wire changed shape, so the app is correct as pinned.
 |---|---|
 | `XR_DXR_atlas_capture.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
 | `XR_DXR_cocoa_window_binding.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
-| `XR_DXR_display_info.h` | runtime main is spec v18: adds `XrDisplayDesktopInfoDXR` (panel desktop rect + device name, runtime#1301/#1317). Purely ADDITIVE — a NEW chained struct; `XrDisplayInfoDXR` itself is byte-identical. Nothing this app reads changed. |
 | `XR_DXR_display_zones.h` | runtime main is spec v3: adds `XrDisplayZoneFeatherDXR` (opt-in cosmetic edge feather, runtime#800) and `xrGetWorkspaceTileSizeDXR`. Additive; `XrDisplayZoneDXR` unchanged. |
 | `XR_DXR_local_3d_zone.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
 | `XR_DXR_macos_gl_binding.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
@@ -69,3 +69,16 @@ informational — only a pin *mismatch* fails CI).
    `FetchContent` OpenXR `GIT_TAG` if the core headers moved.
 
 Refreshed in the #61 pass: `XR_DXR_xlib_window_binding.h`.
+Refreshed in the PRIMARY_MULTIVIEW_DXR opt-in pass (runtime #1486 / #1500):
+`XR_DXR_display_info.h` (spec 1 → 19).
+
+## `dxr_view_config.h` — vendored, but NOT under this manifest
+
+`../openxr_includes/dxr_view_config.h` (one directory up, beside this file) is
+also vendored from the runtime, but from `test_apps/common/`, not from
+`src/external/openxr_includes/openxr/`. `VENDORED.json` maps a single source
+path, and `check_vendored_headers.py` requires a pin for **every** `*.h` in
+`openxr_includes/openxr/` — so putting it in the pinned directory would fail
+the check as an unpinnable header. It sits one level up instead (still on every
+leg's include path) and records its own provenance, and its one deliberate
+deviation from the runtime copy, in its file header.

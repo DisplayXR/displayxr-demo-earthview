@@ -32,6 +32,9 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_mcp_tools.h>
+// INV-3.1 / runtime #1486: DxrSelectViewConfigType() — the N-view opt-in.
+// Vendored at openxr_includes/dxr_view_config.h.
+#include <dxr_view_config.h>
 
 #include <cmath>
 #include <csignal>
@@ -1219,6 +1222,11 @@ struct AppXrSession {
     bool renderingModeDisplay3D[8] = {};
     uint32_t renderingModeTileColumns[8] = {};  // atlas tile layout (v12)
     uint32_t renderingModeTileRows[8] = {};
+    // Index of the 3D mode the runtime reports ACTIVE at session create, or -1.
+    // Only a 3D mode is a candidate: the display commonly reports its 2D mode
+    // active at startup (it stays 2D until something asks for 3D), and adopting
+    // that would open this 3D demo in mono.
+    int32_t activeRenderingMode = -1;
 
     // Max views the runtime may return from xrLocateViews, taken from
     // xrEnumerateViewConfigurationViews at session init. Some runtimes (e.g.
@@ -1319,6 +1327,18 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XrSystemGetInfo si = {XR_TYPE_SYSTEM_GET_INFO};
     si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &si, &xr.systemId));
+
+    // INV-3.1 / runtime #1486: pick the view configuration ONCE, here, before
+    // the first xrEnumerateViewConfigurationViews (CreateSwapchains), the
+    // xrBeginSession and every xrLocateViews — all three read xr.viewConfigType.
+    // This leg derives its per-frame eye count from the ACTIVE DXR rendering
+    // mode (renderingModeViewCounts[]), so it is an N-view app: conformant
+    // PRIMARY_STEREO reports exactly 2 and xrEndFrame rejects a projection
+    // layer with more, which is every frame in sim_display's 4-view Quad mode.
+    // The helper degrades to PRIMARY_STEREO on an older runtime, so calling it
+    // unconditionally is safe.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
 
     { XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
       xrGetSystemProperties(xr.instance, xr.systemId, &sp);
@@ -1580,11 +1600,15 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                     xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
                     xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
                     xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
-                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
+                    // Only a 3D mode is a candidate for the app's default —
+                    // see AppXrSession::activeRenderingMode.
+                    if (modes[i].isActive == XR_TRUE && modes[i].hardwareDisplay3D == XR_TRUE)
+                        xr.activeRenderingMode = (int32_t)i;
+                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d, active=%d)",
                         modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
                         modes[i].viewScaleX, modes[i].viewScaleY,
                         xr.renderingModeTileColumns[i], xr.renderingModeTileRows[i],
-                        modes[i].hardwareDisplay3D);
+                        modes[i].hardwareDisplay3D, modes[i].isActive == XR_TRUE);
                 }
             }
         }
@@ -2013,14 +2037,44 @@ int main() {
 
     LOG_INFO("=== DisplayXR 3D Model Viewer (Vulkan) + External macOS Window ===");
 
-    // Initialize rendering mode from env var (legacy fallback)
+    // Rendering mode explicitly pinned by the environment. -1 = not pinned,
+    // which is the normal case: the mode then comes from the runtime's ACTIVE
+    // mode after CreateSession (see the adoption below).
+    //
+    // THE RUNTIME READS THIS SAME VARIABLE (sim_display_hmd_create,
+    // sim_display_device.c) to pick the display's boot mode, so this map must
+    // speak the runtime's vocabulary or the app forces a different mode than
+    // the display booted in. It didn't, three ways:
+    //   "quad" and "2d"                 → fell through to the anaglyph default,
+    //                                     so NO value could ask for the 4-view
+    //                                     or the 1-view mode (the two view
+    //                                     counts that most need exercising, and
+    //                                     the two an agent cannot reach at all —
+    //                                     the V key needs a human).
+    //   "squeezed" / "squeezed_sbs"     → same fall-through: the display booted
+    //                                     Squeezed SBS and the app immediately
+    //                                     stomped it back to Anaglyph.
+    //   "passthrough"                   → the runtime's alias for 2d.
+    // sim_display's enumerated mode table is
+    // [0]=2D [1]=Anaglyph [2]=Cropped SBS [3]=Squeezed SBS [4]=Quad.
+    int32_t envPinnedMode = -1;
     {
         const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
         if (mode_str) {
-            if (strcmp(mode_str, "anaglyph") == 0) g_input.currentRenderingMode = 1;
-            else if (strcmp(mode_str, "sbs") == 0) g_input.currentRenderingMode = 2;
-            else if (strcmp(mode_str, "blend") == 0) g_input.currentRenderingMode = 3;
-            else g_input.currentRenderingMode = 1; // default to anaglyph
+            if (strcmp(mode_str, "2d") == 0 ||
+                strcmp(mode_str, "passthrough") == 0) envPinnedMode = 0;
+            else if (strcmp(mode_str, "anaglyph") == 0) envPinnedMode = 1;
+            else if (strcmp(mode_str, "sbs") == 0) envPinnedMode = 2;
+            else if (strcmp(mode_str, "squeezed") == 0 ||
+                     strcmp(mode_str, "squeezed_sbs") == 0) envPinnedMode = 3;
+            else if (strcmp(mode_str, "quad") == 0) envPinnedMode = 4;
+            // "blend" is a sim_display DP pipeline, not an enumerated rendering
+            // mode — with it set, the runtime reports mode 0 (2D) active. Left
+            // on 3 (a 2-view mode, which the blend shader needs) as it has
+            // always been; there is no index that names it.
+            else if (strcmp(mode_str, "blend") == 0) envPinnedMode = 3;
+            else envPinnedMode = 1; // unrecognised → the first 3D mode
+            g_input.currentRenderingMode = (uint32_t)envPinnedMode;
         }
     }
 
@@ -2097,6 +2151,40 @@ int main() {
         vkDestroyDevice(vkDevice, nullptr); vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr); return 1; }
 
+    // Adopt the display's ACTIVE rendering mode rather than assuming one, so a
+    // display that boots in 4-view Quad renders a 4-tile atlas instead of being
+    // forced down to 2 (which is what hardcoding mode 1 here did — the log read
+    // "Rendering mode changed 4 -> 1" on every launch, and neither Quad nor 2D
+    // was reachable from the environment at all).
+    //
+    // Precedence: an explicit SIM_DISPLAY_OUTPUT pin wins — it is the agent's
+    // only way to select a mode, so adoption must not silently override it.
+    // Otherwise take the runtime's active 3D mode; it is gated on being 3D
+    // because a display commonly reports its 2D mode active at startup and
+    // adopting that would open this 3D demo in mono. When nothing 3D is active
+    // and nothing is pinned, the old default (mode 1, the first 3D mode)
+    // stands. Later changes still arrive via XrEventDataRenderingModeChangedDXR.
+    if (envPinnedMode >= 0) {
+        if (xr.renderingModeCount > 0 && (uint32_t)envPinnedMode >= xr.renderingModeCount) {
+            LOG_WARN("SIM_DISPLAY_OUTPUT selects mode %d but the display has only %u mode(s) "
+                     "— falling back to mode 0",
+                     envPinnedMode, xr.renderingModeCount);
+            g_input.currentRenderingMode = 0;
+        } else {
+            g_input.currentRenderingMode = (uint32_t)envPinnedMode;
+        }
+    } else if (xr.activeRenderingMode >= 0) {
+        g_input.currentRenderingMode = (uint32_t)xr.activeRenderingMode;
+    }
+    // The startup request below re-asserts whatever we settled on. Keep
+    // g_msLastMode in step so it fires directly instead of running the
+    // mode-switch IPD ramp on frame one.
+    g_msLastMode = g_input.currentRenderingMode;
+    LOG_INFO("Startup rendering mode: %u (%s)", g_input.currentRenderingMode,
+             envPinnedMode >= 0 ? "SIM_DISPLAY_OUTPUT"
+                                : (xr.activeRenderingMode >= 0 ? "adopted from runtime"
+                                                               : "app default"));
+
     // Model-load paths can now flip the agent animation-tool registration
     // (XR_DXR_mcp_tools late registration, #22). Set before the bundled-scene
     // auto-load below so it too funnels through UpdateMcpAnimationTools.
@@ -2140,11 +2228,12 @@ int main() {
     g_input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
     g_input.nominalViewerZ = xr.nominalViewerZ;
     g_input.renderingModeCount = xr.renderingModeCount;
-    // Align the runtime's active rendering mode with the app's default
-    // (currentRenderingMode = 1, the first 3D mode) at startup. The sim display
-    // boots in 2D (mode 0); without this the display stays 2D until the user
-    // toggles. The main-loop dispatch holds this request until the session is
-    // running, so it isn't issued to a not-yet-begun session and lost.
+    // Re-assert the startup mode settled on above (env pin > runtime's active
+    // 3D mode > app default). Without this a display that boots in 2D stays 2D
+    // until the user toggles; with it, adopting the runtime's own active mode
+    // is a no-op rather than a downgrade. The main-loop dispatch holds this
+    // request until the session is running, so it isn't issued to a
+    // not-yet-begun session and lost.
     g_input.renderingModeChangeRequested = true;
     g_input.lastInputTimeSec = NowSec();
 
@@ -2427,7 +2516,22 @@ int main() {
                         uint32_t modeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
                             ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
                         if (modeViewCount < 1) modeViewCount = 1;
-                        if (modeViewCount > runtimeViewCount) modeViewCount = runtimeViewCount;
+                        // INV-3.1 clamp #1: never claim more views than
+                        // xrLocateViews actually WROTE. Pre-existing; now it
+                        // says so once instead of clamping silently.
+                        if (modeViewCount > runtimeViewCount) {
+                            static bool warnedViewClamp = false;
+                            if (!warnedViewClamp) {
+                                warnedViewClamp = true;
+                                LOG_WARN("View-count clamp: mode advertises %u view(s), "
+                                         "xrLocateViews returned %u under %s — submitting %u "
+                                         "(logged once)",
+                                         modeViewCount, runtimeViewCount,
+                                         DxrViewConfigTypeName(xr.viewConfigType),
+                                         runtimeViewCount);
+                            }
+                            modeViewCount = runtimeViewCount;
+                        }
                         bool display3D = (xr.renderingModeCount > 0)
                             ? xr.renderingModeDisplay3D[g_input.currentRenderingMode] : true;
                         bool monoMode = !display3D;
@@ -2438,6 +2542,31 @@ int main() {
                             ? xr.renderingModeTileRows[g_input.currentRenderingMode]
                             : 1u;
 
+                        // INV-3.1 clamp #2: the swapchain's slice count. This
+                        // leg uses ONE tiled swapchain image (imageArrayIndex is
+                        // always 0), so a slice is an atlas tile and the
+                        // capacity is tileColumns × tileRows. More views than
+                        // tiles would wrap eye N onto tile 0.
+                        {
+                            uint32_t tileCapacity = tileColumns * tileRows;
+                            if (tileCapacity < 1) tileCapacity = 1;
+                            if (modeViewCount > tileCapacity) {
+                                static bool warnedTileClamp = false;
+                                if (!warnedTileClamp) {
+                                    warnedTileClamp = true;
+                                    LOG_WARN("View-count clamp: mode advertises %u view(s) but its "
+                                             "atlas is %ux%u = %u tile(s) — submitting %u "
+                                             "(logged once)",
+                                             modeViewCount, tileColumns, tileRows,
+                                             tileCapacity, tileCapacity);
+                                }
+                                modeViewCount = tileCapacity;
+                            }
+                        }
+
+                        // INV-3.1: eyeCount is what gets FILLED and therefore
+                        // what xrEndFrame is told (projectionViews is assigned
+                        // eyeCount entries and submitted by .size()).
                         int eyeCount = monoMode ? 1 : (int)modeViewCount;
 
                         // HUD eye readout. Under the rig, views[] carries render-ready

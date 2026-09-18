@@ -129,6 +129,25 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     XR_CHECK_LOG(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
     LOG_INFO("System ID: %llu", (unsigned long long)xr.systemId);
 
+    // INV-3.1 / runtime #1486: pick the view configuration BEFORE the first
+    // xrEnumerateViewConfigurationViews below. EarthView derives its per-frame
+    // view count from the ACTIVE DXR rendering mode (see main.cpp's
+    // renderingModeViewCounts[]), so it is an N-view app: under the now-
+    // conformant PRIMARY_STEREO the runtime reports exactly 2 views and
+    // xrEndFrame REJECTS a projection layer carrying more — which is every
+    // frame in sim_display's 4-view Quad mode. DxrSelectViewConfigType()
+    // enumerates once and returns PRIMARY_MULTIVIEW_DXR when the runtime
+    // advertises it (needs XR_DXR_display_info enabled on the instance, which
+    // it is above), degrading to PRIMARY_STEREO on an older runtime.
+    //
+    // displayxr::common's XrSessionManager threads xr.viewConfigType through
+    // xrEnumerateViewConfigurationViews, XrSessionBeginInfo::
+    // primaryViewConfigurationType and XrViewLocateInfo::viewConfigurationType,
+    // and main.cpp's own locate uses the same field — so this ONE assignment is
+    // the whole opt-in for the Windows leg.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
+
     // Get system name
     {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};

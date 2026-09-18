@@ -58,6 +58,22 @@
 
 namespace {
 
+// DXR_STEREO_FIXED_APP — INV-3.1 / runtime #1486, a DELIBERATE non-opt-in.
+//
+// This leg is stereo-fixed by construction: kViewCount == 2 sizes the atlas
+// (g_atlas_w = tile_w * 2), the XrView / XrCompositionLayerProjectionView
+// arrays, the per-eye matrices and every eye loop. It never reads the active
+// rendering mode's view count, so nothing here can ask for more than 2 views —
+// and the new conformant PRIMARY_STEREO contract *guarantees* exactly 2, which
+// makes create_swapchains()'s `vc != kViewCount` startup check pass by
+// construction rather than by luck (it used to be the union across modes).
+//
+// So it must NOT call DxrSelectViewConfigType(): under PRIMARY_MULTIVIEW_DXR
+// xrEnumerateViewConfigurationViews reports the DEVICE MAX, so on any device
+// with a >2-view mode that same startup check would fail and the app would
+// refuse to start — a regression bought for no capability, since making this
+// leg N-view means re-laying out the atlas, not switching an enum. The other
+// three legs (windows/macos/linux) are mode-driven and DO opt in.
 constexpr uint32_t kViewCount = 2;
 constexpr float kCameraVFovRad = 0.6498f;  // ~37.2° full vertical FOV
 // Physical (orthoscopic) cam-rig vFOV: the angle the display subtends from the
