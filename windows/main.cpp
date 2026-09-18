@@ -1429,6 +1429,13 @@ static void RenderThreadFunc(
                 // Active mode's view count drives how many slots are actually filled and submitted.
                 XrCompositionLayerProjectionView projectionViews[8] = {};
                 bool rendered = false;
+                // INV-3.1: how many projectionViews[] entries were actually
+                // FILLED this frame. This — not the active mode's advertised
+                // view count — is what xrEndFrame may be told about: the two
+                // disagree whenever xrLocateViews wrote fewer views than the
+                // mode wants (and in mono, where only slot 0 is filled).
+                // Submitting an unfilled slot is a zero-pose/zero-fov view.
+                uint32_t filledViewCount = 0;
                 bool hudSubmitted = false;
                 bool loadBtnSubmitted = false;
 
@@ -1635,7 +1642,26 @@ static void RenderThreadFunc(
                             ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2u;
                         if (activeViewCount == 0) activeViewCount = 1u;
                         if (activeViewCount > 8) activeViewCount = 8u;
-                        const int eyeCount = monoMode ? 1 : (int)activeViewCount;
+                        // INV-3.1: clamp to what xrLocateViews actually WROTE.
+                        // Under PRIMARY_MULTIVIEW_DXR the located count is the
+                        // device max, so it normally covers every mode — but if
+                        // the two ever disagree (older runtime that degraded us
+                        // to PRIMARY_STEREO, a mode advertised wider than the
+                        // view configuration), rendering past viewCount would
+                        // read uninitialised XrViews and submit them. Clamp and
+                        // say so ONCE; never silently drop to zero.
+                        if (viewCount > 0 && activeViewCount > viewCount) {
+                            static bool warnedViewClamp = false;
+                            if (!warnedViewClamp) {
+                                warnedViewClamp = true;
+                                LOG_WARN("View-count clamp: mode advertises %u view(s), "
+                                    "xrLocateViews returned %u under %s — submitting %u "
+                                    "(logged once)",
+                                    activeViewCount, viewCount,
+                                    DxrViewConfigTypeName(xr->viewConfigType), viewCount);
+                            }
+                            activeViewCount = viewCount;
+                        }
 
                         // Per-view extent driven entirely by the current rendering
                         // mode's view_scale and the live window size. Atlas dims
@@ -1663,6 +1689,27 @@ static void RenderThreadFunc(
                         uint32_t renderH = (uint32_t)((double)windowH * scaleY);
                         if (renderW == 0) renderW = 1;
                         if (renderH == 0) renderH = 1;
+
+                        // INV-3.1, third clamp term: the swapchain's SLICE count
+                        // for this mode. This leg uses ONE tiled swapchain image
+                        // (imageArrayIndex is always 0, see the projectionViews
+                        // fill below), so a "slice" is an atlas tile and the
+                        // capacity is cols × rows. Rendering more views than
+                        // there are tiles would wrap eye N onto tile 0 and weave
+                        // two eyes into one tile.
+                        uint32_t tileCapacity = cols * rows;
+                        if (tileCapacity == 0) tileCapacity = 1u;
+                        if (activeViewCount > tileCapacity) {
+                            static bool warnedTileClamp = false;
+                            if (!warnedTileClamp) {
+                                warnedTileClamp = true;
+                                LOG_WARN("View-count clamp: mode advertises %u view(s) but its "
+                                    "atlas is %ux%u = %u tile(s) — submitting %u (logged once)",
+                                    activeViewCount, cols, rows, tileCapacity, tileCapacity);
+                            }
+                            activeViewCount = tileCapacity;
+                        }
+                        const int eyeCount = monoMode ? 1 : (int)activeViewCount;
 
                         // --- Consume the runtime's render-ready XrView{pose, fov} (#396 W7) ---
                         // The runtime owns the off-axis Kooima (window resolve included —
@@ -2134,6 +2181,8 @@ static void RenderThreadFunc(
                                     projectionViews[eye].fov = monoMode ? rawViews[0].fov : rawViews[eye].fov;
                                 }
                             }
+                            // INV-3.1: this is the count xrEndFrame gets.
+                            filledViewCount = (uint32_t)eyeCount;
                             ReleaseSwapchainImage(*xr);
                         } else {
                             rendered = false;
@@ -2453,8 +2502,14 @@ static void RenderThreadFunc(
                     }
                 }
 
-                // Submit frame
-                uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
+                // Submit frame.
+                // INV-3.1 (#1486): submit the number of views we FILLED, which
+                // is min(active mode's viewCount, xrLocateViews' output, the
+                // mode's atlas tile capacity) — all three clamps applied above,
+                // each logged once. Re-deriving this from the mode here (what
+                // this line used to do) is exactly how an app ends up telling
+                // xrEndFrame "4 views" on a frame it located 2 for.
+                uint32_t submitViewCount = filledViewCount;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
                 if (rendered) {

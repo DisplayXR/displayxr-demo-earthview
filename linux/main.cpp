@@ -56,6 +56,9 @@ static const Atom kXAtomNone = None;
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_xlib_window_binding.h>
+// INV-3.1 / runtime #1486: DxrSelectViewConfigType() — the N-view opt-in.
+// Vendored at openxr_includes/dxr_view_config.h.
+#include <dxr_view_config.h>
 
 #include "projection_depth.h"
 
@@ -258,6 +261,17 @@ InitializeOpenXR(AppXrSession &xr)
 	XrSystemGetInfo si = {XR_TYPE_SYSTEM_GET_INFO};
 	si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
 	XR_CHECK(xrGetSystem(xr.instance, &si, &xr.systemId));
+
+	// INV-3.1 / runtime #1486: pick the view configuration ONCE, here, before
+	// the first xrEnumerateViewConfigurationViews (CreateSwapchains), the
+	// xrBeginSession and every xrLocateViews — all three read xr.viewConfigType.
+	// This leg derives its per-frame eye count from the ACTIVE DXR rendering
+	// mode (renderingModeViewCounts[]), so it is an N-view app: conformant
+	// PRIMARY_STEREO reports exactly 2 and xrEndFrame rejects a projection
+	// layer with more, which is every frame in sim_display's 4-view Quad mode.
+	// Degrades to PRIMARY_STEREO on an older runtime, so it is unconditional.
+	xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+	LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
 
 	{
 		XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
@@ -1085,18 +1099,63 @@ main()
 				                               : 2u;
 				if (activeViewCount == 0)
 					activeViewCount = 1;
-				if (activeViewCount > viewCount)
+				// INV-3.1 clamp #1: never claim more views than
+				// xrLocateViews actually WROTE. Pre-existing; it now
+				// says so once instead of clamping silently.
+				if (activeViewCount > viewCount) {
+					static bool warnedViewClamp = false;
+					if (!warnedViewClamp) {
+						warnedViewClamp = true;
+						LOG_WARN("View-count clamp: mode advertises %u view(s), "
+						         "xrLocateViews returned %u under %s — submitting "
+						         "%u (logged once)",
+						         activeViewCount, viewCount,
+						         DxrViewConfigTypeName(xr.viewConfigType),
+						         viewCount);
+					}
 					activeViewCount = viewCount;
-				const uint32_t eyeCount = monoMode ? 1 : activeViewCount;
+				}
 				float scaleX = 1.0f, scaleY = 1.0f;
 				uint32_t cols = monoMode ? 1u : 2u;
+				uint32_t rows = 1u;
 				if (xr.renderingModeCount > 0) {
 					scaleX = xr.renderingModeScaleX[mode];
 					scaleY = xr.renderingModeScaleY[mode];
 					cols = xr.renderingModeTileColumns[mode];
 					if (cols == 0)
 						cols = 1;
+					rows = xr.renderingModeTileRows[mode];
+					if (rows == 0)
+						rows = 1;
 				}
+				// INV-3.1 clamp #2: the swapchain's slice count. This leg
+				// uses ONE tiled swapchain image (imageArrayIndex is always
+				// 0), so a slice is an atlas tile and the capacity is
+				// cols × rows. More views than tiles would wrap eye N onto
+				// tile 0. NOTE this leg's tile offset is 1-D (column only,
+				// see the projectionViews fill below), so a >1-row mode is
+				// clamped to its first row here rather than mis-tiled.
+				{
+					uint32_t tileCapacity = cols * rows;
+					if (tileCapacity < 1)
+						tileCapacity = 1;
+					if (activeViewCount > tileCapacity) {
+						static bool warnedTileClamp = false;
+						if (!warnedTileClamp) {
+							warnedTileClamp = true;
+							LOG_WARN("View-count clamp: mode advertises %u view(s) but its "
+							         "atlas is %ux%u = %u tile(s) — submitting %u "
+							         "(logged once)",
+							         activeViewCount, cols, rows, tileCapacity,
+							         tileCapacity);
+						}
+						activeViewCount = tileCapacity;
+					}
+				}
+				// INV-3.1: eyeCount is what gets FILLED and therefore what
+				// xrEndFrame is told (projectionViews is assigned eyeCount
+				// entries and submitted by .size()).
+				const uint32_t eyeCount = monoMode ? 1 : activeViewCount;
 				uint32_t renderW = (uint32_t)((double)g_windowW * scaleX);
 				uint32_t renderH = (uint32_t)((double)g_windowH * scaleY);
 				if (renderW == 0)

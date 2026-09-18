@@ -32,6 +32,9 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_mcp_tools.h>
+// INV-3.1 / runtime #1486: DxrSelectViewConfigType() — the N-view opt-in.
+// Vendored at openxr_includes/dxr_view_config.h.
+#include <dxr_view_config.h>
 
 #include <cmath>
 #include <csignal>
@@ -1320,6 +1323,18 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &si, &xr.systemId));
 
+    // INV-3.1 / runtime #1486: pick the view configuration ONCE, here, before
+    // the first xrEnumerateViewConfigurationViews (CreateSwapchains), the
+    // xrBeginSession and every xrLocateViews — all three read xr.viewConfigType.
+    // This leg derives its per-frame eye count from the ACTIVE DXR rendering
+    // mode (renderingModeViewCounts[]), so it is an N-view app: conformant
+    // PRIMARY_STEREO reports exactly 2 and xrEndFrame rejects a projection
+    // layer with more, which is every frame in sim_display's 4-view Quad mode.
+    // The helper degrades to PRIMARY_STEREO on an older runtime, so calling it
+    // unconditionally is safe.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
+
     { XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
       xrGetSystemProperties(xr.instance, xr.systemId, &sp);
       memcpy(xr.systemName, sp.systemName, sizeof(xr.systemName)); }
@@ -2427,7 +2442,22 @@ int main() {
                         uint32_t modeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
                             ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
                         if (modeViewCount < 1) modeViewCount = 1;
-                        if (modeViewCount > runtimeViewCount) modeViewCount = runtimeViewCount;
+                        // INV-3.1 clamp #1: never claim more views than
+                        // xrLocateViews actually WROTE. Pre-existing; now it
+                        // says so once instead of clamping silently.
+                        if (modeViewCount > runtimeViewCount) {
+                            static bool warnedViewClamp = false;
+                            if (!warnedViewClamp) {
+                                warnedViewClamp = true;
+                                LOG_WARN("View-count clamp: mode advertises %u view(s), "
+                                         "xrLocateViews returned %u under %s — submitting %u "
+                                         "(logged once)",
+                                         modeViewCount, runtimeViewCount,
+                                         DxrViewConfigTypeName(xr.viewConfigType),
+                                         runtimeViewCount);
+                            }
+                            modeViewCount = runtimeViewCount;
+                        }
                         bool display3D = (xr.renderingModeCount > 0)
                             ? xr.renderingModeDisplay3D[g_input.currentRenderingMode] : true;
                         bool monoMode = !display3D;
@@ -2438,6 +2468,31 @@ int main() {
                             ? xr.renderingModeTileRows[g_input.currentRenderingMode]
                             : 1u;
 
+                        // INV-3.1 clamp #2: the swapchain's slice count. This
+                        // leg uses ONE tiled swapchain image (imageArrayIndex is
+                        // always 0), so a slice is an atlas tile and the
+                        // capacity is tileColumns × tileRows. More views than
+                        // tiles would wrap eye N onto tile 0.
+                        {
+                            uint32_t tileCapacity = tileColumns * tileRows;
+                            if (tileCapacity < 1) tileCapacity = 1;
+                            if (modeViewCount > tileCapacity) {
+                                static bool warnedTileClamp = false;
+                                if (!warnedTileClamp) {
+                                    warnedTileClamp = true;
+                                    LOG_WARN("View-count clamp: mode advertises %u view(s) but its "
+                                             "atlas is %ux%u = %u tile(s) — submitting %u "
+                                             "(logged once)",
+                                             modeViewCount, tileColumns, tileRows,
+                                             tileCapacity, tileCapacity);
+                                }
+                                modeViewCount = tileCapacity;
+                            }
+                        }
+
+                        // INV-3.1: eyeCount is what gets FILLED and therefore
+                        // what xrEndFrame is told (projectionViews is assigned
+                        // eyeCount entries and submitted by .size()).
                         int eyeCount = monoMode ? 1 : (int)modeViewCount;
 
                         // HUD eye readout. Under the rig, views[] carries render-ready
