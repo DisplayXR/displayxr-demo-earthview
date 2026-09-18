@@ -1132,9 +1132,8 @@ main()
 				// uses ONE tiled swapchain image (imageArrayIndex is always
 				// 0), so a slice is an atlas tile and the capacity is
 				// cols × rows. More views than tiles would wrap eye N onto
-				// tile 0. NOTE this leg's tile offset is 1-D (column only,
-				// see the projectionViews fill below), so a >1-row mode is
-				// clamped to its first row here rather than mis-tiled.
+				// tile 0 (the fill below places tile e at
+				// e % cols, e / cols).
 				{
 					uint32_t tileCapacity = cols * rows;
 					if (tileCapacity < 1)
