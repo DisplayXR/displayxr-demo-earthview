@@ -58,7 +58,7 @@ static const Atom kXAtomNone = None;
 #include <openxr/XR_DXR_xlib_window_binding.h>
 // INV-3.1 / runtime #1486: DxrSelectViewConfigType() — the N-view opt-in.
 // Vendored at openxr_includes/dxr_view_config.h.
-#include <dxr_view_config.h>
+#include "../openxr_includes/dxr_view_config.h"
 
 #include "projection_depth.h"
 

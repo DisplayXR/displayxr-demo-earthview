@@ -16,7 +16,10 @@
 // INV-3.1 / runtime #1486: DxrSelectViewConfigType() — the N-view opt-in.
 // Vendored at openxr_includes/dxr_view_config.h (see its header for why it is
 // not under openxr_includes/openxr/).
-#include <dxr_view_config.h>
+// Explicit relative path on purpose: displayxr-common v2.14.0 ships an
+// identical dxr_view_config.h via displayxr::rules, so a bare include is
+// ambiguous once displayxr::common is on the include path.
+#include "../openxr_includes/dxr_view_config.h"
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
 // returns render-ready XrView{pose, fov}; the app deletes its own. App-owned
