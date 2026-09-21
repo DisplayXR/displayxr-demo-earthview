@@ -57,8 +57,10 @@ static const Atom kXAtomNone = None;
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_xlib_window_binding.h>
 // INV-3.1 / runtime #1486: DxrSelectViewConfigType() — the N-view opt-in.
-// Vendored at openxr_includes/dxr_view_config.h.
-#include "../openxr_includes/dxr_view_config.h"
+// ADR-041 / runtime #1612: DxrAliasInactiveViews() — the layer carries EVERY
+// located view. Both come from displayxr-common's dxr_view_config.h (via
+// displayxr::rules) — the one shared implementation.
+#include "dxr_view_config.h"
 
 #include "projection_depth.h"
 
@@ -1245,9 +1247,9 @@ main()
 						activeViewCount = tileCapacity;
 					}
 				}
-				// INV-3.1: eyeCount is what gets FILLED and therefore what
-				// xrEndFrame is told (projectionViews is assigned eyeCount
-				// entries and submitted by .size()).
+				// INV-3.1: eyeCount is what gets RENDERED. ADR-041: xrEndFrame
+				// is told every LOCATED view (viewCount) — the tail past
+				// eyeCount is aliased onto view 0 after the fill below.
 				const uint32_t eyeCount = monoMode ? 1 : activeViewCount;
 				uint32_t renderW = (uint32_t)((double)g_windowW * scaleX);
 				uint32_t renderH = (uint32_t)((double)g_windowH * scaleY);
@@ -1354,8 +1356,17 @@ main()
 					VkImage targetImage = swapchainImages[imageIndex].image;
 					VkFormat swapFormat = (VkFormat)xr.swapchain.format;
 
+					// ADR-041 / runtime #1612: the layer carries EVERY
+					// located view; only [0, eyeCount) are rendered. Under
+					// PRIMARY_MULTIVIEW_DXR xrEndFrame rejects a shorter
+					// layer, so a 1-view (2D) frame submitted as 1 view was
+					// dropped and the panel kept its last woven 3D frame.
+					// eyeCount <= viewCount (clamped above), so this is the
+					// located count.
+					const uint32_t located =
+					    viewCount > (uint32_t)eyeCount ? viewCount : (uint32_t)eyeCount;
 					projectionViews.assign(
-					    (size_t)eyeCount,
+					    (size_t)located,
 					    {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 					for (uint32_t e = 0; e < eyeCount; e++) {
 						uint32_t tileX = e % cols;
@@ -1380,6 +1391,8 @@ main()
 						projectionViews[e].pose = eyes[e].src.pose;
 						projectionViews[e].fov = eyes[e].src.fov;
 					}
+					DxrAliasInactiveViews(projectionViews.data(), xrViews.data(),
+					                      located, eyeCount);
 
 					XrSwapchainImageReleaseInfo ri = {
 					    XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};

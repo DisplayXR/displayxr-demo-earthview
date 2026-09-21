@@ -1429,12 +1429,13 @@ static void RenderThreadFunc(
                 // Active mode's view count drives how many slots are actually filled and submitted.
                 XrCompositionLayerProjectionView projectionViews[8] = {};
                 bool rendered = false;
-                // INV-3.1: how many projectionViews[] entries were actually
-                // FILLED this frame. This — not the active mode's advertised
-                // view count — is what xrEndFrame may be told about: the two
-                // disagree whenever xrLocateViews wrote fewer views than the
-                // mode wants (and in mono, where only slot 0 is filled).
-                // Submitting an unfilled slot is a zero-pose/zero-fov view.
+                // INV-3.1 + ADR-041: how many projectionViews[] entries were
+                // FILLED this frame — every LOCATED view. Only the active
+                // mode's views are rendered; the tail is aliased onto view 0
+                // (DxrAliasInactiveViews) so the layer carries the full
+                // located count, which PRIMARY_MULTIVIEW_DXR requires (a
+                // shorter layer is rejected — runtime #1612). Never an
+                // unfilled (zero-pose/zero-fov) slot.
                 uint32_t filledViewCount = 0;
                 bool hudSubmitted = false;
                 bool loadBtnSubmitted = false;
@@ -1612,7 +1613,8 @@ static void RenderThreadFunc(
                         uint32_t viewCount = 8;
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
-                        xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+                        const XrResult locateResult =
+                            xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
                         // HUD eye readout. Under the rig, rawViews[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel
@@ -2181,8 +2183,27 @@ static void RenderThreadFunc(
                                     projectionViews[eye].fov = monoMode ? rawViews[0].fov : rawViews[eye].fov;
                                 }
                             }
+                            // ADR-041 / runtime #1612: the layer carries EVERY
+                            // located view; only [0, eyeCount) were rendered.
+                            // Under PRIMARY_MULTIVIEW_DXR xrEndFrame rejects a
+                            // shorter layer, so a 1-view (2D) frame submitted as
+                            // 1 view was dropped and the panel kept its last
+                            // woven 3D frame (a frozen double image). Alias the
+                            // inactive tail onto view 0's subimage; each keeps
+                            // its own located pose/fov. eyeCount <= viewCount
+                            // whenever xrLocateViews wrote anything (clamped
+                            // above); both are <= 8 = projectionViews[] size.
+                            // A failed locate wrote no views: alias nothing (the
+                            // no-op DxrAliasInactiveViews guarantees for
+                            // located <= active) rather than stamp unlocated
+                            // zero poses into the layer.
+                            const uint32_t locatedViewCount = XR_FAILED(locateResult) ? 0u
+                                : ((viewCount > 8u) ? 8u : viewCount);
+                            DxrAliasInactiveViews(projectionViews, rawViews, locatedViewCount,
+                                                  (uint32_t)eyeCount);
                             // INV-3.1: this is the count xrEndFrame gets.
-                            filledViewCount = (uint32_t)eyeCount;
+                            filledViewCount = (locatedViewCount > (uint32_t)eyeCount)
+                                                  ? locatedViewCount : (uint32_t)eyeCount;
                             ReleaseSwapchainImage(*xr);
                         } else {
                             rendered = false;
@@ -2503,12 +2524,12 @@ static void RenderThreadFunc(
                 }
 
                 // Submit frame.
-                // INV-3.1 (#1486): submit the number of views we FILLED, which
-                // is min(active mode's viewCount, xrLocateViews' output, the
-                // mode's atlas tile capacity) — all three clamps applied above,
-                // each logged once. Re-deriving this from the mode here (what
-                // this line used to do) is exactly how an app ends up telling
-                // xrEndFrame "4 views" on a frame it located 2 for.
+                // INV-3.1 (#1486) + ADR-041 (#1612): submit the number of views
+                // we FILLED — every located view (the rendered ones plus the
+                // aliased inactive tail). Re-deriving this from the mode here
+                // is exactly how an app ends up telling xrEndFrame "4 views"
+                // on a frame it located 2 for, or "1 view" on a 2D frame the
+                // runtime then rejects.
                 uint32_t submitViewCount = filledViewCount;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing

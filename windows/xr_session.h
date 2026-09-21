@@ -14,12 +14,11 @@
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_mcp_tools.h>
 // INV-3.1 / runtime #1486: DxrSelectViewConfigType() — the N-view opt-in.
-// Vendored at openxr_includes/dxr_view_config.h (see its header for why it is
-// not under openxr_includes/openxr/).
-// Explicit relative path on purpose: displayxr-common v2.14.0 ships an
-// identical dxr_view_config.h via displayxr::rules, so a bare include is
-// ambiguous once displayxr::common is on the include path.
-#include "../openxr_includes/dxr_view_config.h"
+// ADR-041 / runtime #1612: DxrAliasInactiveViews() — the layer carries EVERY
+// located view. Both come from displayxr-common's dxr_view_config.h (via
+// displayxr::rules); the demo-local copy is gone, so the bare include is
+// unambiguous — the one shared implementation.
+#include "dxr_view_config.h"
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima and
 // returns render-ready XrView{pose, fov}; the app deletes its own. App-owned
