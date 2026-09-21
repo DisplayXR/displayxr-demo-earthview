@@ -72,13 +72,10 @@ Refreshed in the #61 pass: `XR_DXR_xlib_window_binding.h`.
 Refreshed in the PRIMARY_MULTIVIEW_DXR opt-in pass (runtime #1486 / #1500):
 `XR_DXR_display_info.h` (spec 1 → 19).
 
-## `dxr_view_config.h` — vendored, but NOT under this manifest
+## `dxr_view_config.h` — no longer vendored
 
-`../openxr_includes/dxr_view_config.h` (one directory up, beside this file) is
-also vendored from the runtime, but from `test_apps/common/`, not from
-`src/external/openxr_includes/openxr/`. `VENDORED.json` maps a single source
-path, and `check_vendored_headers.py` requires a pin for **every** `*.h` in
-`openxr_includes/openxr/` — so putting it in the pinned directory would fail
-the check as an unpinnable header. It sits one level up instead (still on every
-leg's include path) and records its own provenance, and its one deliberate
-deviation from the runtime copy, in its file header.
+The demo-local copy that used to sit at `../openxr_includes/dxr_view_config.h`
+is gone (runtime #1612). Every leg now takes `DxrSelectViewConfigType()` and
+`DxrAliasInactiveViews()` from displayxr-common's `common/dxr_view_config.h`
+(via `displayxr::rules`, pinned in `common/CMakeLists.txt`) — one shared
+implementation instead of a per-demo copy.
