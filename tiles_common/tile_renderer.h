@@ -124,6 +124,8 @@ public:
 	// internal color+depth target, then blit into the [vpX,vpY,vpW,vpH]
 	// region of the swapchain image. Clears to sky. Submit + wait (M1;
 	// batching is an M1.x optimization).
+	// swapchainFormat is READ: the internal target adopts its encoding class
+	// so the blit is always a matched pair (see setColorEncoding).
 	void
 	renderEye(VkImage swapchainImage,
 	          VkFormat swapchainFormat,
@@ -187,9 +189,18 @@ private:
 	bool
 	createRenderTargets();
 	bool
+	createRenderPass();
+	bool
 	ensureTargets(uint32_t w, uint32_t h);
 	bool
 	createPipeline();
+	bool
+	createGraphicsPipeline();
+	// Point the internal colour target at the swapchain's encoding class,
+	// recreating the render pass / images / framebuffer / pipeline if it
+	// changed. Cheap no-op once settled (the format never flaps in practice).
+	bool
+	setColorEncoding(VkFormat swapchainFormat);
 	bool
 	createSamplerAndDefaults();
 	ModelImage
@@ -217,9 +228,14 @@ private:
 	VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
 	ModelImage colorImage_;
 	ModelImage depthImage_;
-	// SRGB internal target: shader writes linear, attachment encodes, blit to
-	// the sRGB swapchain is value-preserving (INV-4.6).
+	// The internal target's encoding class MIRRORS the swapchain's, so the
+	// blit at the end of renderEye is a matched pair (INV-4.6). _SRGB: the
+	// shader writes linear and the attachment encodes. UNORM: the shader
+	// encodes (encodeInShader_ → tile.frag via pc.tint.a) and the attachment
+	// stores raw. Either way exactly one encode, and the display gets
+	// display-referred bytes (ADR-021 Model-A passthrough).
 	VkFormat colorFormat_ = VK_FORMAT_R8G8B8A8_SRGB;
+	bool encodeInShader_ = false;
 	VkFormat depthFormat_ = VK_FORMAT_D32_SFLOAT;
 
 	VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;

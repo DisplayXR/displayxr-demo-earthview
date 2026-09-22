@@ -111,6 +111,16 @@ env vars force a bookmark framing to reproduce a reported pose.
 - DisplayXR app invariants: `displayxr-runtime/docs/guides/displayxr-app-rules.md`
   (one worst-case swapchain, per-mode tiles via `subImage.imageRect`,
   `XR_DXR_view_rig` poses used directly, sRGB).
+- **Matched-pair rule (colour).** The display wants display-referred bytes and
+  the runtime is a Model-A passthrough (ADR-021 / INV-4.6), so the tile path
+  must apply **exactly one** linear→sRGB encode. `TileRenderer::setColorEncoding`
+  makes the internal target adopt the swapchain's encoding class, because
+  `vkCmdBlitImage` converts through formats: `_SRGB`→`_SRGB` is decode+encode
+  (identity), UNORM→UNORM is raw, and a MIXED pair is a whole gamma out. On the
+  UNORM leg (`DXR_SWAPCHAIN_ENCODING=unorm`) nothing encodes for us, so
+  `tile.frag` does — gated by `pc.tint.a`. Authored colours (the sky clear) are
+  already display-referred: pre-decode them for an `_SRGB` attachment, which
+  encodes its clear value, or they ship encoded twice.
 - Tile selection runs ONCE per frame with a center-eye camera; both views draw
   the same selected set.
 - **ADOPT the runtime's active rendering mode; never force one at startup.**

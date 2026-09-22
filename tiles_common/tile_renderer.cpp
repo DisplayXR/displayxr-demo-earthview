@@ -33,7 +33,33 @@ extern "C" int stbi_write_png(const char *filename, int w, int h, int comp, cons
 
 namespace {
 
+// Authored sky, DISPLAY-REFERRED (the value we want the panel to show).
 constexpr float kSkyColor[4] = {0.53f, 0.75f, 0.92f, 1.0f};
+
+// Standard sRGB EOTF (accurate piecewise) — exact inverse of tile.frag's
+// linearToSrgb(). No vendor curve, no pow(2.2) approximation.
+float
+srgbToLinear(float c)
+{
+	return (c <= 0.04045f) ? (c / 12.92f) : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+// The sky clear matched to what the colour attachment does to a clear value.
+// An _SRGB attachment ENCODES it, so hand it the linear sky or the authored
+// colour lands encoded twice (same defect the D3D11 side fixed with
+// ClearRenderTargetViewDisplayReferred(), displayxr-common#49). A UNORM
+// attachment stores it raw, and the authored value is already display-referred
+// — the shader's encode covers geometry only, never the clear.
+VkClearColorValue
+skyClearColor(bool srgbTarget)
+{
+	VkClearColorValue v;
+	for (int i = 0; i < 3; ++i) {
+		v.float32[i] = srgbTarget ? srgbToLinear(kSkyColor[i]) : kSkyColor[i];
+	}
+	v.float32[3] = kSkyColor[3];
+	return v;
+}
 
 struct TileVertex
 {
@@ -442,6 +468,24 @@ TileRenderer::init(VkInstance instance,
 bool
 TileRenderer::createRenderTargets()
 {
+	return createRenderPass() && ensureTargets(width_, height_);
+}
+
+// Render pass alone — split out of createRenderTargets so setColorEncoding can
+// rebuild it (its colour attachment carries colorFormat_) without touching the
+// descriptor pool / sets the live tiles hold.
+bool
+TileRenderer::createRenderPass()
+{
+	if (framebuffer_ != VK_NULL_HANDLE) {
+		vkDestroyFramebuffer(device_, framebuffer_, nullptr);
+		framebuffer_ = VK_NULL_HANDLE;
+	}
+	if (renderPass_ != VK_NULL_HANDLE) {
+		vkDestroyRenderPass(device_, renderPass_, nullptr);
+		renderPass_ = VK_NULL_HANDLE;
+	}
+
 	VkAttachmentDescription atts[2] = {};
 	atts[0].format = colorFormat_;
 	atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -493,10 +537,44 @@ TileRenderer::createRenderTargets()
 	rpci.pSubpasses = &sub;
 	rpci.dependencyCount = 2;
 	rpci.pDependencies = deps;
-	if (vkCreateRenderPass(device_, &rpci, nullptr, &renderPass_) != VK_SUCCESS) {
-		return false;
+	return vkCreateRenderPass(device_, &rpci, nullptr, &renderPass_) == VK_SUCCESS;
+}
+
+// Adopt the swapchain's encoding class for the internal colour target, so the
+// blit at the end of renderEye is always a MATCHED pair: _SRGB→_SRGB decodes
+// then re-encodes (identity), UNORM→UNORM copies raw. vkCmdBlitImage converts
+// through the formats, so a mismatched pair is exactly one gamma out — an
+// _SRGB target into a UNORM swapchain decodes with nothing to re-encode, which
+// measured as an atlas mean of 59.5 where 119.6 was correct. ADR-021 (Model-A
+// passthrough: the bytes we leave in the swapchain reach the panel unchanged)
+// and INV-4.6 (the panel wants display-referred bytes).
+bool
+TileRenderer::setColorEncoding(VkFormat swapchainFormat)
+{
+	const bool srgb = (swapchainFormat == VK_FORMAT_R8G8B8A8_SRGB ||
+	                   swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB ||
+	                   swapchainFormat == VK_FORMAT_A8B8G8R8_SRGB_PACK32);
+	const VkFormat want = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+	if (want == colorFormat_) {
+		return true;
 	}
-	return ensureTargets(width_, height_);
+
+	vkDeviceWaitIdle(device_);
+	// Pipelines are tied to their render pass by attachment format, so the
+	// graphics pipeline has to go with it. The pipeline LAYOUT, descriptor
+	// pool, sampler and per-tile sets are format-independent — leave them be.
+	if (pipeline_ != VK_NULL_HANDLE) {
+		vkDestroyPipeline(device_, pipeline_, nullptr);
+		pipeline_ = VK_NULL_HANDLE;
+	}
+	colorFormat_ = want;
+	// UNORM stores the fragment raw, so tile.frag has to do the encode; _SRGB
+	// does it in hardware and the shader must not (pc.tint.a is the gate).
+	encodeInShader_ = !srgb;
+	std::printf("TileRenderer: colour target -> %s (swapchain format %d)\n",
+	            srgb ? "R8G8B8A8_SRGB" : "R8G8B8A8_UNORM + shader encode",
+	            (int)swapchainFormat);
+	return createRenderPass() && ensureTargets(width_, height_) && createGraphicsPipeline();
 }
 
 bool
@@ -607,6 +685,33 @@ TileRenderer::createPipeline()
 		return false;
 	}
 
+	if (!createGraphicsPipeline()) {
+		return false;
+	}
+
+	// Descriptor pool: one set per live tile texture. FREE bit so free()
+	// returns sets individually as tiles expire. ~70 visible tiles × a few
+	// textures leaves lots of headroom at 4096.
+	VkDescriptorPoolSize psize = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096};
+	VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+	dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+	dpci.maxSets = 4096;
+	dpci.poolSizeCount = 1;
+	dpci.pPoolSizes = &psize;
+	return vkCreateDescriptorPool(device_, &dpci, nullptr, &descPool_) == VK_SUCCESS;
+}
+
+// The graphics pipeline alone — split out of createPipeline so setColorEncoding
+// can rebuild it against a new render pass. Assumes pipelineLayout_ and
+// renderPass_ are live; destroys any previous pipeline_.
+bool
+TileRenderer::createGraphicsPipeline()
+{
+	if (pipeline_ != VK_NULL_HANDLE) {
+		vkDestroyPipeline(device_, pipeline_, nullptr);
+		pipeline_ = VK_NULL_HANDLE;
+	}
+
 	auto makeShader = [&](const uint32_t *code, size_t bytes) {
 		VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
 		ci.codeSize = bytes;
@@ -700,20 +805,7 @@ TileRenderer::createPipeline()
 
 	vkDestroyShaderModule(device_, vert, nullptr);
 	vkDestroyShaderModule(device_, frag, nullptr);
-	if (res != VK_SUCCESS) {
-		return false;
-	}
-
-	// Descriptor pool: one set per live tile texture. FREE bit so free()
-	// returns sets individually as tiles expire. ~70 visible tiles × a few
-	// textures leaves lots of headroom at 4096.
-	VkDescriptorPoolSize psize = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096};
-	VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-	dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-	dpci.maxSets = 4096;
-	dpci.poolSizeCount = 1;
-	dpci.pPoolSizes = &psize;
-	return vkCreateDescriptorPool(device_, &dpci, nullptr, &descPool_) == VK_SUCCESS;
+	return res == VK_SUCCESS;
 }
 
 bool
@@ -767,8 +859,9 @@ TileRenderer::uploadTexture(const uint8_t *rgba, uint32_t w, uint32_t h)
 
 	VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
 	ici.imageType = VK_IMAGE_TYPE_2D;
-	// SRGB sampled: HW decodes to linear in the shader; the SRGB attachment
-	// re-encodes on write (INV-4.6 round-trip, no manual gamma anywhere).
+	// SRGB sampled: HW decodes to linear in the shader; exactly one encode
+	// follows (the SRGB attachment's write, or tile.frag on the UNORM leg) —
+	// INV-4.6 round-trip, no manual gamma in the tile path.
 	ici.format = VK_FORMAT_R8G8B8A8_SRGB;
 	ici.extent = {w, h, 1};
 	ici.mipLevels = mips;
@@ -859,6 +952,9 @@ TileRenderer::uploadTexture(const uint8_t *rgba, uint32_t w, uint32_t h)
 		blit.srcOffsets[1] = {mw, mh, 1};
 		blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
 		blit.dstOffsets[1] = {nw, nh, 1};
+		// _SRGB → _SRGB within one image: the blit decodes and re-encodes, so
+		// the downsample averages in linear and the level is value-preserving.
+		// Independent of the swapchain's encoding class (setColorEncoding).
 		vkCmdBlitImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img.image,
 		               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 		barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -924,6 +1020,11 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	if (!initialized_) {
 		return;
 	}
+	// Match the internal target to the swapchain's encoding class BEFORE the
+	// size check — a class change rebuilds the targets anyway.
+	if (!setColorEncoding(swapchainFormat)) {
+		return;
+	}
 	if (imageWidth != width_ || imageHeight != height_) {
 		if (!ensureTargets(imageWidth, imageHeight)) {
 			return;
@@ -958,7 +1059,9 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	vkBeginCommandBuffer(cmd, &bi);
 
 	VkClearValue clears[2];
-	clears[0].color = {{kSkyColor[0], kSkyColor[1], kSkyColor[2], kSkyColor[3]}};
+	// Not kSkyColor raw: the clear goes through whatever the attachment does
+	// to it, so it is pre-matched (skyClearColor).
+	clears[0].color = skyClearColor(!encodeInShader_);
 	clears[1].depthStencil = {1.0f, 0};
 
 	VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -999,7 +1102,9 @@ TileRenderer::renderEye(VkImage swapchainImage,
 				pb.tint[0] = p.tint[0];
 				pb.tint[1] = p.tint[1];
 				pb.tint[2] = p.tint[2];
-				pb.tint[3] = 1.0f;
+				// .a = tile.frag's linear→sRGB encode gate (1 only when the
+				// internal target is UNORM and nothing else will encode).
+				pb.tint[3] = encodeInShader_ ? 1.0f : 0.0f;
 				vkCmdPushConstants(cmd, pipelineLayout_,
 				                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 				                   0, sizeof(PushBlock), &pb);
@@ -1041,6 +1146,9 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	blit.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
 	blit.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
 	                      (int32_t)(viewportY + viewportHeight), 1};
+	// Matched pair by construction (setColorEncoding): _SRGB→_SRGB decodes then
+	// re-encodes, UNORM→UNORM copies raw. Either way the swapchain receives the
+	// display-referred bytes the panel wants (ADR-021 / INV-4.6).
 	vkCmdBlitImage(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage,
 	               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 
@@ -1142,6 +1250,11 @@ TileRenderer::dumpColorTarget(const char *path, uint32_t w, uint32_t h)
 	if (!initialized_ || colorImage_.image == VK_NULL_HANDLE) {
 		return;
 	}
+	// Byte copy of colorImage_, which holds DISPLAY-REFERRED bytes on both legs
+	// (the _SRGB attachment encoded them, or tile.frag did) — so the PNG stays
+	// the oracle the atlas capture is compared against, whichever encoding
+	// class the swapchain picked.
+	//
 	// The view was rendered at the supersampled size; grab that whole region so
 	// the dump shows the full eye (not just the top-left 1/kSsaa² corner).
 	w = (uint32_t)((float)w * lastSsScaleX_);

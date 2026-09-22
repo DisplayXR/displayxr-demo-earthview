@@ -8,7 +8,8 @@ layout(location = 1) in vec2 inUV;
 
 layout(push_constant) uniform Push {
     mat4 mvp;
-    vec4 tint; // rgb tint × a=1 for textureless primitives (white tex bound)
+    vec4 tint; // rgb tint (gray for textureless primitives, white tex bound);
+               // a = tile.frag's linear→sRGB encode gate (see that shader)
 } pc;
 
 layout(location = 0) out vec2 outUV;
