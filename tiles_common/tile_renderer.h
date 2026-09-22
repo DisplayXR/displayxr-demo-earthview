@@ -217,9 +217,16 @@ private:
 	VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
 	ModelImage colorImage_;
 	ModelImage depthImage_;
-	// SRGB internal target: shader writes linear, attachment encodes, blit to
-	// the sRGB swapchain is value-preserving (INV-4.6).
+	// SRGB internal target: shader writes linear, attachment encodes, so it
+	// holds the authored (encoded) bytes; renderEye hands those bytes to the
+	// swapchain unchanged via swapScratch_ (INV-4.6).
 	VkFormat colorFormat_ = VK_FORMAT_R8G8B8A8_SRGB;
+	// sRGB-typed staging image in the swapchain's channel order: the blit goes
+	// colorImage_ -> swapScratch_ (sRGB -> sRGB, an identity with the SSAA
+	// downsample done in linear light), then a raw vkCmdCopyImage puts the
+	// encoded bytes into the swapchain whatever format its VkImage really has.
+	ModelImage swapScratch_;
+	VkFormat swapScratchFormat_ = VK_FORMAT_UNDEFINED;
 	VkFormat depthFormat_ = VK_FORMAT_D32_SFLOAT;
 
 	VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
