@@ -50,6 +50,52 @@ git clone --branch v0.61.0 --recurse-submodules \
 `./scripts/build_macos.sh --installer` produces
 `_package/DisplayXREarthView-<version>.pkg`.
 
+## Build & run (Linux)
+
+Ubuntu 22.04, 24.04 and 26.04 are supported. Requires the DisplayXR runtime
+(`displayxr-runtime` .deb, or a local dev build).
+
+**Toolchain floor** — `scripts/build_linux.sh` resolves both up front:
+
+| | need | 22.04 | 24.04 / 26.04 |
+|---|---|---|---|
+| CMake | >= 3.25 | 3.22.1 too old → **auto-provisioned** | fine as shipped |
+| GCC | >= 12 | **`sudo apt install g++-12`** | fine as shipped |
+
+Neither is optional, and both bite only on 22.04:
+
+* **CMake 3.25** — cesium-native v0.61.0 selects its vcpkg triplet with
+  `elseif(LINUX)`, and the `LINUX` variable was introduced in CMake 3.25. With
+  jammy's 3.22.1 the configure fails with *"Cannot guess an appropriate value
+  for VCPKG_TRIPLET"*. The script downloads a pinned Kitware CMake into
+  `/tmp/dxr-cmake` (override with `DXR_CMAKE_DIR`) and uses it for that build
+  only; set `DXR_NO_CMAKE_DOWNLOAD=1` to refuse the download and get
+  instructions instead.
+* **GCC 12** — cesium's ezvcpkg tree builds ada-url v3.3.0, which needs C++20
+  `constexpr std::string`, a GCC 12 libstdc++ feature. The script selects
+  `g++-12` automatically when the default `g++` is older; `CC` / `CXX`
+  override it.
+
+```bash
+sudo apt install build-essential cmake ninja-build pkg-config \
+    libvulkan-dev glslang-tools \
+    libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
+    libxcb1-dev libx11-xcb-dev libxcb-glx0-dev libxxf86vm-dev \
+    libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
+    libcurl4-openssl-dev libssl-dev zlib1g-dev \
+    autoconf automake autoconf-archive libtool nasm zip unzip
+sudo apt install g++-12          # 22.04 only
+
+./scripts/build_linux.sh         # clones cesium-native, builds build/linux/earthview_handle_vk_linux
+./scripts/run_earthview_linux.sh # runs against an installed or dev runtime
+```
+
+`./scripts/package_deb_linux.sh` produces
+`dist/displayxr-earthview_<version>_amd64.deb`. Release artifacts are built in
+an `ubuntu:22.04` container so the one package installs and runs on all three
+releases; CI then installs it into pristine 22.04 / 24.04 / 26.04 containers
+(`scripts/verify_deb_install_linux.sh`) before it may be attached to a release.
+
 ## Controls
 
 | Input | Action |

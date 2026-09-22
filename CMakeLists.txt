@@ -9,6 +9,13 @@
 # The headless M0 spike (spike/) is a standalone project and is deliberately
 # NOT added here — build it from spike/ directly (see spike/CMakeLists.txt).
 
+# CMake floor: 3.25 is a HARD requirement on Linux, not an aspiration.
+# cesium-native v0.61.0's cmake/detect-vcpkg-triplet.cmake selects its vcpkg
+# triplet with `elseif(LINUX)`, and the LINUX variable was introduced in CMake
+# 3.25 — with an older cmake it falls through to
+# "Cannot guess an appropriate value for VCPKG_TRIPLET". Ubuntu 22.04 ships
+# 3.22.1, so a jammy box needs a newer cmake; scripts/build_linux.sh checks
+# the version and provisions a pinned Kitware build when the host's is older.
 cmake_minimum_required(VERSION 3.25)
 project(displayxr-demo-earthview LANGUAGES C CXX)
 
