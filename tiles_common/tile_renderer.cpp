@@ -33,7 +33,30 @@ extern "C" int stbi_write_png(const char *filename, int w, int h, int comp, cons
 
 namespace {
 
+// Authored display-referred (sRGB-encoded), like every colour picked by eye.
 constexpr float kSkyColor[4] = {0.53f, 0.75f, 0.92f, 1.0f};
+
+// The sRGB format with `swapchainFormat`'s channel order — what the internal
+// sRGB colour target is blitted into before the raw copy to the swapchain.
+// UNDEFINED for anything else (then the blit goes straight to the swapchain).
+VkFormat
+srgbStagingFormatFor(VkFormat swapchainFormat)
+{
+	switch (swapchainFormat) {
+	case VK_FORMAT_R8G8B8A8_UNORM:
+	case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+	case VK_FORMAT_B8G8R8A8_UNORM:
+	case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
+	default: return VK_FORMAT_UNDEFINED;
+	}
+}
+
+// sRGB EOTF: display-referred [0,1] -> linear [0,1].
+float
+srgbToLinear(float c)
+{
+	return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
 
 struct TileVertex
 {
@@ -518,6 +541,10 @@ TileRenderer::ensureTargets(uint32_t w, uint32_t h)
 	if (colorImage_.image != VK_NULL_HANDLE) {
 		modelDestroyImage(device_, colorImage_);
 	}
+	if (swapScratch_.image != VK_NULL_HANDLE) {
+		modelDestroyImage(device_, swapScratch_);
+		swapScratchFormat_ = VK_FORMAT_UNDEFINED;
+	}
 	if (depthImage_.image != VK_NULL_HANDLE) {
 		modelDestroyImage(device_, depthImage_);
 	}
@@ -929,6 +956,23 @@ TileRenderer::renderEye(VkImage swapchainImage,
 			return;
 		}
 	}
+	// Staging image for the byte-exact hand-off (see the blit below). Every
+	// renderEye ends in a queue wait, so it is idle here. On failure the blit
+	// falls back to going straight to the swapchain.
+	const VkFormat stagingFormat = srgbStagingFormatFor(swapchainFormat);
+	if (stagingFormat != swapScratchFormat_) {
+		if (swapScratch_.image != VK_NULL_HANDLE) {
+			modelDestroyImage(device_, swapScratch_);
+		}
+		swapScratchFormat_ = stagingFormat;
+		if (stagingFormat != VK_FORMAT_UNDEFINED) {
+			// SAMPLED only so the helper's image view is valid.
+			swapScratch_ = modelCreateImage2D(device_, physDevice_, width_, height_, stagingFormat,
+			                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+			                                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+			                                      VK_IMAGE_USAGE_SAMPLED_BIT);
+		}
+	}
 
 	// Supersample: render the view at kSsaa× the final per-view size into the
 	// (swapchain-sized) internal target, then downsample on the blit below —
@@ -957,8 +1001,15 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(cmd, &bi);
 
+	// A clear value is LINEAR: an sRGB colour target (colorFormat_ is
+	// R8G8B8A8_SRGB) encodes it on store, exactly like a shader output.
+	// Clearing with the display-referred sky colour itself encodes it twice
+	// (washed-out sky), so linearize it and the stored bytes are the authored
+	// ones. Alpha is never sRGB-converted.
+	const bool srgbTarget = (colorFormat_ == VK_FORMAT_R8G8B8A8_SRGB);
+	auto sky = [&](int i) { return srgbTarget ? srgbToLinear(kSkyColor[i]) : kSkyColor[i]; };
 	VkClearValue clears[2];
-	clears[0].color = {{kSkyColor[0], kSkyColor[1], kSkyColor[2], kSkyColor[3]}};
+	clears[0].color = {{sky(0), sky(1), sky(2), kSkyColor[3]}};
 	clears[1].depthStencil = {1.0f, 0};
 
 	VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -1033,16 +1084,65 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
 	                     0, nullptr, 0, nullptr, 1, &toDst);
 
+	/*
+	 * colorImage_ holds the authored, sRGB-ENCODED bytes. vkCmdBlitImage is not
+	 * a byte copy — it converts through each image's own format — so blitting
+	 * straight into the swapchain is only right when the swapchain VkImage is
+	 * sRGB-typed too: into an UNORM-typed one it decodes (too dark), which is
+	 * what an UNORM swapchain, or a runtime that substitutes an UNORM image for
+	 * an sRGB request, gets. So blit sRGB -> sRGB into swapScratch_ (identity,
+	 * SSAA downsample in linear light) and vkCmdCopyImage — which never
+	 * converts — the encoded bytes into the swapchain. Correct on any 8-bit
+	 * RGBA/BGRA swapchain and any runtime.
+	 */
 	VkImageBlit blit = {};
 	blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 	blit.srcOffsets[0] = {0, 0, 0};
 	blit.srcOffsets[1] = {(int32_t)ssW, (int32_t)ssH, 1};  // supersampled source
 	blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	blit.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
-	blit.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
-	                      (int32_t)(viewportY + viewportHeight), 1};
-	vkCmdBlitImage(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage,
-	               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+	const bool viaScratch = swapScratch_.image != VK_NULL_HANDLE &&
+	                        viewportWidth <= swapScratch_.width &&
+	                        viewportHeight <= swapScratch_.height;
+	if (viaScratch) {
+		VkImageMemoryBarrier sb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+		sb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		sb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		sb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		sb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		sb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		sb.image = swapScratch_.image;
+		sb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0, 0, nullptr, 0, nullptr, 1, &sb);
+
+		blit.dstOffsets[0] = {0, 0, 0};
+		blit.dstOffsets[1] = {(int32_t)viewportWidth, (int32_t)viewportHeight, 1};
+		vkCmdBlitImage(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		               swapScratch_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+		               VK_FILTER_LINEAR);
+
+		sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		sb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		sb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     0, 0, nullptr, 0, nullptr, 1, &sb);
+
+		VkImageCopy copy = {};
+		copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		copy.dstOffset = {(int32_t)viewportX, (int32_t)viewportY, 0};
+		copy.extent = {viewportWidth, viewportHeight, 1};
+		vkCmdCopyImage(cmd, swapScratch_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		               swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	} else {
+		blit.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
+		blit.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
+		                      (int32_t)(viewportY + viewportHeight), 1};
+		vkCmdBlitImage(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage,
+		               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+	}
 
 	VkImageMemoryBarrier toColor = toDst;
 	toColor.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1254,6 +1354,10 @@ TileRenderer::cleanup()
 	}
 	if (colorImage_.image != VK_NULL_HANDLE) {
 		modelDestroyImage(device_, colorImage_);
+	}
+	if (swapScratch_.image != VK_NULL_HANDLE) {
+		modelDestroyImage(device_, swapScratch_);
+		swapScratchFormat_ = VK_FORMAT_UNDEFINED;
 	}
 	if (depthImage_.image != VK_NULL_HANDLE) {
 		modelDestroyImage(device_, depthImage_);
