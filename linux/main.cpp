@@ -25,8 +25,14 @@
 // remaps the GL projection to Vulkan [0,1] depth. Mirrors the windows/main.cpp
 // fly path; orbit/focus/HUD/MCP/atlas-capture remain per-platform UI concerns.
 //
-// INPUT — B cycles city bookmarks (Windows parity); close button exits. NO
-// file-open by design: EarthView streams tiles, there is no model to load.
+// INPUT — the Windows leg's geo navigation, onto the helper's pump_events:
+// left-drag look (0.005 rad/px), wheel dolly (0.5 step/notch), WASD pan + E/Q
+// climb (held keys, 0.5*dt), Space reframe the bookmark, B cycle bookmarks,
+// C orbit -> fly, Esc release an acquired orbit else exit; close button exits.
+// Not ported (Windows-only machinery with no Linux counterpart yet): the HUD
+// mode/city buttons, double-click POI focus, V/0-8/T/M, I atlas capture, X
+// supersampling, Ctrl+K key dialog. NO file-open by design: EarthView streams
+// tiles, there is no model to load.
 
 #define XR_USE_GRAPHICS_API_VULKAN
 
@@ -769,10 +775,101 @@ CreateAppWindow(AppXrSession &xr)
 	return true;
 }
 
-// Drain the window once per frame (both backends): B = cycle city bookmarks
-// (Windows parity), the close button = clean exit, Resize = the live content
-// size. The header bar, its drag and F11 are the helper's. NO file-open by
-// design (EarthView streams tiles).
+// Geo-navigation input, accumulated by PumpWindow and consumed once per frame
+// by UpdateGeoNav — the same split, names and constants as windows/main.cpp
+// (WndProc accumulates, the render loop consumes). One thread here, so no lock.
+static float g_lookDX = 0.0f, g_lookDY = 0.0f; // radians (left-drag)
+static float g_dollySteps = 0.0f;              // wheel steps (exponential zoom)
+static bool g_cycleBookmarkRequested = false;  // B
+static bool g_releaseOrbitRequested = false;   // Esc (orbit acquired) / Space
+static bool g_releaseToFlyRequested = false;   // C: orbit -> fly, continuous
+static int32_t g_lastDragX = 0, g_lastDragY = 0;
+static bool g_leftDown = false;  // left button held (Windows: MK_LBUTTON)
+static bool g_dragValid = false; // g_lastDrag* is a valid origin
+struct HeldKeys
+{
+	bool w = false, a = false, s = false, d = false, e = false, q = false;
+};
+static HeldKeys g_keys;
+
+// Geo navigation — windows/main.cpp UpdateGeoNav, minus its [FOCUS] branches
+// (double-click POI focus is not ported to Linux, so g_focusActive is always
+// false there and only the fly branches below run).
+static void
+UpdateGeoNav(double dt)
+{
+	const float lookDX = g_lookDX, lookDY = g_lookDY, dollySteps = g_dollySteps;
+	const bool releaseToFly = g_releaseToFlyRequested;
+	const bool releaseOrbit = g_releaseOrbitRequested;
+	const bool cycleBookmark = g_cycleBookmarkRequested;
+	g_lookDX = g_lookDY = g_dollySteps = 0.0f;
+	g_releaseToFlyRequested = g_releaseOrbitRequested = g_cycleBookmarkRequested = false;
+
+	if (releaseToFly && g_geoNav.orbitAcquired) {
+		// Inert today: nothing on Linux acquires an orbit (no diorama path).
+		// Windows passes the tracked viewer's XR z as the ZDP distance; the
+		// Linux fly rig pins the target at kTargetXrDist = 1 XR metre.
+		g_geoNav.releaseToFly(1.0);
+		LOG_INFO("Released orbit -> fly mode (continuous)");
+	}
+	if (releaseOrbit) {
+		g_geoNav.releaseOrbit(); // back to camera-centric, reframe bookmark
+		return;
+	}
+	if (cycleBookmark) {
+		g_geoNav.cycleBookmark(); // instant jump
+		size_t n = 0;
+		const geo::Bookmark *bm = geo::bookmarks(&n);
+		if (n > 0)
+			LOG_INFO("Bookmark: %s", bm[g_geoNav.bookmarkIndex].name);
+	}
+	if (lookDX != 0.0f || lookDY != 0.0f)
+		g_geoNav.look((double)lookDX, (double)lookDY);
+	if (dollySteps != 0.0f)
+		g_geoNav.dolly((double)dollySteps);
+
+	// WASD pan in the ground tangent plane, E/Q climb. Speeds scale with
+	// targetDist inside GeoNav, so dt is the only factor here.
+	const double k = 0.5 * dt;
+	double panX = 0.0, panY = 0.0, climb = 0.0;
+	if (g_keys.w)
+		panY += k;
+	if (g_keys.s)
+		panY -= k;
+	if (g_keys.d)
+		panX += k;
+	if (g_keys.a)
+		panX -= k;
+	if (g_keys.e)
+		climb += k;
+	if (g_keys.q)
+		climb -= k;
+	if (panX != 0.0 || panY != 0.0)
+		g_geoNav.pan(panX, panY);
+	if (climb != 0.0)
+		g_geoNav.elevate(climb);
+}
+
+// Held-key state for WASDEQ; returns false for any other key.
+static bool
+SetHeldKey(uint32_t keysym, bool down)
+{
+	switch (keysym) {
+	case XK_w: g_keys.w = down; return true;
+	case XK_a: g_keys.a = down; return true;
+	case XK_s: g_keys.s = down; return true;
+	case XK_d: g_keys.d = down; return true;
+	case XK_e: g_keys.e = down; return true;
+	case XK_q: g_keys.q = down; return true;
+	default: return false;
+	}
+}
+
+// Drain the window once per frame (both backends) into the geo-navigation
+// accumulators above; the close button (or Esc with no orbit acquired) is a
+// clean exit, Resize is the live content size. The header bar, its drag and
+// F11 are the helper's (drag buttons are 0, so every content click is ours).
+// NO file-open by design (EarthView streams tiles).
 static void
 PumpWindow(AppXrSession &xr)
 {
@@ -780,15 +877,65 @@ PumpWindow(AppXrSession &xr)
 		return;
 	bool running = true;
 	g_window.pump_events(
-	    [&xr](const DxrWindowEvent &ev) {
-		    if (ev.type == DxrWindowEvent::Type::KeyDown && !ev.repeat &&
-		        (ev.keysym == XK_b || ev.keysym == XK_B)) {
-			    g_geoNav.cycleBookmark();
-			    size_t n = 0;
-			    const geo::Bookmark *bm = geo::bookmarks(&n);
-			    if (n > 0)
-				    LOG_INFO("Bookmark: %s", bm[g_geoNav.bookmarkIndex].name);
-		    } else if (ev.type == DxrWindowEvent::Type::Resize) {
+	    [&xr, &running](const DxrWindowEvent &ev) {
+		    using T = DxrWindowEvent::Type;
+		    switch (ev.type) {
+		    case T::KeyDown:
+			    if (SetHeldKey(ev.keysym, true))
+				    break;
+			    if (ev.keysym == XK_Escape && !ev.repeat) {
+				    // First press releases an acquired orbit, the next exits.
+				    if (g_geoNav.orbitAcquired)
+					    g_releaseOrbitRequested = true;
+				    else
+					    running = false;
+			    } else if (ev.keysym == XK_space) {
+				    g_releaseOrbitRequested = true; // Space = reset view
+			    } else if (ev.keysym == XK_b && !ev.repeat) {
+				    g_cycleBookmarkRequested = true;
+			    } else if (ev.keysym == XK_c) {
+				    g_releaseToFlyRequested = true;
+			    }
+			    break;
+		    case T::KeyUp: SetHeldKey(ev.keysym, false); break;
+		    case T::FocusLost:
+			    // Released keys and buttons never arrive once focus is gone.
+			    g_keys = HeldKeys{};
+			    g_leftDown = false;
+			    g_dragValid = false;
+			    break;
+		    case T::ButtonDown:
+			    if (ev.button == 1 && !ev.window_drag) {
+				    g_leftDown = true;
+				    g_lastDragX = ev.x;
+				    g_lastDragY = ev.y;
+				    g_dragValid = true;
+			    }
+			    break;
+		    case T::ButtonUp:
+			    if (ev.button == 1) {
+				    g_leftDown = false;
+				    g_dragValid = false;
+			    }
+			    break;
+		    case T::Motion:
+			    if (g_leftDown) {
+				    if (g_dragValid) {
+					    g_lookDX += (float)(ev.x - g_lastDragX) * 0.005f;
+					    g_lookDY += (float)(ev.y - g_lastDragY) * 0.005f;
+				    }
+				    g_lastDragX = ev.x;
+				    g_lastDragY = ev.y;
+				    g_dragValid = true;
+			    }
+			    break;
+		    case T::Scroll:
+			    // +1 per notch up/away, as Windows' WHEEL_DELTA notches.
+			    g_dollySteps += (float)ev.scroll_steps * 0.5f;
+			    break;
+		    default: break;
+		    }
+		    if (ev.type == T::Resize) {
 			    xr.xWinW = ev.width;
 			    xr.xWinH = ev.height;
 			    g_windowW = xr.xWinW;
@@ -1022,7 +1169,7 @@ main(int argc, char **argv)
 
 	while (g_running && !xr.exitRequested) {
 		PollEvents(xr);
-		PumpWindow(xr); // B = cycle bookmark; close button = exit
+		PumpWindow(xr); // accumulate geo-nav input; close button / Esc = exit
 
 		// Assert the startup rendering mode ONCE, the first frame the session
 		// is running (the request is dropped by a not-yet-begun session, hence
@@ -1046,6 +1193,7 @@ main(int argc, char **argv)
 		auto now = std::chrono::high_resolution_clock::now();
 		double deltaTime = std::chrono::duration<double>(now - lastTime).count();
 		lastTime = now;
+		UpdateGeoNav(deltaTime);
 
 		XrFrameState frameState = {XR_TYPE_FRAME_STATE};
 		if (XR_FAILED(xrWaitFrame(xr.session, nullptr, &frameState)))
