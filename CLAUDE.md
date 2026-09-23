@@ -73,16 +73,22 @@ Lint before calling work done:
 ./scripts/run_earthview_linux.sh  # dev run vs a Linux runtime (on-screen pass only — Phase-3 gated)
 ```
 
-`linux/main.cpp` is a **HOSTED-NULL, reduced harness** — Vulkan (system
-`libvulkan`) + OpenXR session + cesium tile streaming, with **no app-provided
-window** (the runtime self-creates one) and no HUD/input/MCP. This is
-BUILD-GREEN scope: `.github/workflows/build-linux.yml` (mirrors mediaplayer's,
-NOT a required check; triggers on `linux*` branches + manual dispatch) compiles
-the cross-platform scene layer on `ubuntu-latest`. **On-screen validation is a
-separate pass**, gated on the runtime's Linux Phase 1b + a GPU + an X server.
-The faithful app-window arm is `XR_DXR_xlib_window_binding` (runtime Phase 3a) —
-see the `TODO(Phase 3)` in `linux/main.cpp` and the runtime repo's
-`docs/guides/linux-demo-port.md`. The OpenXR **loader pin is `1.1.43`** (equal in
+`linux/main.cpp` is a **handle app with one binary for X11 and native Wayland**.
+It runs Vulkan (system `libvulkan`) + an OpenXR session + cesium tile
+streaming. Its window is displayxr-common's `displayxr::linux_window`, the one
+Linux window implementation, shared with the runtime's test apps and the other
+demos. **Never copy window code back into this repo.**
+
+The platform is chosen by capability at startup with
+`--platform=x11|wayland|auto`. The default `auto` picks native Wayland when
+the compositor is ready and X11 otherwise. The helper passes
+`XR_DXR_xlib_window_binding` or `XR_DXR_wayland_surface_binding`. The window
+carries the shared header bar, whose drag is phase-snapped on X11. Input is
+B, to cycle bookmarks. With no window system the app falls back to
+hosted-NULL.
+
+`--frame-stats` logs frame time periodically. `.github/workflows/build-linux.yml`
+compiles it. The OpenXR **loader pin is `1.1.43`** (equal in
 `scripts/build_linux.sh` + `linux/CMakeLists.txt` FetchContent fallback + CI);
 the vendored `openxr_includes/` headers are newer (1.1.51) — that drift is
 expected on Linux, unlike the macOS/Windows legs which pin the loader to the

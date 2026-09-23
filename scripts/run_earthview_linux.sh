@@ -8,10 +8,10 @@
 # has no display/GPU, so build-linux.yml only compiles the binary. Running it
 # needs the runtime's Linux Phase 1b (on-screen present) + a GPU + an X server.
 #
-# The Linux binary is a HOSTED-NULL app: it passes no window binding, so the
-# runtime self-creates its window (the faithful XR_DXR_xlib_window_binding arm
-# is Phase-3 hardware-gated). See linux/main.cpp and the runtime repo's
-# docs/guides/linux-demo-port.md.
+# The Linux binary is a handle app, one binary for X11 and native Wayland
+# (--platform=x11|wayland|auto; default auto = native Wayland when the
+# compositor is ready, else X11). With no window system it falls back to
+# hosted-NULL. See linux/main.cpp.
 set -euo pipefail
 
 # --- API key for local dev --------------------------------------------------

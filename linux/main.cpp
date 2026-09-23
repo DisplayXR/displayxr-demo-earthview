@@ -4,15 +4,19 @@
 // linux/main.cpp — the Linux entry point for the EarthView demo (#19
 // build-green harness, upgraded to a real handle app by #34).
 //
-// WINDOWING — HANDLE app (matching the binary name and the other platforms):
-// the app owns a decorated X11 window centered on the 3D panel and passes it
-// via XR_DXR_xlib_window_binding, so the runtime weaves window-relative
-// (runtime#729/#730) and the app receives keyboard input. The window defaults
-// to 1920x1080 centered on the panel (XR_DXR_display_info desktop rect, else
-// Xrandr); EARTHVIEW_WINDOW="WxH+X+Y" overrides (X,Y absolute virtual-desktop
-// px). When no X server is available (or window creation fails) the app falls
-// back to the previous hosted-NULL path — which also keeps this compiling and
-// startable on the build-green CI runner.
+// WINDOWING — HANDLE app, ONE binary for X11 and native Wayland: the window is
+// displayxr-common's displayxr::linux_window (dxr_linux_window.h), the one
+// Linux window implementation shared with the runtime's test apps and the
+// other demos. The platform is chosen by capability at startup
+// (--platform=x11|wayland|auto; auto = native Wayland when the compositor is
+// ready, else X11 — never from session env vars), and the helper passes
+// XR_DXR_xlib_window_binding or XR_DXR_wayland_surface_binding, so the runtime
+// weaves window-relative and the app receives keyboard input. The window
+// defaults to 1920x1080 centered on the panel (XR_DXR_display_info desktop
+// rect); EARTHVIEW_WINDOW="WxH+X+Y" overrides (X,Y absolute virtual-desktop
+// px, X11 only). It carries the shared client-side header bar, whose drag is
+// phase-snapped on X11. When no window system answers the app falls back to
+// hosted-NULL — which also keeps it startable on the build-green CI runner.
 //
 // RENDERING — extension app: enumerates + requests display rendering modes,
 // tiles = window x recommendedViewScaleXY, chains the XR_DXR_view_rig CAMERA
@@ -28,21 +32,17 @@
 
 #include <vulkan/vulkan.h>
 
-// X11 window + input (handle app) — before the OpenXR platform header so the
-// xlib binding struct sees the real Display/Window types.
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/Xatom.h>
+// The Linux window (displayxr::linux_window) — before the OpenXR platform
+// header so the window-binding structs see the real Display/Window/wl_* types.
+// Keys arrive as X11 keysyms on both backends.
+#include "dxr_linux_window.h"
 #include <X11/keysym.h>
-#include <X11/extensions/Xrandr.h>
 
 // X11's headers #define plain words: None/Success (X.h) and Bool/Status
 // (Xlib.h). Those collide with cesium-native + rapidjson identifiers
-// (CesiumUtility::JsonValue::Bool, CreditReferencer::None, ...), so capture
-// the one constant this file needs and drop the macros before any cesium
-// header is pulled in. The X11 function signatures were already parsed above,
-// so the calls below are unaffected.
-static const Atom kXAtomNone = None;
+// (CesiumUtility::JsonValue::Bool, CreditReferencer::None, ...), so drop the
+// macros before any cesium header is pulled in. The X11 declarations were
+// already parsed above, so nothing below is affected.
 #undef None
 #undef Bool
 #undef Status
@@ -56,6 +56,7 @@ static const Atom kXAtomNone = None;
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_xlib_window_binding.h>
+#include <openxr/XR_DXR_wayland_surface_binding.h>
 // INV-3.1 / runtime #1486: DxrSelectViewConfigType() — the N-view opt-in.
 // ADR-041 / runtime #1612: DxrAliasInactiveViews() — the layer carries EVERY
 // located view. Both come from displayxr-common's dxr_view_config.h (via
@@ -110,6 +111,11 @@ static const Atom kXAtomNone = None;
 	} while (0)
 
 static volatile sig_atomic_t g_running = 1;
+
+//! The window — X11 or native Wayland, header bar, drag, F11
+//! (displayxr::linux_window). Destroyed LAST (the runtime's VkSurfaceKHR
+//! borrows its connection).
+static DxrLinuxWindow g_window;
 static void
 SignalHandler(int)
 {
@@ -186,15 +192,18 @@ struct AppXrSession
 	bool hasDisplayInfoExt = false;
 	bool hasViewRigExt = false;
 	bool hasXlibBindingExt = false;
+	bool hasWaylandBindingExt = false;
+	//! Window platform resolved before xrCreateInstance; Auto = hosted-NULL.
+	DxrWindowBackend windowBackend = DxrWindowBackend::Auto;
 	uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
 	float displayWidthM = 0, displayHeightM = 0;
 	float nominalViewerZ = 0.5f;
 	int32_t displayScreenLeft = 0; // 3D-panel top-left in virtual-desktop px
 	int32_t displayScreenTop = 0;
 
-	// App-owned X11 window (handle app). Null display = hosted-NULL fallback.
-	Display *xDisplay = nullptr;
-	::Window xWindow = 0;
+	// App-owned window (g_window). False = hosted-NULL fallback. xWinW/H is the
+	// CONTENT size (the bound window/surface, header bar excluded).
+	bool hasAppWindow = false;
 	unsigned int xWinW = 0, xWinH = 0;
 
 	PFN_xrRequestDisplayRenderingModeDXR pfnRequestMode = nullptr;
@@ -222,7 +231,7 @@ struct AppXrSession
 // ── OpenXR + Vulkan bootstrap (Linux arm of the macOS harness, no MoltenVK
 //    portability bits, no window binding) ─────────────────────────────────
 static bool
-InitializeOpenXR(AppXrSession &xr)
+InitializeOpenXR(AppXrSession &xr, DxrWindowBackend requestedBackend)
 {
 	uint32_t extCount = 0;
 	xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
@@ -241,6 +250,8 @@ InitializeOpenXR(AppXrSession &xr)
 			xr.hasViewRigExt = true;
 		if (strcmp(e.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0)
 			xr.hasXlibBindingExt = true;
+		if (strcmp(e.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0)
+			xr.hasWaylandBindingExt = true;
 	}
 	if (!hasVulkan) {
 		LOG_ERROR("XR_KHR_vulkan_enable not available");
@@ -253,8 +264,24 @@ InitializeOpenXR(AppXrSession &xr)
 		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	if (xr.hasViewRigExt)
 		enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
-	if (xr.hasXlibBindingExt)
+	// Window platform, resolved BEFORE xrCreateInstance so only the binding the
+	// session will chain is enabled. A capability probe, never session env
+	// vars; an explicit --platform wins. Nothing usable -> hosted-NULL.
+	{
+		std::string why;
+		xr.windowBackend = DxrLinuxWindow::select(requestedBackend, xr.hasXlibBindingExt,
+		                                          xr.hasWaylandBindingExt, &why);
+		if (xr.windowBackend == DxrWindowBackend::Auto)
+			LOG_WARN("No usable window platform (%s) — hosted-NULL windowing", why.c_str());
+		else
+			LOG_INFO("Window platform: %s (requested %s) — %s",
+			         DxrLinuxWindow::backend_name(xr.windowBackend),
+			         DxrLinuxWindow::backend_name(requestedBackend), why.c_str());
+	}
+	if (xr.windowBackend == DxrWindowBackend::X11)
 		enabled.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
+	if (xr.windowBackend == DxrWindowBackend::Wayland)
+		enabled.push_back(XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME);
 
 	XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
 	strncpy(ci.applicationInfo.applicationName, "DisplayXREarthViewLinux",
@@ -470,25 +497,19 @@ CreateSession(AppXrSession &xr, VkInstance vkInstance, VkPhysicalDevice pd,
 	vkBinding.queueFamilyIndex = qfi;
 	vkBinding.queueIndex = 0;
 
-	// Handle app: pass the app-owned X11 window via XR_DXR_xlib_window_binding
-	// so the runtime weaves window-relative (runtime#729/#730). Falls back to
-	// hosted-NULL (no window binding — the runtime self-creates a window at
-	// native resolution) when CreateAppWindow didn't run.
-	XrXlibWindowBindingCreateInfoDXR xlibBinding = {
-	    XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
-	xlibBinding.next = &vkBinding;
-	xlibBinding.xDisplay = xr.xDisplay;
-	xlibBinding.window = xr.xWindow;
-	xlibBinding.transparentBackgroundEnabled = XR_FALSE;
-	const bool useAppWindow =
-	    (xr.hasXlibBindingExt && xr.xDisplay != nullptr && xr.xWindow != 0);
+	// Handle app: the window helper hands back the binding for its platform
+	// (xlib, or Wayland + its surface-geometry struct), bound to the CONTENT,
+	// opaque. Falls back to hosted-NULL (no window binding — the runtime
+	// self-creates a window at native resolution) when there is no app window.
+	const bool useAppWindow = xr.hasAppWindow;
 
 	XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
-	si.next = useAppWindow ? (const void *)&xlibBinding : (const void *)&vkBinding;
+	si.next = useAppWindow ? g_window.session_binding_chain(&vkBinding) : (const void *)&vkBinding;
 	si.systemId = xr.systemId;
 	XR_CHECK(xrCreateSession(xr.instance, &si, &xr.session));
-	LOG_INFO("Session created (%s)",
-	         useAppWindow ? "app-owned window, handle app" : "hosted-NULL");
+	if (useAppWindow)
+		g_window.attach_session(xr.instance, xr.session); // Wayland geometry feed
+	LOG_INFO("Session created (%s)", useAppWindow ? g_window.describe().c_str() : "hosted-NULL");
 
 	if (xr.pfnEnumerateModes && xr.session != XR_NULL_HANDLE) {
 		uint32_t modeCount = 0;
@@ -658,13 +679,8 @@ CleanupOpenXR(AppXrSession &xr)
 		xrDestroySession(xr.session);
 	if (xr.instance)
 		xrDestroyInstance(xr.instance);
-	// Tear down the app-owned X11 window after the runtime has released it.
-	if (xr.xWindow != 0 && xr.xDisplay != nullptr)
-		XDestroyWindow(xr.xDisplay, xr.xWindow);
-	if (xr.xDisplay != nullptr)
-		XCloseDisplay(xr.xDisplay);
-	xr.xWindow = 0;
-	xr.xDisplay = nullptr;
+	// The app window is destroyed separately, LAST — after the Vulkan
+	// instance, since the runtime's VkSurfaceKHR borrows its connection.
 }
 
 // ── EarthView scene state ────────────────────────────────────────────────
@@ -678,130 +694,28 @@ static std::vector<TileRenderer::DrawItem> g_drawList;
 // Falls back to the display size on the hosted-NULL path.
 static uint32_t g_windowW = 1920, g_windowH = 1080;
 
-// ── app-owned X11 window (handle app) ────────────────────────────────────
+// ── app-owned window (handle app) — displayxr::linux_window, X11 or Wayland ──
 static const unsigned int kDefaultWindowW = 1920;
 static const unsigned int kDefaultWindowH = 1080;
-static Atom g_wmDeleteAtom = kXAtomNone;
 
-// Find the target panel rect (virtual-desktop px). Prefer the RandR PRIMARY
-// output; else the largest connected NON-eDP/LVDS output (the 3D display is
-// an external panel, not the laptop's built-in). Same helper as the other
-// demos.
-static bool
-GetPanelRect(Display *dpy, ::Window root, int &x, int &y, int &w, int &h)
-{
-	XRRScreenResources *res = XRRGetScreenResources(dpy, root);
-	if (res == nullptr)
-		return false;
-
-	auto tryOutput = [&](RROutput out) -> bool {
-		XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, out);
-		if (oi == nullptr)
-			return false;
-		bool ok = false;
-		if (oi->connection == RR_Connected && oi->crtc != 0) {
-			XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
-			if (ci != nullptr && ci->width > 0 && ci->height > 0) {
-				x = ci->x;
-				y = ci->y;
-				w = (int)ci->width;
-				h = (int)ci->height;
-				ok = true;
-			}
-			if (ci != nullptr)
-				XRRFreeCrtcInfo(ci);
-		}
-		XRRFreeOutputInfo(oi);
-		return ok;
-	};
-
-	bool found = false;
-	RROutput primary = XRRGetOutputPrimary(dpy, root);
-	if (primary != 0 && tryOutput(primary))
-		found = true;
-	if (!found) {
-		long bestArea = 0;
-		for (int i = 0; i < res->noutput; i++) {
-			XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, res->outputs[i]);
-			if (oi == nullptr)
-				continue;
-			const bool isBuiltin =
-			    oi->name != nullptr && (strncasecmp(oi->name, "eDP", 3) == 0 ||
-			                            strncasecmp(oi->name, "LVDS", 4) == 0);
-			if (oi->connection == RR_Connected && oi->crtc != 0 && !isBuiltin) {
-				XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
-				if (ci != nullptr && ci->width > 0 && ci->height > 0) {
-					const long area = (long)ci->width * (long)ci->height;
-					if (area > bestArea) {
-						bestArea = area;
-						x = ci->x;
-						y = ci->y;
-						w = (int)ci->width;
-						h = (int)ci->height;
-						found = true;
-					}
-				}
-				if (ci != nullptr)
-					XRRFreeCrtcInfo(ci);
-			}
-			XRRFreeOutputInfo(oi);
-		}
-	}
-	XRRFreeScreenResources(res);
-	return found;
-}
-
-// Create a normal decorated X11 window (opaque, default visual), landscape
-// 1920x1080 centered on the 3D panel — the app passes it via
-// XR_DXR_xlib_window_binding so the runtime weaves window-relative. Override
-// with EARTHVIEW_WINDOW="WxH+X+Y" (X,Y absolute virtual-desktop px; WxH alone
-// re-centers). Returns false (xDisplay left null) when no X server is
-// available, so the caller falls back to hosted-NULL (also the CI-safe path).
+// Create the window: 1920x1080 content centred on the 3D panel (a panel-sized
+// EARTHVIEW_WINDOW goes fullscreen on it, INV-1.3), with the shared header
+// bar. Override with EARTHVIEW_WINDOW="WxH+X+Y" (X,Y absolute virtual-desktop
+// px, X11 only; WxH alone re-centers). Returns false when no window could be
+// made, so the caller falls back to hosted-NULL (also the CI-safe path).
 static bool
 CreateAppWindow(AppXrSession &xr)
 {
-	Display *dpy = XOpenDisplay(nullptr);
-	if (dpy == nullptr) {
-		LOG_INFO("XOpenDisplay failed (no X server) — using hosted-NULL windowing");
+	if (xr.windowBackend == DxrWindowBackend::Auto)
 		return false;
-	}
-	int screen = DefaultScreen(dpy);
-	::Window root = RootWindow(dpy, screen);
-
-	XSetWindowAttributes attrs = {};
-	attrs.background_pixel = BlackPixel(dpy, screen);
-	attrs.event_mask = StructureNotifyMask | KeyPressMask;
 
 	unsigned int w = kDefaultWindowW, h = kDefaultWindowH;
+	const bool panelKnown = xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0;
+	const int prx = xr.displayScreenLeft, pry = xr.displayScreenTop;
+	const int prw = (int)xr.displayPixelWidth, prh = (int)xr.displayPixelHeight;
+	bool explicitPos = false;
 	int px = 0, py = 0;
-	int prx = 0, pry = 0, prw = 0, prh = 0;
-	if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
-		// Authoritative: XR_DXR_display_info reports the 3D panel's desktop
-		// rect. Prefer it — on a multi-monitor box the RandR PRIMARY is often
-		// NOT the 3D panel.
-		prx = xr.displayScreenLeft;
-		pry = xr.displayScreenTop;
-		prw = (int)xr.displayPixelWidth;
-		prh = (int)xr.displayPixelHeight;
-		px = prx + (prw - (int)w) / 2;
-		py = pry + (prh - (int)h) / 2;
-		LOG_INFO("3D panel (display_info) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
-		         prw, prh, prx, pry, w, h, px, py);
-	} else if (GetPanelRect(dpy, root, prx, pry, prw, prh)) {
-		px = prx + (prw - (int)w) / 2;
-		py = pry + (prh - (int)h) / 2;
-		LOG_INFO("Panel rect (Xrandr) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
-		         prw, prh, prx, pry, w, h, px, py);
-	} else {
-		const int sw = DisplayWidth(dpy, screen), sh = DisplayHeight(dpy, screen);
-		px = (sw - (int)w) / 2;
-		py = (sh - (int)h) / 2;
-		LOG_INFO("Xrandr panel query failed — centering %ux%u on default screen %dx%d at (%d,%d)",
-		         w, h, sw, sh, px, py);
-	}
 
-	// EARTHVIEW_WINDOW="WxH+X+Y" override (X,Y absolute virtual-desktop px);
-	// WxH alone re-centers on the same panel/screen origin.
 	if (const char *wenv = getenv("EARTHVIEW_WINDOW")) {
 		unsigned int ow = 0, oh = 0;
 		int ox = 0, oy = 0;
@@ -810,100 +724,81 @@ CreateAppWindow(AppXrSession &xr)
 			w = ow;
 			h = oh;
 			if (n >= 4) {
+				explicitPos = true;
 				px = ox;
 				py = oy;
-				LOG_INFO("EARTHVIEW_WINDOW override: %ux%u at absolute (%d,%d)", w, h, px, py);
-			} else {
-				if (prw > 0 && prh > 0) {
-					px = prx + (prw - (int)w) / 2;
-					py = pry + (prh - (int)h) / 2;
-				}
-				LOG_INFO("EARTHVIEW_WINDOW override: %ux%u (re-centered at %d,%d)", w, h, px, py);
 			}
+			LOG_INFO("EARTHVIEW_WINDOW override: %ux%u%s", w, h, n >= 4 ? " at an absolute position" : "");
 		}
 	}
+	if (!explicitPos && panelKnown) {
+		px = prx + (prw - (int)w) / 2;
+		py = pry + (prh - (int)h) / 2;
+		LOG_INFO("3D panel (display_info) %dx%d at (%d,%d) — centering %ux%u window at (%d,%d)",
+		         prw, prh, prx, pry, w, h, px, py);
+	}
 
-	::Window win = XCreateWindow(dpy, root, px, py, w, h, 0, CopyFromParent,
-	                             InputOutput, CopyFromParent,
-	                             CWBackPixel | CWEventMask, &attrs);
-	if (win == 0) {
-		LOG_ERROR("XCreateWindow failed — using hosted-NULL windowing");
-		XCloseDisplay(dpy);
+	DxrLinuxWindowDesc desc;
+	desc.width = w;
+	desc.height = h;
+	desc.panel_left = prx;
+	desc.panel_top = pry;
+	desc.panel_width = (uint32_t)prw;
+	desc.panel_height = (uint32_t)prh;
+	desc.title = "DisplayXR EarthView";
+	desc.app_id = "com.displayxr.earthview";
+	desc.x11_header_bar = true;  // the title bar the WM used to draw, now phase-snapped
+	desc.x11_drag_button = 0;    // no mouse input in this app; the bar is the drag handle
+	desc.wayland_drag_button = 0;
+	desc.has_position = explicitPos || panelKnown;
+	desc.x = px;
+	desc.y = py;
+	desc.fullscreen_on_wayland = panelKnown && (int)w == prw && (int)h == prh;
+
+	if (!g_window.create(xr.windowBackend, desc)) {
+		LOG_WARN("%s window creation failed — using hosted-NULL windowing",
+		         DxrLinuxWindow::backend_name(xr.windowBackend));
 		return false;
 	}
-	XStoreName(dpy, win, "DisplayXR EarthView");
-
-	// Close button → clean exit (ClientMessage in the event pump).
-	g_wmDeleteAtom = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-	if (g_wmDeleteAtom != kXAtomNone)
-		XSetWMProtocols(dpy, win, &g_wmDeleteAtom, 1);
-
-	// WM_NORMAL_HINTS with USPosition|PPosition so the WM honors the
-	// create-time position instead of auto-placing (GNOME/Mutter).
-	{
-		XSizeHints hints = {};
-		hints.flags = USPosition | PPosition;
-		hints.x = px;
-		hints.y = py;
-		XSetWMNormalHints(dpy, win, &hints);
-	}
-
-	XMapWindow(dpy, win);
-	XFlush(dpy);
-	// Re-assert the position after mapping — Mutter ignores the create-time
-	// x/y of a freshly-mapped toplevel but honors a post-map move.
-	XMoveWindow(dpy, win, px, py);
-	XFlush(dpy);
-
-	xr.xDisplay = dpy;
-	xr.xWindow = win;
-	xr.xWinW = w;
-	xr.xWinH = h;
-	LOG_INFO("Created %ux%u app window at (%d,%d) — XR_DXR_xlib_window_binding",
-	         w, h, px, py);
+	xr.hasAppWindow = true;
+	uint32_t cw = w, ch = h;
+	g_window.current_size(&cw, &ch);
+	xr.xWinW = cw;
+	xr.xWinH = ch;
+	LOG_INFO("Created %ux%u window on %s", cw, ch, g_window.connection_description().c_str());
 	return true;
 }
 
-// Pump the app window's X11 events: B = cycle city bookmarks (Windows
-// parity), close button = clean exit, ConfigureNotify = track live window
-// size. NO file-open by design (EarthView streams tiles).
+// Drain the window once per frame (both backends): B = cycle city bookmarks
+// (Windows parity), the close button = clean exit, Resize = the live content
+// size. The header bar, its drag and F11 are the helper's. NO file-open by
+// design (EarthView streams tiles).
 static void
-PumpXEvents(AppXrSession &xr)
+PumpWindow(AppXrSession &xr)
 {
-	if (xr.xDisplay == nullptr)
+	if (!xr.hasAppWindow)
 		return;
-	while (XPending(xr.xDisplay) > 0) {
-		XEvent ev;
-		XNextEvent(xr.xDisplay, &ev);
-		switch (ev.type) {
-		case KeyPress: {
-			KeySym sym = XLookupKeysym(&ev.xkey, 0);
-			if (sym == XK_b || sym == XK_B) {
-				g_geoNav.cycleBookmark();
-				size_t n = 0;
-				const geo::Bookmark *bm = geo::bookmarks(&n);
-				if (n > 0)
-					LOG_INFO("Bookmark: %s", bm[g_geoNav.bookmarkIndex].name);
-			}
-			break;
-		}
-		case ConfigureNotify:
-			if (ev.xconfigure.width > 0 && ev.xconfigure.height > 0) {
-				xr.xWinW = (unsigned int)ev.xconfigure.width;
-				xr.xWinH = (unsigned int)ev.xconfigure.height;
-				g_windowW = xr.xWinW;
-				g_windowH = xr.xWinH;
-			}
-			break;
-		case ClientMessage:
-			if (g_wmDeleteAtom != kXAtomNone && (Atom)ev.xclient.data.l[0] == g_wmDeleteAtom) {
-				LOG_INFO("Window closed — exiting");
-				g_running = 0;
-			}
-			break;
-		default:
-			break;
-		}
+	bool running = true;
+	g_window.pump_events(
+	    [&xr](const DxrWindowEvent &ev) {
+		    if (ev.type == DxrWindowEvent::Type::KeyDown && !ev.repeat &&
+		        (ev.keysym == XK_b || ev.keysym == XK_B)) {
+			    g_geoNav.cycleBookmark();
+			    size_t n = 0;
+			    const geo::Bookmark *bm = geo::bookmarks(&n);
+			    if (n > 0)
+				    LOG_INFO("Bookmark: %s", bm[g_geoNav.bookmarkIndex].name);
+		    } else if (ev.type == DxrWindowEvent::Type::Resize) {
+			    xr.xWinW = ev.width;
+			    xr.xWinH = ev.height;
+			    g_windowW = xr.xWinW;
+			    g_windowH = xr.xWinH;
+		    }
+	    },
+	    &running);
+	if (!running) {
+		LOG_INFO("Window closed — exiting");
+		g_running = 0;
 	}
 }
 
@@ -919,10 +814,21 @@ CamVFovRad(float physHeightM, float nominalZ)
 }
 
 int
-main()
+main(int argc, char **argv)
 {
 	setvbuf(stdout, nullptr, _IONBF, 0);
 	setvbuf(stderr, nullptr, _IONBF, 0);
+
+	// Window platform: --platform=x11|wayland|auto (default auto, a capability
+	// probe — never session env vars).
+	DxrWindowBackend requestedBackend = DxrWindowBackend::Auto;
+	{
+		std::string err;
+		if (!DxrLinuxWindow::parse_platform_args(argc, argv, &requestedBackend, &err)) {
+			LOG_ERROR("%s", err.c_str());
+			return 1;
+		}
+	}
 
 	// EV_PROBE=<key>: validate a Map Tiles API key against Google and exit
 	// (0 = valid). No window / runtime / GPU needed — support tool, shared
@@ -975,7 +881,7 @@ main()
 	}
 
 	AppXrSession xr = {};
-	if (!InitializeOpenXR(xr)) {
+	if (!InitializeOpenXR(xr, requestedBackend)) {
 		LOG_ERROR("OpenXR init failed");
 		return 1;
 	}
@@ -1116,7 +1022,7 @@ main()
 
 	while (g_running && !xr.exitRequested) {
 		PollEvents(xr);
-		PumpXEvents(xr); // B = cycle bookmark; close button = exit
+		PumpWindow(xr); // B = cycle bookmark; close button = exit
 
 		// Assert the startup rendering mode ONCE, the first frame the session
 		// is running (the request is dropped by a not-yet-begun session, hence
@@ -1432,6 +1338,7 @@ main()
 		vkDestroyDevice(vkDevice, nullptr);
 	if (vkInstance)
 		vkDestroyInstance(vkInstance, nullptr);
+	g_window.destroy(); // LAST: the runtime's VkSurfaceKHR borrowed this connection
 	LOG_INFO("EarthView Linux exited cleanly.");
 	return 0;
 }

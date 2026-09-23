@@ -158,7 +158,7 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
             libxcb1-dev libx11-xcb-dev libxcb-glx0-dev libxxf86vm-dev \
-            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev libasound2-dev \
             libcurl4-openssl-dev libssl-dev zlib1g-dev \
             autoconf automake autoconf-archive libtool nasm \
             zip unzip tar curl
@@ -286,7 +286,7 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
             libxcb1-dev libx11-xcb-dev libxcb-glx0-dev libxxf86vm-dev \
-            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev libasound2-dev \
             libcurl4-openssl-dev libssl-dev zlib1g-dev \
             autoconf automake autoconf-archive libtool nasm \
             zip unzip xz-utils bzip2 patch perl \
