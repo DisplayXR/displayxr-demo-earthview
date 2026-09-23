@@ -33,10 +33,18 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.7.0
+    GIT_TAG v2.19.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
+
+# Header-only consumers that must NOT take a link dependency on
+# displayxr::common — tile_renderer is built by the Android leg too, which
+# never configures displayxr-common's own CMake (desktop platform deps). Cache
+# the header dir so sibling subdirectories (tiles_common/) can add it as an
+# include path. Keep in step with the Android leg's own copy of this variable.
+set(DISPLAYXR_COMMON_HEADERS_DIR "${displayxr_common_SOURCE_DIR}/common"
+    CACHE INTERNAL "displayxr-common header directory for header-only consumers")
 
 # Thin compatibility shims: the apps keep linking sr_common (Windows D3D11/HUD
 # stack) and sr_common_base (API-agnostic) — both now map onto

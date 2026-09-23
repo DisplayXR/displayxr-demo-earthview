@@ -9,6 +9,12 @@
 #include "tile_renderer.h"
 #include "geo_math.h"
 
+// dxr::VkDisplayReferredClearValue — display-referred clears (displayxr-common
+// common/vk_clear.h, runtime #1647 / INV-4.6). Header-only: tiles_common takes
+// the include directory, not a link dependency, so the Android leg (which does
+// not build displayxr::common) compiles it too.
+#include "vk_clear.h"
+
 #include <Cesium3DTilesSelection/Tile.h>
 #include <Cesium3DTilesSelection/ViewUpdateResult.h>
 #include <CesiumAsync/AsyncSystem.h>
@@ -33,6 +39,11 @@ extern "C" int stbi_write_png(const char *filename, int w, int h, int comp, cons
 
 namespace {
 
+// Display-referred (what a colour picker gives you): #87BFEB. It is NOT handed
+// to Vulkan as-is — `colorFormat_` is an `_SRGB` attachment, so the hardware
+// applies the sRGB OETF to whatever clear value it is given (INV-4.6). Passed
+// raw it measured (192,225,246) in the attachment instead of (135,191,235) —
+// a washed-out sky. dxr::VkDisplayReferredClearValue() linearises it first.
 constexpr float kSkyColor[4] = {0.53f, 0.75f, 0.92f, 1.0f};
 
 struct TileVertex
@@ -958,7 +969,11 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	vkBeginCommandBuffer(cmd, &bi);
 
 	VkClearValue clears[2];
-	clears[0].color = {{kSkyColor[0], kSkyColor[1], kSkyColor[2], kSkyColor[3]}};
+	// Format-derived: this attachment is the thing that encodes (the shader
+	// writes scene-linear into it, and the blit into the sRGB swapchain is
+	// _SRGB -> _SRGB, i.e. value-preserving), so its own VkFormat answers what
+	// space the clear has to be in.
+	clears[0] = dxr::VkDisplayReferredClearValue(colorFormat_, kSkyColor);
 	clears[1].depthStencil = {1.0f, 0};
 
 	VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};

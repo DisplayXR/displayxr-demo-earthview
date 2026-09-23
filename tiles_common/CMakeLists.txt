@@ -65,6 +65,21 @@ target_include_directories(tile_renderer PUBLIC
     ${CMAKE_CURRENT_BINARY_DIR}
 )
 
+# displayxr-common's display-referred clear helpers (common/vk_clear.h +
+# clear_policy.h + color_policy.h — header-only, INV-4.6 / runtime #1647).
+# An include directory, deliberately NOT target_link_libraries(displayxr::common):
+# the Android leg builds this same library without that target. The variable is
+# set by common/CMakeLists.txt on desktop and by the Android CMakeLists before
+# it adds this subdirectory.
+if(NOT DISPLAYXR_COMMON_HEADERS_DIR)
+    message(FATAL_ERROR
+        "DISPLAYXR_COMMON_HEADERS_DIR is not set — tile_renderer needs "
+        "displayxr-common's common/ header directory (vk_clear.h). Configure "
+        "through the repo root (which adds common/ first) or set it before "
+        "add_subdirectory(tiles_common).")
+endif()
+target_include_directories(tile_renderer PRIVATE ${DISPLAYXR_COMMON_HEADERS_DIR})
+
 target_link_libraries(tile_renderer PUBLIC
     Vulkan::Vulkan
     Cesium3DTilesSelection

@@ -33,6 +33,7 @@
 #include "tile_engine.h"
 #include "tile_renderer.h"
 #include "dxr_view_math.h"  // cam->display rig converter (focus/orbit display rig)
+#include "vk_clear.h"       // dxr::VkDisplayReferredClearColor (INV-4.6, runtime #1647)
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/android_sink.h>
@@ -586,7 +587,11 @@ clear_atlas(VkImage image, float r, float g, float b)
 		vkCmdPipelineBarrier(g_cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &m);
 	};
 	bar(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-	VkClearColorValue c = {}; c.float32[0]=r; c.float32[1]=g; c.float32[2]=b; c.float32[3]=1.0f;
+	// r,g,b are display-referred, as authored. The atlas swapchain may be an
+	// `_SRGB` format, in which case the hardware applies the sRGB OETF to the
+	// clear value (INV-4.6) — linearise first so the colour lands as written.
+	const float display_referred[4] = {r, g, b, 1.0f};
+	VkClearColorValue c = dxr::VkDisplayReferredClearColor(g_swapchain_format, display_referred);
 	vkCmdClearColorImage(g_cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &range);
 	bar(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 	vkEndCommandBuffer(g_cmd);

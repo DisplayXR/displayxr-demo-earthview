@@ -52,6 +52,7 @@
 #include <sys/stat.h>
 
 #include "view_params.h"
+#include "vk_clear.h"   // dxr::VkDisplayReferredClearColor (INV-4.6, runtime #1647)
 #include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
 #include "display3d_view.h"
 #include "camera3d_view.h"
@@ -1933,7 +1934,7 @@ static void CleanupOpenXR(AppXrSession& xr) {
 // ============================================================================
 
 static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
-                               VkImage image, uint32_t w, uint32_t h,
+                               VkImage image, VkFormat imageFormat, uint32_t w, uint32_t h,
                                float yaw, float pitch) {
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
@@ -1954,7 +1955,11 @@ static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
     // Tint color based on camera direction so drag-rotation gives visual feedback
     float ny = (yaw / 3.14159f) * 0.5f + 0.5f;   // 0..1 over ±π
     float np = (pitch / 1.5f) * 0.5f + 0.5f;       // 0..1 over ±1.5 rad
-    VkClearColorValue cc = {{0.05f + ny * 0.15f, 0.08f + np * 0.12f, 0.15f, 1.0f}};
+    // Display-referred, as authored. An `_SRGB` swapchain applies the sRGB OETF
+    // to the clear value (INV-4.6), so it has to be linearised first — passed
+    // raw, the default pose's (32,36,38) lands at (101,106,109).
+    const float displayReferred[4] = {0.05f + ny * 0.15f, 0.08f + np * 0.12f, 0.15f, 1.0f};
+    VkClearColorValue cc = dxr::VkDisplayReferredClearColor(imageFormat, displayReferred);
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &range);
 
@@ -2817,7 +2822,7 @@ int main() {
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
-                                    targetImage, xr.swapchain.width, xr.swapchain.height,
+                                    targetImage, swapFormat, xr.swapchain.width, xr.swapchain.height,
                                     g_input.yaw, g_input.pitch);
                             }
 

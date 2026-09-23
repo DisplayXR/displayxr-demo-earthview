@@ -27,6 +27,7 @@
 
 #include "logging.h"
 #include "input_handler.h"
+#include "vk_clear.h"   // dxr::VkDisplayReferredClearColor (INV-4.6, runtime #1647)
 #include "xr_session.h"
 
 // cesium-native headers (pulled in transitively by tile_renderer.h) define
@@ -1041,9 +1042,16 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
     }
 }
 
+// The placeholder background, display-referred (#1A1A1F). `imageFormat` is the
+// swapchain's own VkFormat: an `_SRGB` swapchain applies the sRGB OETF to the
+// clear value (INV-4.6), so this has to be linearised first or the "dark gray"
+// lands at (89,89,96) instead of (26,26,31).
+static constexpr float kPlaceholderColor[4] = {0.1f, 0.1f, 0.12f, 1.0f};
+
 // Render a simple "no scene" placeholder by clearing to dark gray
 static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdPool,
-                               VkImage image, uint32_t width, uint32_t height) {
+                               VkImage image, VkFormat imageFormat,
+                               uint32_t width, uint32_t height) {
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = cmdPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -1069,7 +1077,8 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    VkClearColorValue clearColor = {{0.1f, 0.1f, 0.12f, 1.0f}};
+    VkClearColorValue clearColor =
+        dxr::VkDisplayReferredClearColor(imageFormat, kPlaceholderColor);
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
 
@@ -2074,7 +2083,8 @@ static void RenderThreadFunc(
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
-                                    (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
+                                    (*swapchainVkImages)[imageIndex], (VkFormat)xr->swapchain.format,
+                                    xr->swapchain.width, xr->swapchain.height);
                             }
 
                             // 'I' key: snapshot the multi-view atlas via xrCaptureAtlasDXR

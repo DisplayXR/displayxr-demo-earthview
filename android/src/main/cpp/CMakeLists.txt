@@ -45,6 +45,27 @@ endif()
 set(CESIUM_TESTS_ENABLED OFF CACHE BOOL "" FORCE)
 add_subdirectory(${REPO_ROOT}/third_party/cesium-native cesium-native EXCLUDE_FROM_ALL)
 
+# displayxr-common sources: the cam<->display rig converter
+# (dxr_view_rig_camera_to_display, include/) for the focus/orbit display-rig
+# model, and the header-only display-referred clear helpers (common/vk_clear.h,
+# INV-4.6) used by tile_renderer and clear_atlas() — the same sources the
+# desktop legs get via displayxr::common. Self-contained; fetch sources and
+# compile the one TU (don't run its CMake, which carries desktop platform deps).
+# Populated BEFORE tiles_common is added: tile_renderer needs
+# DISPLAYXR_COMMON_HEADERS_DIR at configure time.
+include(FetchContent)
+FetchContent_Declare(displayxr_common_dxr
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG v2.19.0 GIT_SHALLOW TRUE)
+FetchContent_GetProperties(displayxr_common_dxr)
+if(NOT displayxr_common_dxr_POPULATED)
+    FetchContent_Populate(displayxr_common_dxr)
+endif()
+set(DXR_VIEW_MATH_DIR ${displayxr_common_dxr_SOURCE_DIR}/include)
+# Mirrors what common/CMakeLists.txt caches on the desktop legs.
+set(DISPLAYXR_COMMON_HEADERS_DIR "${displayxr_common_dxr_SOURCE_DIR}/common"
+    CACHE INTERNAL "displayxr-common header directory for header-only consumers")
+
 # ── Shared scene layer (tile_renderer: cesium glue + Vulkan draw + geo math) ─
 # Reuses the maintained tiles_common/CMakeLists.txt — same renderer the desktop
 # legs build. It bakes the tile.vert/tile.frag SPIR-V headers and links cesium.
@@ -59,20 +80,6 @@ target_include_directories(native_app_glue PUBLIC
 # Khronos OpenXR loader from the openxr_loader_for_android .aar (prefab).
 find_package(OpenXR REQUIRED CONFIG)
 
-# displayxr-common's cam<->display rig converter (dxr_view_rig_camera_to_display)
-# for the focus/orbit display-rig model — the same source the desktop legs link
-# via displayxr::common. Self-contained pure math; fetch sources + compile the
-# one TU (don't run its CMake, which carries desktop platform deps).
-include(FetchContent)
-FetchContent_Declare(displayxr_common_dxr
-    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.0.0 GIT_SHALLOW TRUE)
-FetchContent_GetProperties(displayxr_common_dxr)
-if(NOT displayxr_common_dxr_POPULATED)
-    FetchContent_Populate(displayxr_common_dxr)
-endif()
-set(DXR_VIEW_MATH_DIR ${displayxr_common_dxr_SOURCE_DIR}/include)
-
 # stb_impl.c provides stbi_write_png (tile_renderer's dumpColorTarget needs it;
 # the desktop legs get it from displayxr-common, which the Android leg omits).
 add_library(earthview_vk_android SHARED main.cpp stb_impl.c
@@ -84,6 +91,7 @@ target_include_directories(earthview_vk_android BEFORE PRIVATE
     ${REPO_ROOT}/spike                      # stb_image_write.h (single-header)
     ${REPO_ROOT}/common                     # dxr_math.h
     ${DXR_VIEW_MATH_DIR}                     # dxr_view_math.h (rig converter)
+    ${DISPLAYXR_COMMON_HEADERS_DIR}          # vk_clear.h (display-referred clears)
     # DisplayXR's in-tree OpenXR headers BEFORE the AAR's stock set.
     ${REPO_ROOT}/openxr_includes)
 
