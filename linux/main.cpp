@@ -23,16 +23,23 @@
 // rig on xrLocateViews (the default camera-centric FLY view — the runtime owns
 // the off-axis eyes; convergence auto-focuses on the forward ground ray), and
 // remaps the GL projection to Vulkan [0,1] depth. Mirrors the windows/main.cpp
-// fly path; orbit/focus/HUD/MCP/atlas-capture remain per-platform UI concerns.
+// fly path and its double-click focus (display rig); HUD/MCP/atlas-capture
+// remain per-platform UI concerns.
 //
 // INPUT — the Windows leg's geo navigation, onto the helper's pump_events:
 // left-drag look (0.005 rad/px), wheel dolly (0.5 step/notch), WASD pan + E/Q
-// climb (held keys, 0.5*dt), Space reframe the bookmark, B cycle bookmarks,
-// C orbit -> fly, Esc release an acquired orbit else exit; close button exits.
-// Not ported (Windows-only machinery with no Linux counterpart yet): the HUD
-// mode/city buttons, double-click POI focus, V/0-8/T/M, I atlas capture, X
-// supersampling, Ctrl+K key dialog. NO file-open by design: EarthView streams
-// tiles, there is no model to load.
+// climb (held keys, 0.5*dt), Space reframe the bookmark, B cycle bookmarks;
+// close button exits. Double-click = FOCUS (windows/main.cpp's model): a
+// depth-readback pick under the cursor becomes the POI, the camera re-aims
+// onto it over ~0.4 s, the view switches seamlessly from the camera rig to
+// the display rig with the POI on the zero-parallax plane, and left-drag /
+// wheel then orbit / zoom about it (10 s idle = a slow turntable). C, or any
+// of WASDQE, returns to fly; a further double-click moves the POI. Esc exits
+// (on Windows too: its Esc only releases a diorama orbit, which nothing
+// acquires). Not ported (Windows-only UI with no Linux counterpart yet): the
+// HUD mode/city buttons, V/0-8/T/M, I atlas capture, X supersampling, Ctrl+K
+// key dialog. NO file-open by design: EarthView streams tiles, there is no
+// model to load.
 
 #define XR_USE_GRAPHICS_API_VULKAN
 
@@ -76,6 +83,10 @@
 #include "tile_renderer.h"
 
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp> // glm::rotate — focus orbit / turntable
+#include <glm/gtc/type_ptr.hpp>         // glm::make_mat4 — the pick unproject
+
+#include "dxr_view_math.h" // dxr_view_rig_camera_to_display — focus rig switch
 
 #include <array>
 #include <chrono>
@@ -695,6 +706,39 @@ static TileEngine g_tileEngine;
 static geo::GeoNav g_geoNav;
 static bool g_tilesActive = false;
 static std::vector<TileRenderer::DrawItem> g_drawList;
+// World mapping of the frame being rendered (the pick unprojects through it).
+static glm::dmat4 g_xrFromEcef(1.0);
+
+// Double-click pick, deferred until after eye 0 renders this frame (the
+// depth-readback unproject needs the eye's depth buffer + matrices).
+static bool g_pickRequested = false; // set by PumpWindow (Windows: teleportRequested)
+static float g_pickMouseX = 0.0f, g_pickMouseY = 0.0f; // content px
+static bool g_pendingPick = false;
+static float g_pickNdcX = 0.0f, g_pickNdcY = 0.0f;
+
+// Camera-rig convergence (1/m) — auto-focused on the forward ground ray in
+// fly, frozen while focused. g_viewDistXR = frustum-source eye->focus
+// distance. Canvas size (m) from XrViewDisplayRawDXR::canvasSizeMeters.
+static float g_convDiopters = 1.0f;
+static float g_viewDistXR = 0.0f;
+static float g_canvasWM = 0.0f, g_canvasHM = 0.0f;
+
+// Double-click "focus" model (windows/main.cpp, macOS parity): seamless
+// cam->display rig switch, frame the picked POI onto the zero-parallax plane
+// via targetDist, and orbit the CAMERA around it. World stays camera-centric.
+static bool g_focusActive = false;
+static double g_focusT = 0.0;             // 0->1 re-aim/reframe transition
+static glm::dvec3 g_focusPOIecef(0.0);    // POI in ECEF — orbit pivot + ZDP target
+static glm::dvec3 g_poiXitFromDir(0.0), g_poiXitToDir(0.0);
+static double g_poiXitFromTD = 0.0, g_poiXitToTD = 0.0;
+// Stereo "fullness": 1 in focus (display ipd/par -> 1), 0 in fly. Glides
+// toward g_focusActive; the rig branches lerp ipd/par by it.
+static double g_stereoFull = 0.0;
+
+// Idle turntable (Windows InputState: animateEnabled is set true at startup
+// and only M toggles it — M is not ported, so it stays on).
+static constexpr bool kAnimateEnabled = true;
+static double g_lastInputTimeSec = 0.0;
 
 // Tile basis for a handle app: the app window (window × viewScale, #729-style).
 // Falls back to the display size on the hosted-NULL path.
@@ -792,28 +836,87 @@ struct HeldKeys
 };
 static HeldKeys g_keys;
 
-// Geo navigation — windows/main.cpp UpdateGeoNav, minus its [FOCUS] branches
-// (double-click POI focus is not ported to Linux, so g_focusActive is always
-// false there and only the fly branches below run).
+static double
+NowSec()
+{
+	using namespace std::chrono;
+	return (double)duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count() *
+	       1e-6;
+}
+
+// A fresh user interaction restarts the idle-turntable timer (Windows'
+// MarkUserInput: key press, button press, wheel notch, drag motion).
+static void
+MarkUserInput()
+{
+	g_lastInputTimeSec = NowSec();
+}
+
+// Geo navigation — windows/main.cpp UpdateGeoNav, transcribed branch for
+// branch (its [FOCUS] model included). The XR rig pose stays FIXED; only the
+// double-precision geo camera moves.
 static void
 UpdateGeoNav(double dt)
 {
 	const float lookDX = g_lookDX, lookDY = g_lookDY, dollySteps = g_dollySteps;
 	const bool releaseToFly = g_releaseToFlyRequested;
-	const bool releaseOrbit = g_releaseOrbitRequested;
+	const bool resetOrReleaseOrbit = g_releaseOrbitRequested;
 	const bool cycleBookmark = g_cycleBookmarkRequested;
 	g_lookDX = g_lookDY = g_dollySteps = 0.0f;
 	g_releaseToFlyRequested = g_releaseOrbitRequested = g_cycleBookmarkRequested = false;
 
-	if (releaseToFly && g_geoNav.orbitAcquired) {
-		// Inert today: nothing on Linux acquires an orbit (no diorama path).
-		// Windows passes the tracked viewer's XR z as the ZDP distance; the
-		// Linux fly rig pins the target at kTargetXrDist = 1 XR metre.
-		g_geoNav.releaseToFly(1.0);
-		LOG_INFO("Released orbit -> fly mode (continuous)");
+	// [FOCUS] smooth POI transition (~0.4 s): re-aim cam.dir toward the new
+	// POI (slerp) + reframe targetDist (log-lerp) so the feature glides to
+	// centre and onto the zero-parallax plane. Camera position is fixed.
+	if (g_focusActive && g_focusT < 1.0) {
+		g_focusT += dt / 0.4;
+		double t = g_focusT > 1.0 ? 1.0 : g_focusT;
+		double e = t * t * (3.0 - 2.0 * t); // smoothstep
+		double cosA = glm::clamp(glm::dot(g_poiXitFromDir, g_poiXitToDir), -1.0, 1.0);
+		double ang = std::acos(cosA);
+		if (ang < 1.0e-4) {
+			g_geoNav.cam.dir = g_poiXitToDir;
+		} else {
+			double s0 = std::sin((1.0 - e) * ang) / std::sin(ang);
+			double s1 = std::sin(e * ang) / std::sin(ang);
+			g_geoNav.cam.dir = glm::normalize(s0 * g_poiXitFromDir + s1 * g_poiXitToDir);
+		}
+		g_geoNav.cam.up = glm::normalize(g_geoNav.cam.pos); // radial up
+		g_geoNav.targetDist = g_poiXitFromTD * std::pow(g_poiXitToTD / g_poiXitFromTD, e);
+		if (g_focusT >= 1.0)
+			g_focusT = 1.0;
 	}
-	if (releaseOrbit) {
+	// [FOCUS] glide the stereo fullness toward the current mode (~0.4 s).
+	{
+		double tgt = g_focusActive ? 1.0 : 0.0;
+		double rate = dt / 0.4;
+		if (g_stereoFull < tgt)
+			g_stereoFull = std::min(tgt, g_stereoFull + rate);
+		else if (g_stereoFull > tgt)
+			g_stereoFull = std::max(tgt, g_stereoFull - rate);
+	}
+	if (releaseToFly) {
+		if (g_focusActive) {
+			// Focus -> fly (cam rig): the cam rig inherits the frozen
+			// convergence, so the switch is seamless; the ground auto-focus
+			// then resumes.
+			g_focusActive = false;
+			g_focusT = 0.0;
+			LOG_INFO("Focus released -> fly (cam rig)");
+			MarkUserInput();
+			return;
+		}
+		if (g_geoNav.orbitAcquired) {
+			// Inert: nothing acquires a diorama orbit (on Windows either).
+			// Windows passes the viewer's XR z; the fly target sits 1 XR-m out.
+			g_geoNav.releaseToFly(1.0);
+			LOG_INFO("Released orbit -> fly mode (continuous)");
+		}
+		MarkUserInput();
+	}
+	if (resetOrReleaseOrbit) {
 		g_geoNav.releaseOrbit(); // back to camera-centric, reframe bookmark
+		MarkUserInput();
 		return;
 	}
 	if (cycleBookmark) {
@@ -823,10 +926,60 @@ UpdateGeoNav(double dt)
 		if (n > 0)
 			LOG_INFO("Bookmark: %s", bm[g_geoNav.bookmarkIndex].name);
 	}
-	if (lookDX != 0.0f || lookDY != 0.0f)
-		g_geoNav.look((double)lookDX, (double)lookDY);
-	if (dollySteps != 0.0f)
-		g_geoNav.dolly((double)dollySteps);
+
+	// Left-drag look / orbit.
+	if (lookDX != 0.0f || lookDY != 0.0f) {
+		if (g_focusActive) {
+			// [FOCUS] orbit the CAMERA around the POI (feature fixed); only
+			// cam.pos/dir revolve about g_focusPOIecef.
+			g_focusT = 1.0; // a drag cancels any in-flight re-aim transition
+			glm::dvec3 poi = g_focusPOIecef;
+			glm::dvec3 up = glm::normalize(poi); // geodetic normal ~ radial
+			glm::dvec3 v = g_geoNav.cam.pos - poi;
+			glm::dmat4 ry = glm::rotate(glm::dmat4(1.0), -(double)lookDX, up);
+			v = glm::dvec3(ry * glm::dvec4(v, 0.0));
+			glm::dvec3 right = glm::normalize(glm::cross(up, glm::normalize(v)));
+			glm::dmat4 rp = glm::rotate(glm::dmat4(1.0), -(double)lookDY, right);
+			glm::dvec3 v2 = glm::dvec3(rp * glm::dvec4(v, 0.0));
+			if (std::abs(glm::dot(glm::normalize(v2), up)) < 0.98)
+				v = v2; // no pole flip
+			g_geoNav.cam.pos = poi + v;
+			g_geoNav.cam.dir = glm::normalize(poi - g_geoNav.cam.pos);
+			g_geoNav.cam.up = up;
+			// Keep the POI on the convergence plane (no zoom drift).
+			g_geoNav.targetDist =
+			    std::max(glm::length(v) / std::max((double)g_viewDistXR, 0.1), 20.0);
+		} else {
+			g_geoNav.look((double)lookDX, (double)lookDY);
+		}
+	}
+	// Wheel dolly (exponential).
+	if (dollySteps != 0.0f) {
+		if (g_focusActive) {
+			// [FOCUS] zoom = scale the orbit RADIUS about the POI, then re-pin
+			// the POI on the convergence plane (keeps it centred + at zero
+			// parallax through the zoom).
+			glm::dvec3 poi = g_focusPOIecef;
+			glm::dvec3 v = g_geoNav.cam.pos - poi;
+			double k = std::pow(0.9, (double)dollySteps); // match GeoNav::dolly
+			v *= k;
+			g_geoNav.cam.pos = poi + v;
+			g_geoNav.cam.dir = glm::normalize(poi - g_geoNav.cam.pos);
+			g_geoNav.targetDist =
+			    std::max(glm::length(v) / std::max((double)g_viewDistXR, 0.1), 20.0);
+		} else {
+			g_geoNav.dolly((double)dollySteps);
+		}
+	}
+
+	// [FOCUS] WASDQE while focused => disturbance-free return to the cam rig
+	// (it uses the frozen convergence at the switch instant, then the ground
+	// auto-focus smoothly re-tracks).
+	if (g_focusActive && (g_keys.w || g_keys.s || g_keys.a || g_keys.d || g_keys.e || g_keys.q)) {
+		g_focusActive = false;
+		g_focusT = 1.0; // cancel any in-flight re-aim transition
+		LOG_INFO("[FOCUS] WASDQE -> return to fly (cam rig); ground auto-focus resumes");
+	}
 
 	// WASD pan in the ground tangent plane, E/Q climb. Speeds scale with
 	// targetDist inside GeoNav, so dt is the only factor here.
@@ -848,6 +1001,21 @@ UpdateGeoNav(double dt)
 		g_geoNav.pan(panX, panY);
 	if (climb != 0.0)
 		g_geoNav.elevate(climb);
+
+	// Idle turntable: > 10 s, ONLY while focused, a gentle revolution AROUND
+	// the POI (one per 60 s). Disabled in fly (it churned tile LOD).
+	const double idleFor = NowSec() - g_lastInputTimeSec;
+	if (kAnimateEnabled && idleFor > 10.0 && g_focusActive) {
+		double rate = 6.2831853 / 60.0;
+		glm::dvec3 poi = g_focusPOIecef;
+		glm::dvec3 up = glm::normalize(poi);
+		glm::dvec3 v = g_geoNav.cam.pos - poi;
+		glm::dmat4 ry = glm::rotate(glm::dmat4(1.0), -(rate * dt), up);
+		v = glm::dvec3(ry * glm::dvec4(v, 0.0));
+		g_geoNav.cam.pos = poi + v;
+		g_geoNav.cam.dir = glm::normalize(poi - g_geoNav.cam.pos);
+		g_geoNav.cam.up = up;
+	}
 }
 
 // Held-key state for WASDEQ; returns false for any other key.
@@ -865,6 +1033,18 @@ SetHeldKey(uint32_t keysym, bool down)
 	}
 }
 
+// Double-click detection. Windows gets WM_LBUTTONDBLCLK from the system
+// (CS_DBLCLKS); the helper delivers plain presses with a server timestamp, so
+// this applies the Windows defaults: a second press within GetDoubleClickTime
+// (500 ms) inside the SM_CXDOUBLECLK x SM_CYDOUBLECLK box (4 x 4 px, centred
+// on the first press). A double-click consumes both presses — a third starts
+// a new pair, as on Windows.
+static constexpr uint32_t kDoubleClickMs = 500;
+static constexpr int32_t kDoubleClickHalfPx = 2;
+static bool g_firstClickValid = false;
+static uint32_t g_firstClickMs = 0;
+static int32_t g_firstClickX = 0, g_firstClickY = 0;
+
 // Drain the window once per frame (both backends) into the geo-navigation
 // accumulators above; the close button (or Esc with no orbit acquired) is a
 // clean exit, Resize is the live content size. The header bar, its drag and
@@ -881,6 +1061,7 @@ PumpWindow(AppXrSession &xr)
 		    using T = DxrWindowEvent::Type;
 		    switch (ev.type) {
 		    case T::KeyDown:
+			    MarkUserInput();
 			    if (SetHeldKey(ev.keysym, true))
 				    break;
 			    if (ev.keysym == XK_Escape && !ev.repeat) {
@@ -906,10 +1087,30 @@ PumpWindow(AppXrSession &xr)
 			    break;
 		    case T::ButtonDown:
 			    if (ev.button == 1 && !ev.window_drag) {
+				    MarkUserInput();
 				    g_leftDown = true;
-				    g_lastDragX = ev.x;
-				    g_lastDragY = ev.y;
-				    g_dragValid = true;
+				    const bool dbl = g_firstClickValid &&
+				                     (uint32_t)(ev.time_ms - g_firstClickMs) <= kDoubleClickMs &&
+				                     std::abs(ev.x - g_firstClickX) <= kDoubleClickHalfPx &&
+				                     std::abs(ev.y - g_firstClickY) <= kDoubleClickHalfPx;
+				    if (dbl) {
+					    // WM_LBUTTONDBLCLK: request the focus pick at the
+					    // cursor. Like Windows, the second press does not seed
+					    // a drag origin (the next motion does).
+					    g_firstClickValid = false;
+					    g_pickRequested = true;
+					    g_pickMouseX = (float)ev.x;
+					    g_pickMouseY = (float)ev.y;
+					    g_dragValid = false;
+				    } else {
+					    g_firstClickValid = true;
+					    g_firstClickMs = ev.time_ms;
+					    g_firstClickX = ev.x;
+					    g_firstClickY = ev.y;
+					    g_lastDragX = ev.x;
+					    g_lastDragY = ev.y;
+					    g_dragValid = true;
+				    }
 			    }
 			    break;
 		    case T::ButtonUp:
@@ -923,6 +1124,7 @@ PumpWindow(AppXrSession &xr)
 				    if (g_dragValid) {
 					    g_lookDX += (float)(ev.x - g_lastDragX) * 0.005f;
 					    g_lookDY += (float)(ev.y - g_lastDragY) * 0.005f;
+					    MarkUserInput();
 				    }
 				    g_lastDragX = ev.x;
 				    g_lastDragY = ev.y;
@@ -932,6 +1134,7 @@ PumpWindow(AppXrSession &xr)
 		    case T::Scroll:
 			    // +1 per notch up/away, as Windows' WHEEL_DELTA notches.
 			    g_dollySteps += (float)ev.scroll_steps * 0.5f;
+			    MarkUserInput();
 			    break;
 		    default: break;
 		    }
@@ -1163,7 +1366,7 @@ main(int argc, char **argv)
 
 	// Convergence auto-focus state (mirrors windows/main.cpp): forward ray →
 	// ground distance in geo metres, scaled to XR metres, exp-smoothed.
-	float convDiopters = 1.0f; // 1/m; default = 1/kTargetXrDist
+	// (g_convDiopters: 1/m; default = 1/kTargetXrDist.)
 	constexpr double kConvSmoothTau = 0.15;
 	auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -1209,25 +1412,104 @@ main(int argc, char **argv)
 			locateInfo.displayTime = frameState.predictedDisplayTime;
 			locateInfo.space = xr.localSpace;
 
-			// XR_DXR_view_rig CAMERA rig (camera-centric FLY, the default
-			// view): a plain perspective camera at the XR origin looking -Z;
-			// the runtime owns the off-axis eyes + window resolve and returns
-			// render-ready XrView{pose, fov}. Mirrors windows/main.cpp's fly
-			// path (orbit/focus are per-platform UI, not ported here).
+			// XR_DXR_view_rig, as windows/main.cpp: FLY (camera-centric, the
+			// default) uses the CAMERA rig — a plain perspective camera at
+			// the XR origin looking -Z; the runtime owns the off-axis eyes +
+			// window resolve and returns render-ready XrView{pose, fov}.
+			// FOCUS (double-click) switches to the DISPLAY rig, converted
+			// from the live camera rig so the switch is seamless. The raw
+			// channel carries the runtime-resolved canvas size.
 			const bool useRig =
 			    xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
+			// The diorama orbit (orbitAcquired) is never acquired, here or
+			// on Windows; focus forces the display rig.
+			const bool rigCamera = useRig && !g_geoNav.orbitAcquired && !g_focusActive;
+			// ViewParams defaults (the Windows leg's ipd/parallax/
+			// perspective 1, virtual display height 1.5 m, scale 1); the
+			// keys that edit them are not ported.
+			const float kIpd = 1.0f, kParallax = 1.0f, kPerspective = 1.0f;
+			const float rigVH = 1.5f;
 			XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
+			XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+			XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+			XrViewState viewState = {XR_TYPE_VIEW_STATE};
 			if (useRig) {
-				cameraRig.pose = {{0, 0, 0, 1}, {0, 0, 0}};
-				cameraRig.ipdFactor = 1.0f;
-				cameraRig.parallaxFactor = 1.0f;
-				cameraRig.convergenceDiopters = convDiopters;
-				cameraRig.verticalFov =
-				    CamVFovRad(xr.displayHeightM, xr.nominalViewerZ);
-				locateInfo.next = &cameraRig;
+				// physical_height_m MUST be the runtime's CANVAS height
+				// (window content), not the full display height.
+				float canvasH = (g_canvasHM > 1.0e-6f) ? g_canvasHM : xr.displayHeightM;
+				float canvasW = (g_canvasWM > 1.0e-6f) ? g_canvasWM : xr.displayWidthM;
+				dxr_rig_display_info dinfo = {canvasH,
+				                              (canvasH > 1.0e-6f) ? (canvasW / canvasH) : 1.0f,
+				                              xr.nominalViewerZ};
+				const XrPosef identity = {{0, 0, 0, 1}, {0, 0, 0}};
+				if (rigCamera) {
+					cameraRig.pose = identity;
+					cameraRig.ipdFactor = kIpd;
+					cameraRig.parallaxFactor = kParallax;
+					cameraRig.convergenceDiopters = g_convDiopters;
+					cameraRig.verticalFov = CamVFovRad(xr.displayHeightM, xr.nominalViewerZ);
+					// [FOCUS] on the focus->fly return, glide ipd/par from the
+					// value that matches the focus display rig (ipd=1 <-> cam
+					// ipd=1/f, f=convDiopters*N => seamless at the switch)
+					// back to the defaults over ~0.4 s.
+					if (g_stereoFull > 1.0e-4) {
+						double f = (double)cameraRig.convergenceDiopters * (double)xr.nominalViewerZ;
+						double invF = (f > 1.0e-4) ? (1.0 / f) : 1.0;
+						double sf = g_stereoFull;
+						cameraRig.ipdFactor = (float)((1.0 - sf) * kIpd + sf * invF);
+						cameraRig.parallaxFactor = (float)((1.0 - sf) * kParallax + sf * invF);
+					}
+					// Frustum-source viewing distance = 1/convergence.
+					g_viewDistXR = (cameraRig.convergenceDiopters > 1.0e-6f)
+					                   ? (1.0f / cameraRig.convergenceDiopters)
+					                   : 0.0f;
+					locateInfo.next = &cameraRig;
+				} else {
+					displayRig.pose = identity;
+					displayRig.virtualDisplayHeight = rigVH;
+					displayRig.ipdFactor = kIpd;
+					displayRig.parallaxFactor = kParallax;
+					displayRig.perspectiveFactor = kPerspective;
+					if (g_focusActive) {
+						// Convert the live camera rig -> display rig
+						// (disturbance-free). Source half-tan-vfov = the live
+						// PHYSICAL fly FOV, so the conversion reproduces the
+						// fly framing exactly.
+						dxr_camera_rig crig0 = {};
+						crig0.pose.orientation = {0, 0, 0, 1};
+						crig0.ipd_factor = kIpd;
+						crig0.parallax_factor = kParallax;
+						crig0.inv_convergence_distance = g_convDiopters;
+						crig0.half_tan_vfov =
+						    tanf(0.5f * CamVFovRad(xr.displayHeightM, xr.nominalViewerZ));
+						crig0.m2v = 1.0f;
+						dxr_display_rig drig = {};
+						dxr_view_rig_camera_to_display(&crig0, &dinfo, &drig);
+						displayRig.pose.orientation = {drig.pose.orientation.x, drig.pose.orientation.y,
+						                               drig.pose.orientation.z, drig.pose.orientation.w};
+						displayRig.pose.position = {drig.pose.position.x, drig.pose.position.y,
+						                            drig.pose.position.z};
+						displayRig.virtualDisplayHeight = drig.virtual_display_height;
+						displayRig.ipdFactor = drig.ipd_factor;
+						displayRig.parallaxFactor = drig.parallax_factor;
+						displayRig.perspectiveFactor = drig.perspective_factor;
+						// Glide ipd/par from the converter's value (t=0,
+						// seamless) to FULL 1.0 for full depth on the POI.
+						double sf = g_stereoFull;
+						displayRig.ipdFactor = (float)((1.0 - sf) * drig.ipd_factor + sf * 1.0);
+						displayRig.parallaxFactor =
+						    (float)((1.0 - sf) * drig.parallax_factor + sf * 1.0);
+					}
+					// Frustum-source viewing distance = eye->display plane =
+					// persp * m2v * N (m2v = vH/canvasH).
+					float m2v_eff =
+					    (canvasH > 1.0e-6f) ? (displayRig.virtualDisplayHeight / canvasH) : 0.0f;
+					g_viewDistXR = displayRig.perspectiveFactor * m2v_eff * xr.nominalViewerZ;
+					locateInfo.next = &displayRig;
+				}
+				viewState.next = &viewRigRaw;
 			}
 
-			XrViewState viewState = {XR_TYPE_VIEW_STATE};
 			// Over-allocate to the runtime's max view count (sim_display Quad
 			// reports 4); hardcoding 2 fails with XR_ERROR_SIZE_INSUFFICIENT.
 			uint32_t viewCap = xr.maxViewCount > 8 ? 8 : (xr.maxViewCount ? xr.maxViewCount : 2);
@@ -1235,6 +1517,12 @@ main(int argc, char **argv)
 			uint32_t viewCount = 0;
 			XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState,
 			                            viewCap, &viewCount, xrViews.data());
+			// Runtime-resolved canvas size (m) drives the cam->display rig
+			// converter's physical_height_m next frame.
+			if (useRig && viewRigRaw.canvasSizeMeters.height > 1.0e-6f) {
+				g_canvasWM = viewRigRaw.canvasSizeMeters.width;
+				g_canvasHM = viewRigRaw.canvasSizeMeters.height;
+			}
 
 			if (XR_SUCCEEDED(lr) && viewCount > 0) {
 				// Active rendering mode → eye count + per-view tile extent
@@ -1349,6 +1637,18 @@ main(int argc, char **argv)
 					eyes[e].src = sv;
 				}
 
+				// Double-click: defer the focus pick until the eyes have
+				// rendered (depth-readback unproject). Content y=0 is the
+				// TOP, so negate to +Y-up NDC.
+				if (g_pickRequested) {
+					g_pickRequested = false;
+					if (useRig) {
+						g_pickNdcX = 2.0f * g_pickMouseX / (float)g_windowW - 1.0f;
+						g_pickNdcY = -(2.0f * g_pickMouseY / (float)g_windowH - 1.0f);
+						g_pendingPick = true;
+					}
+				}
+
 				// Camera-centric FLY world mapping: anchor the geo camera at
 				// the XR origin, target a fixed kTargetXrDist in front
 				// (s = kTargetXrDist/targetDist). Selection camera = the
@@ -1358,8 +1658,9 @@ main(int argc, char **argv)
 					const double kTargetXrDist = 1.0;
 					glm::dvec3 anchorXr(0.0);
 					double s = kTargetXrDist / std::max(g_geoNav.targetDist, 1.0);
-					glm::dmat4 xrFromEcef =
-					    geo::xrFromEcefCamera(g_geoNav.cam, anchorXr, s);
+					// (Focus uses the SAME origin anchor, as on Windows.)
+					g_xrFromEcef = geo::xrFromEcefCamera(g_geoNav.cam, anchorXr, s);
+					const glm::dmat4 &xrFromEcef = g_xrFromEcef;
 
 					double camVFov =
 					    (double)CamVFovRad(xr.displayHeightM, xr.nominalViewerZ);
@@ -1370,10 +1671,11 @@ main(int argc, char **argv)
 					    2.0 * std::atan(std::tan(0.5 * camVFov) * aspect) * 1.15;
 
 					// Convergence auto-focus: forward ray → ground distance,
-					// scaled to XR metres, clamped, exp-smoothed.
+					// scaled to XR metres, clamped, exp-smoothed. Frozen
+					// while focused.
 					double groundM =
 					    geo::rayGroundDistanceM(g_geoNav.cam.pos, g_geoNav.cam.dir);
-					if (groundM > 0.0) {
+					if (groundM > 0.0 && !g_focusActive) {
 						double xrDist = groundM * s;
 						if (xrDist < 0.2)
 							xrDist = 0.2;
@@ -1381,7 +1683,7 @@ main(int argc, char **argv)
 							xrDist = 50.0;
 						float tgt = (float)(1.0 / xrDist);
 						double a = 1.0 - std::exp(-deltaTime / kConvSmoothTau);
-						convDiopters += (tgt - convDiopters) * (float)a;
+						g_convDiopters += (tgt - g_convDiopters) * (float)a;
 					}
 
 					geo::GeoCamera selCam;
@@ -1422,6 +1724,8 @@ main(int argc, char **argv)
 					projectionViews.assign(
 					    (size_t)located,
 					    {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+					glm::dvec3 pickAccum(0.0);
+					int pickHits = 0;
 					for (uint32_t e = 0; e < eyeCount; e++) {
 						uint32_t tileX = e % cols;
 						uint32_t tileY = e / cols;
@@ -1433,6 +1737,31 @@ main(int argc, char **argv)
 							    xr.swapchain.height, vpX, vpY, renderW, renderH,
 							    eyes[e].viewMat.data(), eyes[e].projMat.data(),
 							    g_drawList);
+
+							// Deferred double-click pick, CENTER-eye: after each
+							// of the first two eyes renders, read its depth at
+							// the clicked texel and unproject through that eye's
+							// matrices; the POI is the midpoint of the hits.
+							if (g_pendingPick && e < 2 && !g_drawList.empty()) {
+								uint32_t px = (uint32_t)std::min(
+								    std::max((g_pickNdcX + 1.0f) * 0.5f * (float)renderW, 0.0f),
+								    (float)(renderW - 1));
+								// Negative-height viewport: ndcY=+1 -> row 0.
+								uint32_t py = (uint32_t)std::min(
+								    std::max((1.0f - g_pickNdcY) * 0.5f * (float)renderH, 0.0f),
+								    (float)(renderH - 1));
+								float d = g_tileRenderer.readDepth(px, py);
+								if (d < 1.0f) {
+									glm::dmat4 V = glm::dmat4(glm::make_mat4(eyes[e].viewMat.data()));
+									glm::dmat4 P = glm::dmat4(glm::make_mat4(eyes[e].projMat.data()));
+									glm::dvec4 clip((double)g_pickNdcX, (double)g_pickNdcY, (double)d, 1.0);
+									glm::dvec4 w = glm::inverse(P * V) * clip;
+									if (std::abs(w.w) > 1e-12) {
+										pickAccum += glm::dvec3(w) / w.w;
+										pickHits++;
+									}
+								}
+							}
 						}
 
 						projectionViews[e].subImage.swapchain =
@@ -1447,6 +1776,38 @@ main(int argc, char **argv)
 					}
 					DxrAliasInactiveViews(projectionViews.data(), xrViews.data(),
 					                      located, eyeCount);
+
+					// Finalize the center-eye pick once the sampled eyes have
+					// rendered (tiles only — with no tiles the pick stays
+					// pending, exactly as on Windows).
+					if (g_tilesActive && g_pendingPick) {
+						g_pendingPick = false;
+						if (pickHits > 0) {
+							glm::dvec3 xrPos = pickAccum / (double)pickHits;
+							glm::dvec3 ecef =
+							    glm::dvec3(glm::inverse(g_xrFromEcef) * glm::dvec4(xrPos, 1.0));
+							// Re-aim the camera onto the POI and reframe it onto
+							// the zero-parallax plane (targetDist = eye->POI /
+							// vDist). Position stays put; dir + zoom lerp.
+							double poiDist = glm::length(g_geoNav.cam.pos - ecef);
+							g_focusPOIecef = ecef;
+							g_poiXitFromDir = g_geoNav.cam.dir;
+							g_poiXitToDir = glm::normalize(ecef - g_geoNav.cam.pos);
+							g_poiXitFromTD = g_geoNav.targetDist;
+							g_poiXitToTD = std::max(poiDist / std::max((double)g_viewDistXR, 0.1), 20.0);
+							g_focusT = 0.0; // start the transition
+							if (g_focusActive) {
+								LOG_INFO("[FOCUS] shift POI -> ECEF (%.1f, %.1f, %.1f) dist=%.0f", ecef.x,
+								         ecef.y, ecef.z, poiDist);
+							} else {
+								g_focusActive = true;
+								LOG_INFO("[FOCUS] acquired POI ECEF (%.1f, %.1f, %.1f) dist=%.0f vDist=%.3f",
+								         ecef.x, ecef.y, ecef.z, poiDist, g_viewDistXR);
+							}
+						} else {
+							LOG_INFO("Pick missed (sky) — staying camera-centric");
+						}
+					}
 
 					XrSwapchainImageReleaseInfo ri = {
 					    XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
