@@ -9,9 +9,11 @@
 #
 # linux/main.cpp is the Linux entry point (#19 harness → #34 handle app):
 # Vulkan (system libvulkan) + OpenXR session + cesium tile streaming, with an
-# app-owned X11 window centered on the 3D panel and passed via
-# XR_DXR_xlib_window_binding (hosted-NULL fallback when no X server, which
-# keeps the CI runner build-green).
+# app-owned window centered on the 3D panel — ONE binary for X11 and native
+# Wayland (displayxr-common's displayxr::linux_window, platform chosen by
+# capability) — passed via XR_DXR_xlib_window_binding or
+# XR_DXR_wayland_surface_binding (hosted-NULL fallback when no window system
+# answers, which keeps the CI runner build-green).
 
 cmake_minimum_required(VERSION 3.25)
 
@@ -22,10 +24,12 @@ endif()
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
-# X11 window + Xrandr panel query (handle app).
-find_package(X11 REQUIRED)
-if(NOT X11_Xrandr_LIB)
-    message(FATAL_ERROR "libXrandr not found (apt install libxrandr-dev) — needed for 3D-panel window centering.")
+# The window (X11 + native Wayland, header bar, drag) is displayxr-common's
+# displayxr::linux_window, added by ../common; it links its own window-system
+# libraries.
+if(NOT TARGET displayxr::linux_window)
+    message(FATAL_ERROR "displayxr::linux_window is not available — install libx11-dev "
+                        "(and libwayland-dev libxkbcommon-dev libdbus-1-dev for the native-Wayland leg)")
 endif()
 
 # OpenXR loader — prefer an installed/dev loader (build_linux.sh installs one
@@ -72,8 +76,7 @@ target_link_libraries(earthview_handle_vk_linux PRIVATE
     tile_renderer
     ${EV_OPENXR_LOADER}
     Vulkan::Vulkan
-    X11::X11
-    ${X11_Xrandr_LIB}
+    displayxr::linux_window # the ONE Linux window: X11 or Wayland, header bar, drag
 )
 
 # Copy the OpenXR loader .so next to the binary when it's an imported target,
