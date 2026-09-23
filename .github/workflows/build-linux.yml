@@ -19,6 +19,11 @@ name: Build Linux
 # Build-green scope: compile earthview_handle_vk_linux. CI has
 # no display/GPU, so the app is never run here; on-screen validation is a
 # separate pass gated on the runtime's Linux Phase 1b + hardware.
+#
+# PACKAGING (runtime #1656 / its PR #1659): Deb builds the one .deb in an
+# ubuntu:22.04 container (the oldest supported release, so the glibc floor is
+# 2.35), DebInstall installs and launch-smokes it in pristine 22.04 / 24.04 /
+# 26.04 containers, and only then may DebRelease attach it to a v* release.
 
 on:
   workflow_dispatch: {}
@@ -201,20 +206,50 @@ jobs:
           [ -x "$BIN" ] || { echo "::error::$BIN not produced"; exit 1; }
           echo "PASS: $BIN built."
 
-  # Build the demo .deb and, on a v* tag, attach it to the GitHub Release — the
-  # asset the Linux meta-bundle fetches (runtime #781 Phase 3). Runs on every PR
-  # too (build-only) so a broken package_deb_linux.sh is caught before release.
-  # Single base (24.04 → GCC 13, which builds cesium's vcpkg tree without the
-  # 22.04 g++-12 override) on a VM, not the tri-LTS matrix — one artifact.
+  # Build the ONE demo .deb — the asset the Linux meta-bundle fetches (runtime
+  # #781 Phase 3). Runs on every PR too so a broken package_deb_linux.sh is
+  # caught before release; DebRelease below attaches it to a v* release once
+  # DebInstall has proved it on every supported Ubuntu.
+  #
+  # PORTABLE BY CONSTRUCTION (runtime #1656 / its PR #1659): the same .deb must
+  # install AND run on Ubuntu 22.04, 24.04 and 26.04, so it is built on the
+  # OLDEST — an ubuntu:22.04 container (glibc 2.35 floor). v0.8.1 was built on
+  # the 24.04 runner, needed GLIBC_2.38 / GLIBCXX_3.4.32, and declared an
+  # unversioned `libc6`, so apt installed it on 22.04 and the app then died at
+  # exec. package_deb_linux.sh now derives versioned Depends with
+  # dpkg-shlibdeps, refuses a DT_NEEDED outside its cross-release
+  # STABLE_SONAMES list, and — with DXR_DEB_MAX_GLIBC — refuses a glibc floor
+  # above 22.04's.
+  #
+  # Deliberately installs NOTHING beyond the jammy archive: cmake comes from
+  # apt (3.22.1) and build_linux.sh provisions the pinned CMake itself, so this
+  # job exercises the same dev path a stock 22.04 box takes. That path is not
+  # optional here — cesium-native picks its vcpkg triplet with `elseif(LINUX)`,
+  # a CMake 3.25 variable. GCC: g++-12 from the jammy archive, same as the
+  # 22.04 Build leg (the default GCC 11 cannot build cesium's ada-url port).
   Deb:
     needs: DetectChanges
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
     env:
-      EZVCPKG_BASEDIR: /home/runner/.ezvcpkg
+      DXR_DEB_MAX_GLIBC: "2.35" # Ubuntu 22.04 — the oldest supported release
+      EZVCPKG_BASEDIR: /ezvcpkg # container-local, cacheable
+      CC: gcc-12
+      CXX: g++-12
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
         run: echo "Doc-only change — skipping .deb build."
+
+      # Bare image, root: git BEFORE actions/checkout (else it falls back to a
+      # tarball with no tags and `git describe` cannot version the .deb).
+      # zstd + tar: actions/cache runs inside the container.
+      - name: Bootstrap container (git for checkout)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates curl tar zstd
 
       - uses: actions/checkout@v5
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -226,33 +261,52 @@ jobs:
       - name: Clone cesium-native (v0.61.0)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
+          git config --global --add safe.directory '*'
           git clone --branch v0.61.0 --depth 1 --recurse-submodules \
             https://github.com/CesiumGS/cesium-native.git third_party/cesium-native
 
-      # Build deps (mirrors the Build job's Install-dependencies) + the .deb
-      # packaging tools (dpkg-dev provides dpkg-deb; fakeroot for root-owned
-      # payload). Static libc apt name resolution is left to objdump/dpkg -S.
+      # Build deps (mirrors the Build job's list) + g++-12 + the .deb packaging
+      # tools: dpkg-dev provides dpkg-deb AND dpkg-shlibdeps (which derives the
+      # versioned Depends), binutils provides objdump (DT_NEEDED + the measured
+      # glibc floor), fakeroot gives the payload root ownership.
+      # perl / patch / xz-utils / bzip2 are not needed on a hosted runner (its
+      # image has them) but ARE on a bare container image: vcpkg unpacks and
+      # patches its port sources, and the openssl port's Configure is a Perl
+      # script.
       - name: Install dependencies
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config git ca-certificates \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential g++-12 cmake ninja-build pkg-config python3 file \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
             libxcb1-dev libx11-xcb-dev libxcb-glx0-dev libxxf86vm-dev \
             libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
             libcurl4-openssl-dev libssl-dev zlib1g-dev \
             autoconf automake autoconf-archive libtool nasm \
-            zip unzip tar curl \
-            dpkg-dev fakeroot
+            zip unzip xz-utils bzip2 patch perl \
+            dpkg-dev fakeroot binutils
+          cmake --version | head -1
+          g++-12 --version | head -1
 
+      # Keyed on the LTS + compiler as well as the cesium/vcpkg pins: GCC 11/12/
+      # 13/15 artifacts are NOT interchangeable, so the 22.04+g++-12 tree needs
+      # its own entry rather than sharing the 24.04 one.
       - name: Cache cesium vcpkg dependencies (ezvcpkg)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/cache@v4
         with:
-          path: /home/runner/.ezvcpkg
-          key: ezvcpkg-${{ runner.os }}-24.04-cesium-v0.61.0-vcpkg-afc0a2e0
+          path: /ezvcpkg
+          key: ezvcpkg-Linux-22.04-gcc12-cesium-v0.61.0-vcpkg-afc0a2e0
+
+      # build_linux.sh downloads the pinned CMake here when the host's is too
+      # old (jammy's 3.22.1 is). Cache the unpack so it is fetched once.
+      - name: Cache provisioned CMake
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/dxr-cmake
+          key: dxr-cmake-3.31.8-linux-x86_64
 
       - name: Build + package the demo .deb
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -271,8 +325,70 @@ jobs:
           path: dist/*.deb
           if-no-files-found: error
 
-      - name: Attach .deb to the GitHub Release (tags only)
-        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+  # Install the .deb from the Deb job into a PRISTINE container of every
+  # supported release, alongside the latest released runtime .deb (the demo
+  # Depends on displayxr-runtime), and run it there
+  # (scripts/verify_deb_install_linux.sh): apt must resolve Depends from that
+  # release's archive with --no-install-recommends, every Depends/Recommends/
+  # Suggests name must exist there, `ldd -r` must be clean on every shipped
+  # ELF, the app must get past the dynamic loader, and `displayxr-cli selftest`
+  # must pass env-free.
+  #
+  # EarthView needs a Google Map Tiles API key and CI has none, so the app is
+  # EXPECTED to exit early here; the verifier only fails on loader-level
+  # errors, which is exactly the failure class this change closes.
+  DebInstall:
+    name: DebInstall (Ubuntu ${{ matrix.lts }})
+    needs: [DetectChanges, Deb]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lts: ["22.04", "24.04", "26.04"]
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — no .deb to verify."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+
+      - uses: actions/download-artifact@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-earthview-deb
+          path: dist
+
+      - name: Fetch the latest released runtime .deb
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo DisplayXR/displayxr-runtime \
+            --pattern 'displayxr-runtime_*_amd64.deb' --dir runtime-deb
+          ls -lh runtime-deb
+
+      - name: apt install + ldd -r + launch smoke in clean ubuntu:${{ matrix.lts }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.lts }}" \
+            ./scripts/verify_deb_install_linux.sh \
+              dist/displayxr-earthview_*_amd64.deb runtime-deb/*.deb
+
+  # Attach the .deb to the GitHub Release on a v* tag — only once DebInstall
+  # has proved it on every supported release, so a non-portable package can
+  # never be published.
+  DebRelease:
+    needs: [DetectChanges, Deb, DebInstall]
+    if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: displayxr-earthview-deb
+          path: dist
+
+      - name: Attach .deb to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.deb
