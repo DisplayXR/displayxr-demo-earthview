@@ -407,7 +407,15 @@ create_swapchains()
 	if (xrEnumerateSwapchainFormats(g_session, 0, &fc, nullptr) != XR_SUCCESS || !fc) return false;
 	int64_t fmts[64] = {}; if (fc > 64) fc = 64;
 	if (xrEnumerateSwapchainFormats(g_session, fc, &fc, fmts) != XR_SUCCESS) return false;
-	const int64_t pref[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
+	// ADR-021 / INV-4.6: prefer an honest `_SRGB` swapchain. TileRenderer's
+	// colour target holds authored, sRGB-ENCODED bytes and hands them to the
+	// swapchain with a byte-exact vkCmdCopyImage (tiles_common/tile_renderer.cpp).
+	// Since runtime #1589/#1610 (v2.21.7) vk_native reads an UNORM swapchain as
+	// LINEAR and encodes it on output, so those encoded bytes in UNORM were
+	// encoded twice (washed out). In `_SRGB` the same bytes are declared as what
+	// they are. UNORM stays as the fallback for a runtime without `_SRGB`.
+	const int64_t pref[] = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB,
+	                        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
 	for (int64_t p : pref) for (uint32_t i = 0; i < fc && g_swapchain_format == VK_FORMAT_UNDEFINED; ++i) if (fmts[i] == p) g_swapchain_format = (VkFormat)p;
 	if (g_swapchain_format == VK_FORMAT_UNDEFINED) g_swapchain_format = (VkFormat)fmts[0];
 
@@ -426,6 +434,10 @@ create_swapchains()
 	if (xrEnumerateSwapchainImages(g_swapchain, ic, &ic, (XrSwapchainImageBaseHeader *)g_images) != XR_SUCCESS) return false;
 	g_image_count = ic;
 	LOGI("Atlas swapchain: %ux%u (tile %ux%u), %u images, fmt 0x%x", g_atlas_w, g_atlas_h, g_tile_w, g_tile_h, ic, (uint32_t)g_swapchain_format);
+	LOGW("[color] colorFormat=%d (%s)", (int)g_swapchain_format,
+	     (g_swapchain_format == VK_FORMAT_R8G8B8A8_SRGB || g_swapchain_format == VK_FORMAT_B8G8R8A8_SRGB)
+	         ? "_SRGB: encoded bytes declared encoded"
+	         : "no _SRGB format advertised: encoded bytes in a non-sRGB swapchain");
 	return true;
 }
 
@@ -602,7 +614,12 @@ clear_atlas(VkImage image, float r, float g, float b)
 		vkCmdPipelineBarrier(g_cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &m);
 	};
 	bar(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-	VkClearColorValue c = {}; c.float32[0]=r; c.float32[1]=g; c.float32[2]=b; c.float32[3]=1.0f;
+	// A clear value is taken in the image's own space: an `_SRGB` swapchain
+	// encodes it on store, so decode the display-referred colour first (INV-4.6).
+	// Alpha is never converted.
+	const bool srgb = g_swapchain_format == VK_FORMAT_R8G8B8A8_SRGB || g_swapchain_format == VK_FORMAT_B8G8R8A8_SRGB;
+	auto lin = [srgb](float v) { return !srgb ? v : (v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f)); };
+	VkClearColorValue c = {}; c.float32[0]=lin(r); c.float32[1]=lin(g); c.float32[2]=lin(b); c.float32[3]=1.0f;
 	vkCmdClearColorImage(g_cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &range);
 	bar(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 	vkEndCommandBuffer(g_cmd);
