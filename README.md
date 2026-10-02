@@ -27,7 +27,10 @@ Credentials → API key). Supply it via either:
 - env var: `export GOOGLE_MAPS_API_KEY=...`
 - or `earthview.ini` next to the app / at the repo root (gitignored): `key=...`
 
-Without a key the app opens to a how-to card and does not crash. The key is
+Without a key the app opens a key-entry dialog (macOS card, Win32 dialog,
+Android dialog, Linux zenity/kdialog prompt; `Ctrl+K` / `⌘K` reopens it) that
+validates the key with Google and saves it per-user — see
+[docs/api-key.md](docs/api-key.md) — and does not crash. The key is
 never committed and never bundled into installers. Usage stays inside the free
 tier: one root-tileset request per launch (1,000 free/month); no per-tile
 billing. Data © Google and partners — attribution is rendered on-screen per the

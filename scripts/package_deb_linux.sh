@@ -24,14 +24,20 @@
 # Google Map Tiles API key. No key is ever committed or bundled (the repo
 # earthview.ini is gitignored and never staged into the .deb). At runtime the
 # app resolves the key from the GOOGLE_MAPS_API_KEY environment variable, else a
-# per-user config (~/Library/Application Support/DisplayXR/EarthView/earthview.ini),
-# else an earthview.ini in the cwd. See docs/api-key.md.
+# per-user config ($XDG_CONFIG_HOME/displayxr/earthview.ini, ~/.config fallback —
+# written mode 0600 by the in-app key dialog), else an earthview.ini in the cwd.
+# A keyless launch opens that dialog (zenity, kdialog fallback), hence
+# Recommends: zenity. The payload is asserted key-free below. See docs/api-key.md.
 #
 # --- Per-demo config (the ONLY part that differs between demos) -------------
 APP="earthview"                                     # short id (dir + component)
 PKG="displayxr-earthview"                           # .deb package + wrapper name
 DISPLAY_NAME="DisplayXR EarthView"
-DESCRIPTION="Google Photorealistic 3D Tiles globe viewer for glasses-free 3D displays. Needs a Google Map Tiles API key (set GOOGLE_MAPS_API_KEY)."
+DESCRIPTION="Google Photorealistic 3D Tiles globe viewer for glasses-free 3D displays. Needs your own Google Map Tiles API key (asked for on first launch, or set GOOGLE_MAPS_API_KEY)."
+# The in-app API-key dialog runs zenity (kdialog fallback); without either the
+# app still runs and takes the key from GOOGLE_MAPS_API_KEY / earthview.ini.
+# Must name a real package on 22.04 / 24.04 / 26.04 (DebInstall checks it).
+RECOMMENDS="zenity"
 BINARY="earthview_handle_vk_linux"                  # build/linux/<BINARY>
 DESKTOP_CATEGORIES="Graphics;Education;"
 ASSETS_SUBDIR=""                                    # repo dir to bundle, "" if none
@@ -110,7 +116,7 @@ cat > "$STAGE/usr/bin/$PKG" <<EOF
 # DisplayXR demo launcher. The runtime .deb registers the OpenXR ActiveRuntime,
 # so no env vars are needed; we only wire the bundled loader + the Linux
 # vk_native compositor. EarthView additionally needs a Google Map Tiles API key
-# via GOOGLE_MAPS_API_KEY (or a per-user earthview.ini) — never baked in here.
+# (in-app dialog, GOOGLE_MAPS_API_KEY or a per-user earthview.ini) — never baked in here.
 DIR="/usr/lib/displayxr-demos/$APP"
 export LD_LIBRARY_PATH="\$DIR:\${LD_LIBRARY_PATH:-}"
 export OXR_ENABLE_VK_NATIVE_COMPOSITOR="\${OXR_ENABLE_VK_NATIVE_COMPOSITOR:-1}"
@@ -226,6 +232,7 @@ Section: graphics
 Priority: optional
 Architecture: $ARCH
 Depends: $DEPENDS
+Recommends: $RECOMMENDS
 Installed-Size: $INSTALLED_KB
 Maintainer: The DisplayXR Project <noreply@displayxr.dev>
 Homepage: https://github.com/DisplayXR/displayxr-demo-$APP
@@ -237,6 +244,21 @@ Description: $DISPLAY_NAME
  processor is active (sim-display fallback, or the Leia SR plug-in when
  installed). Launch from the menu or run '$PKG'.
 EOF
+
+# Never ship an API key (docs/api-key.md security invariants; the Windows CI
+# asserts the same of its installer payload): no ini / key / .env file, and no
+# Google API key literal in any staged file.
+if find "$STAGE" -iname 'earthview.ini' -o -iname '*.key' -o -iname '.env*' | grep -q .; then
+  echo "error: a key/ini/.env file is staged into the .deb:" >&2
+  find "$STAGE" -iname 'earthview.ini' -o -iname '*.key' -o -iname '.env*' >&2
+  exit 1
+fi
+if grep -rlE 'AIza[0-9A-Za-z_-]{35}' "$STAGE" >/dev/null 2>&1; then
+  echo "error: a Google API key literal is staged into the .deb:" >&2
+  grep -rlE 'AIza[0-9A-Za-z_-]{35}' "$STAGE" >&2
+  exit 1
+fi
+echo "==> payload key-free (no earthview.ini / *.key / .env*, no AIza… literal)"
 
 mkdir -p "$DIST_DIR"
 DEB="$DIST_DIR/${PKG}_${VERSION}_${ARCH}.deb"

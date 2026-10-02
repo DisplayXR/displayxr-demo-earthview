@@ -37,9 +37,19 @@
 // of WASDQE, returns to fly; a further double-click moves the POI. Esc exits
 // (on Windows too: its Esc only releases a diorama orbit, which nothing
 // acquires). Not ported (Windows-only UI with no Linux counterpart yet): the
-// HUD mode/city buttons, V/0-8/T/M, I atlas capture, X supersampling, Ctrl+K
-// key dialog. NO file-open by design: EarthView streams tiles, there is no
-// model to load.
+// HUD mode/city buttons, V/0-8/T/M, I atlas capture, X supersampling. NO
+// file-open by design: EarthView streams tiles, there is no model to load.
+//
+// API KEY — as windows/main.cpp's ShowApiKeyDialog + the macOS key card: a
+// keyless start opens the "Google Map Tiles API key" dialog, and Ctrl+K opens
+// it any time to change the key. It is an async zenity --entry (kdialog
+// --inputbox fallback) child polled each frame, so the frame loop never
+// blocks; the key is validated against Google on a worker thread
+// (TileEngine::probeKey, the EV_PROBE path) before it is saved to
+// $XDG_CONFIG_HOME/displayxr/earthview.ini (~/.config fallback, mode 0600),
+// and the tile engine late-inits without a restart. GOOGLE_MAPS_API_KEY still
+// overrides the saved file. No dialog tool → the log line + a window-title
+// hint. See the keydlg section and docs/api-key.md.
 
 #define XR_USE_GRAPHICS_API_VULKAN
 
@@ -89,15 +99,27 @@
 #include "dxr_view_math.h" // dxr_view_rig_camera_to_display — focus rig switch
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char **environ; // posix_spawnp — the key dialog inherits our env
 
 // ── logging + result checks ──────────────────────────────────────────────
 #define LOG_INFO(...)                                                          \
@@ -705,6 +727,7 @@ static TileRenderer g_tileRenderer;
 static TileEngine g_tileEngine;
 static geo::GeoNav g_geoNav;
 static bool g_tilesActive = false;
+static bool g_tileRendererReady = false; // the engine can (late-)init
 static std::vector<TileRenderer::DrawItem> g_drawList;
 // World mapping of the frame being rendered (the pick unprojects through it).
 static glm::dmat4 g_xrFromEcef(1.0);
@@ -1045,6 +1068,418 @@ static bool g_firstClickValid = false;
 static uint32_t g_firstClickMs = 0;
 static int32_t g_firstClickX = 0, g_firstClickY = 0;
 
+// ── API-key dialog (first-run keyless + Ctrl+K) ──────────────────────────
+// The Linux counterpart of windows/main.cpp's ShowApiKeyDialog and the macOS
+// key card (docs/api-key.md), same wording and same flow: paste a key → it is
+// validated against Google (TileEngine::probeKey) BEFORE it is saved → saved
+// to the per-user config (earthviewKeyConfigPath(): $XDG_CONFIG_HOME/
+// displayxr/earthview.ini, mode 0600) → the frame loop late-inits the tile
+// engine, so tiles stream without a relaunch. A rejected key re-prompts with
+// Google's reason. "Get a Key…" opens the Cloud Console; "Remove key" deletes
+// the saved key ("clean box after use").
+//
+// NEVER blocks the frame loop: the dialog is an async child process (zenity
+// --entry, else kdialog --inputbox — the modelviewer file-picker pattern),
+// polled once per frame, and the network probe runs on a worker thread.
+// Neither tool is a hard dependency (the .deb only Recommends zenity): with
+// none, the old log line stays and the window title carries the hint.
+//
+// Env (dev/test):
+//   EV_KEY_DIALOG=zenity|kdialog|none|<cmd>  force a tool; any other value is
+//       a zenity-compatible command (a stub for headless tests).
+//   EV_KEY_PROBE_ACCEPT_FOR_TEST=<key>  that exact key passes validation
+//       without contacting Google (exercises the success path with no real
+//       key). Persistence and late-init still run for real.
+namespace keydlg {
+
+// Dialog title = the macOS card heading (zenity 4 also shows it in-body).
+constexpr const char *kTitle = "Google Map Tiles API key required";
+constexpr const char *kBody =
+    "EarthView streams Google Photorealistic 3D Tiles, which needs your own "
+    "Map Tiles API key. Paste it below, or get one from the Google Cloud "
+    "Console (enable the “Map Tiles API”, then create an API key).";
+constexpr const char *kConsoleUrl = "https://console.cloud.google.com/google/maps-apis/api-list";
+constexpr const char *kGetKeyLabel = "Get a Key…";
+constexpr const char *kRemoveLabel = "Remove key";
+constexpr const char *kWindowTitle = "DisplayXR EarthView";
+
+enum class Tool
+{
+	None,
+	Zenity,  //!< zenity --entry (or a zenity-compatible EV_KEY_DIALOG stub)
+	KDialog, //!< kdialog --inputbox (no extra buttons: URL goes in the text)
+};
+
+// Probe result, shared with the worker thread. Heap-owned so a probe still in
+// flight at exit (detached) never touches a destroyed static.
+struct Probe
+{
+	std::string key;
+	std::atomic<bool> done{false};
+	bool ok = false;
+	std::string err;
+};
+
+static pid_t s_pid = -1;          // the dialog child (zenity/kdialog)
+static int s_fd = -1;             // its stdout (non-blocking)
+static std::string s_out;
+static Tool s_tool = Tool::None;
+static std::string s_status;      // shown above the body on the open dialog
+static bool s_statusIsError = true; // red (rejection) vs plain (info)
+static std::string s_prefill;     // entry text (the rejected key, to fix it)
+static std::shared_ptr<Probe> s_probe;
+static std::thread s_probeThread;
+static bool s_applyPending = false; // frame loop: late-init the engine
+static std::vector<pid_t> s_helpers; // xdg-open children, reaped by Poll()
+static bool s_windowReady = false;   // our window exists (title hints)
+
+static void
+SetTitle(const char *suffix)
+{
+	if (!s_windowReady)
+		return;
+	std::string t = kWindowTitle;
+	if (suffix && *suffix)
+		t += std::string(" — ") + suffix;
+	g_window.set_title(t.c_str());
+}
+
+static bool
+InPath(const char *name)
+{
+	if (strchr(name, '/'))
+		return access(name, X_OK) == 0;
+	const char *path = getenv("PATH");
+	if (!path)
+		return false;
+	std::string p(path);
+	size_t start = 0;
+	while (start <= p.size()) {
+		size_t end = p.find(':', start);
+		if (end == std::string::npos)
+			end = p.size();
+		std::string dir = p.substr(start, end - start);
+		if (dir.empty())
+			dir = ".";
+		if (access((dir + "/" + name).c_str(), X_OK) == 0)
+			return true;
+		start = end + 1;
+	}
+	return false;
+}
+
+// Which dialog tool to run (and its command). No display = no dialog (the
+// hosted-NULL CI case).
+static Tool
+ResolveTool(std::string &cmd)
+{
+	const char *force = getenv("EV_KEY_DIALOG");
+	if (force && *force) {
+		if (strcmp(force, "none") == 0)
+			return Tool::None;
+		cmd = force;
+		const char *base = strrchr(force, '/');
+		base = base ? base + 1 : force;
+		if (!InPath(force))
+			return Tool::None;
+		return strcmp(base, "kdialog") == 0 ? Tool::KDialog : Tool::Zenity;
+	}
+	const char *dpy = getenv("DISPLAY");
+	const char *wl = getenv("WAYLAND_DISPLAY");
+	if (!(dpy && *dpy) && !(wl && *wl))
+		return Tool::None;
+	if (InPath("zenity")) {
+		cmd = "zenity";
+		return Tool::Zenity;
+	}
+	if (InPath("kdialog")) {
+		cmd = "kdialog";
+		return Tool::KDialog;
+	}
+	return Tool::None;
+}
+
+// Neither zenity --entry nor kdialog --inputbox wraps or renders markup in
+// its prompt, so the text is plain and pre-wrapped (an unwrapped paragraph
+// makes a screen-wide dialog).
+static std::string
+Wrap(const std::string &s, size_t width = 64)
+{
+	std::string out, line, word;
+	auto flushWord = [&]() {
+		if (word.empty())
+			return;
+		if (!line.empty() && line.size() + 1 + word.size() > width) {
+			out += line + "\n";
+			line.clear();
+		}
+		line += (line.empty() ? "" : " ") + word;
+		word.clear();
+	};
+	for (char c : s) {
+		if (c == ' ') {
+			flushWord();
+		} else if (c == '\n') {
+			flushWord();
+			out += line + "\n";
+			line.clear();
+		} else {
+			word += c;
+		}
+	}
+	flushWord();
+	return out + line;
+}
+
+// The prompt: [status] + body (macOS card wording; the heading is the title).
+static std::string
+PromptText(bool withUrl)
+{
+	std::string t;
+	if (!s_status.empty())
+		t += Wrap((s_statusIsError ? "⚠ " : "") + s_status) + "\n\n";
+	t += Wrap(kBody);
+	if (withUrl)
+		t += std::string("\n\n") + kConsoleUrl;
+	return t;
+}
+
+static bool
+SavedKeyExists()
+{
+	return access(earthviewKeyConfigPath().c_str(), F_OK) == 0;
+}
+
+static pid_t
+Spawn(const std::vector<std::string> &args, int stdoutFd)
+{
+	std::vector<char *> argv;
+	for (const std::string &a : args)
+		argv.push_back(const_cast<char *>(a.c_str()));
+	argv.push_back(nullptr);
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+	if (stdoutFd >= 0)
+		posix_spawn_file_actions_adddup2(&fa, stdoutFd, STDOUT_FILENO);
+	pid_t pid = -1;
+	int rc = posix_spawnp(&pid, argv[0], &fa, nullptr, argv.data(), environ);
+	posix_spawn_file_actions_destroy(&fa);
+	return rc == 0 ? pid : -1;
+}
+
+static bool
+Busy()
+{
+	return s_pid > 0 || s_probe != nullptr;
+}
+
+// Open the dialog. `status` (a rejection reason, …) is shown above the body,
+// in red unless `isError` is false.
+static void
+Open(const std::string &status = {}, bool isError = true)
+{
+	if (Busy())
+		return;
+	s_status = status;
+	s_statusIsError = isError;
+	std::string cmd;
+	s_tool = ResolveTool(cmd);
+	if (s_tool == Tool::None) {
+		LOG_WARN("No Google Map Tiles API key — set GOOGLE_MAPS_API_KEY or "
+		         "earthview.ini to stream tiles (install zenity for the in-app "
+		         "key dialog).");
+		SetTitle("no API key: set GOOGLE_MAPS_API_KEY or install zenity");
+		return;
+	}
+
+	std::vector<std::string> args{cmd};
+	if (s_tool == Tool::Zenity) {
+		args.insert(args.end(),
+		            {"--entry", std::string("--title=") + kTitle, "--text=" + PromptText(false),
+		             "--entry-text=" + s_prefill, "--ok-label=Save & Start",
+		             "--cancel-label=Close", std::string("--extra-button=") + kGetKeyLabel});
+		if (SavedKeyExists())
+			args.push_back(std::string("--extra-button=") + kRemoveLabel);
+	} else {
+		// No extra buttons in kdialog: the Cloud Console URL goes in the text.
+		args.insert(args.end(), {"--title", kTitle, "--inputbox", PromptText(true), s_prefill});
+	}
+
+	int fds[2];
+	if (pipe2(fds, O_CLOEXEC) != 0) {
+		LOG_WARN("key dialog: pipe() failed");
+		return;
+	}
+	pid_t pid = Spawn(args, fds[1]);
+	close(fds[1]);
+	if (pid < 0) {
+		close(fds[0]);
+		LOG_WARN("key dialog: could not start %s", cmd.c_str());
+		SetTitle("no API key: set GOOGLE_MAPS_API_KEY or install zenity");
+		return;
+	}
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	s_pid = pid;
+	s_fd = fds[0];
+	s_out.clear();
+	LOG_INFO("key dialog: %s opened (pid %d)%s%s", cmd.c_str(), (int)pid,
+	         s_status.empty() ? "" : " — ", s_status.c_str());
+}
+
+static void
+StartProbe(const std::string &key)
+{
+	auto p = std::make_shared<Probe>();
+	p->key = key;
+	s_probe = p;
+	SetTitle("checking API key…");
+	LOG_INFO("key dialog: checking the key with Google…");
+	s_probeThread = std::thread([p]() {
+		const char *testKey = getenv("EV_KEY_PROBE_ACCEPT_FOR_TEST");
+		if (testKey && *testKey && p->key == testKey) {
+			p->ok = true; // test hook — no network
+		} else {
+			// probeKey owns its AsyncSystem + accessor (the live engine is
+			// untouched) — Windows calls it off the render thread too.
+			p->ok = g_tileEngine.probeKey(p->key, p->err);
+		}
+		p->done.store(true);
+	});
+}
+
+static void
+OnDialogClosed(int code)
+{
+	while (!s_out.empty() && (s_out.back() == '\n' || s_out.back() == '\r'))
+		s_out.pop_back();
+	if (code == 0) {
+		// Save & Start. Keys never contain whitespace; a paste often carries
+		// some (Android strips it for the same reason).
+		std::string key;
+		for (char c : s_out)
+			if (!isspace((unsigned char)c))
+				key += c;
+		if (key.empty()) {
+			Open("Paste a key first.");
+			return;
+		}
+		StartProbe(key);
+		return;
+	}
+	if (code == 1 && s_out == kGetKeyLabel) {
+		pid_t h = Spawn({"xdg-open", kConsoleUrl}, -1);
+		if (h > 0)
+			s_helpers.push_back(h);
+		else
+			LOG_WARN("key dialog: xdg-open failed — visit %s", kConsoleUrl);
+		Open(s_status, s_statusIsError);
+		return;
+	}
+	if (code == 1 && s_out == kRemoveLabel) {
+		earthviewClearApiKey();
+		LOG_INFO("key dialog: saved key removed (%s)", earthviewKeyConfigPath().c_str());
+		s_prefill.clear();
+		Open("Saved key removed — it won't persist to the next launch.", false);
+		return;
+	}
+	if (code == 127) {
+		LOG_WARN("key dialog: dialog tool failed to run");
+	}
+	// Close / window closed.
+	s_prefill.clear();
+	LOG_INFO("key dialog: closed%s", g_tilesActive ? "" : " — no key, tiles stay off (Ctrl+K to enter one)");
+	SetTitle(g_tilesActive ? "" : "no API key (Ctrl+K to enter one)");
+}
+
+// Once per frame, on the frame-loop thread. Never blocks.
+static void
+Poll()
+{
+	for (size_t i = 0; i < s_helpers.size();) {
+		if (waitpid(s_helpers[i], nullptr, WNOHANG) != 0)
+			s_helpers.erase(s_helpers.begin() + (long)i);
+		else
+			++i;
+	}
+
+	if (s_pid > 0) {
+		char buf[512];
+		ssize_t n;
+		while ((n = read(s_fd, buf, sizeof(buf))) > 0)
+			s_out.append(buf, (size_t)n);
+		int status = 0;
+		pid_t r = waitpid(s_pid, &status, WNOHANG);
+		if (r == s_pid || r < 0) {
+			while ((n = read(s_fd, buf, sizeof(buf))) > 0)
+				s_out.append(buf, (size_t)n);
+			close(s_fd);
+			s_fd = -1;
+			s_pid = -1;
+			OnDialogClosed(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		}
+	}
+
+	if (s_probe && s_probe->done.load()) {
+		s_probeThread.join();
+		std::shared_ptr<Probe> p = std::move(s_probe);
+		s_probe.reset();
+		if (!p->ok) {
+			LOG_WARN("key dialog: key rejected — %s", p->err.c_str());
+			s_prefill = p->key;
+			SetTitle(g_tilesActive ? "" : "no API key (Ctrl+K to enter one)");
+			Open(p->err);
+			return;
+		}
+		s_prefill.clear();
+		const std::string path = earthviewKeyConfigPath();
+		if (earthviewSaveApiKey(p->key))
+			LOG_INFO("key dialog: key validated, saved to %s (mode 0600)", path.c_str());
+		else
+			LOG_WARN("key dialog: could not save the key to %s — using it this "
+			         "session only", path.c_str());
+		if (const char *env = getenv("GOOGLE_MAPS_API_KEY"); env && *env && p->key != env)
+			LOG_WARN("key dialog: GOOGLE_MAPS_API_KEY is set and overrides the saved "
+			         "key on the next launch");
+		// This session: the env var is the head of earthviewGetApiKey()'s chain
+		// (as windows/macos do).
+		setenv("GOOGLE_MAPS_API_KEY", p->key.c_str(), 1);
+		s_applyPending = true;
+	}
+}
+
+// Frame loop: a validated key arrived → late-init the tile engine now.
+static bool
+TakeApply()
+{
+	bool a = s_applyPending;
+	s_applyPending = false;
+	return a;
+}
+
+// Exit: close an open dialog (our own recorded child) and settle the probe.
+static void
+Shutdown()
+{
+	if (s_pid > 0) {
+		kill(s_pid, SIGTERM);
+		waitpid(s_pid, nullptr, 0);
+		close(s_fd);
+		s_pid = -1;
+		s_fd = -1;
+	}
+	if (s_probeThread.joinable()) {
+		if (s_probe && s_probe->done.load())
+			s_probeThread.join();
+		else
+			s_probeThread.detach(); // in-flight network probe: don't hold exit
+	}
+	for (pid_t h : s_helpers)
+		waitpid(h, nullptr, WNOHANG);
+}
+
+} // namespace keydlg
+
 // Drain the window once per frame (both backends) into the geo-navigation
 // accumulators above; the close button (or Esc with no orbit acquired) is a
 // clean exit, Resize is the live content size. The header bar, its drag and
@@ -1064,7 +1499,11 @@ PumpWindow(AppXrSession &xr)
 			    MarkUserInput();
 			    if (SetHeldKey(ev.keysym, true))
 				    break;
-			    if (ev.keysym == XK_Escape && !ev.repeat) {
+			    if ((ev.keysym == XK_k || ev.keysym == XK_K) &&
+			        (ev.mods & DxrModCtrl) && !ev.repeat) {
+				    // Ctrl+K: the API-key dialog (as Windows/macOS).
+				    keydlg::Open();
+			    } else if (ev.keysym == XK_Escape && !ev.repeat) {
 				    // First press releases an acquired orbit, the next exits.
 				    if (g_geoNav.orbitAcquired)
 					    g_releaseOrbitRequested = true;
@@ -1340,8 +1779,9 @@ main(int argc, char **argv)
 	}
 
 	// Tile renderer + cesium engine. Keyless is a supported state: the app
-	// stays up (the macOS/Windows legs show a how-to-get-a-key card; this
-	// reduced harness just logs it).
+	// stays up and opens the API-key dialog (keydlg, as the macOS card /
+	// Win32 dialog); a key saved there late-inits the engine in the loop.
+	keydlg::s_windowReady = xr.hasAppWindow;
 	{
 		uint32_t rw = xr.swapchain.width;
 		uint32_t rh = xr.swapchain.height;
@@ -1349,10 +1789,25 @@ main(int argc, char **argv)
 		                         queueFamilyIndex, rw, rh)) {
 			LOG_WARN("tile renderer init failed");
 		} else {
+			g_tileRendererReady = true;
 			g_tilesActive = g_tileEngine.init(&g_tileRenderer);
-			if (!g_tilesActive)
-				LOG_WARN("No Google Map Tiles API key — set GOOGLE_MAPS_API_KEY "
-				         "or earthview.ini to stream tiles.");
+			if (g_tilesActive) {
+				// Which store won (never the key itself — its last 4 only).
+				const std::string k = earthviewGetApiKey();
+				const char *env = getenv("GOOGLE_MAPS_API_KEY");
+				const std::string src =
+				    (env && *env) ? std::string("GOOGLE_MAPS_API_KEY")
+				    : access(earthviewKeyConfigPath().c_str(), R_OK) == 0
+				        ? earthviewKeyConfigPath()
+				        : std::string("earthview.ini (cwd)");
+				LOG_INFO("API key …%s from %s",
+				         k.size() > 4 ? k.substr(k.size() - 4).c_str() : "", src.c_str());
+			} else {
+				LOG_WARN("No Google Map Tiles API key (GOOGLE_MAPS_API_KEY / %s) "
+				         "— opening the key dialog.",
+				         earthviewKeyConfigPath().c_str());
+				keydlg::Open();
+			}
 		}
 	}
 
@@ -1373,6 +1828,19 @@ main(int argc, char **argv)
 	while (g_running && !xr.exitRequested) {
 		PollEvents(xr);
 		PumpWindow(xr); // accumulate geo-nav input; close button / Esc = exit
+
+		// API-key dialog: async child + worker-thread probe, polled (never
+		// blocks). A validated + saved key late-inits the engine HERE, on
+		// the frame-loop thread (cesium's prepareInMainThread/free thread),
+		// before this frame's updateView — the loop is serialized (each eye
+		// ends in vkQueueWaitIdle), so the old tileset frees nothing in
+		// flight. TileEngine::init() drops any previous tileset itself.
+		keydlg::Poll();
+		if (keydlg::TakeApply()) {
+			g_tilesActive = g_tileRendererReady && g_tileEngine.init(&g_tileRenderer);
+			LOG_INFO("API key entered — engine %s", g_tilesActive ? "started" : "init failed");
+			keydlg::SetTitle(g_tilesActive ? "" : "API key saved, tile engine failed to start");
+		}
 
 		// Assert the startup rendering mode ONCE, the first frame the session
 		// is running (the request is dropped by a not-yet-begun session, hence
@@ -1840,6 +2308,7 @@ main(int argc, char **argv)
 
 	// Teardown order (tile_renderer.h): engine FIRST (Tileset dtor free()s
 	// every live tile through the renderer), THEN the renderer, THEN Vulkan.
+	keydlg::Shutdown(); // close an open key dialog (our own child)
 	g_tileEngine.shutdown();
 	g_tileRenderer.cleanup();
 	CleanupOpenXR(xr);

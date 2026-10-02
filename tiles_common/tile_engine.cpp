@@ -28,7 +28,9 @@
 #include <thread>
 
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -158,6 +160,17 @@ earthviewKeyConfigPath()
 	const char *base = std::getenv("APPDATA");
 	std::string dir = (base && *base) ? base : ".";
 	return dir + "\\DisplayXR\\EarthView\\earthview.ini";
+#elif defined(__linux__) && !defined(__ANDROID__)
+	// XDG Base Directory: $XDG_CONFIG_HOME, else ~/.config. The spec says a
+	// relative $XDG_CONFIG_HOME is invalid and must be ignored.
+	std::string base;
+	if (const char *xdg = std::getenv("XDG_CONFIG_HOME"); xdg && xdg[0] == '/') {
+		base = xdg;
+	} else {
+		const char *home = std::getenv("HOME");
+		base = std::string((home && *home) ? home : ".") + "/.config";
+	}
+	return base + "/displayxr/earthview.ini";
 #else
 	const char *home = std::getenv("HOME");
 	std::string dir = (home && *home) ? home : ".";
@@ -191,17 +204,28 @@ earthviewSaveApiKey(const std::string &key)
 	const std::string path = earthviewKeyConfigPath();
 	std::error_code ec;
 	std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+	const std::string line = "key=" + key + "\n";
+#ifndef _WIN32
+	// Per-user secret: rw------- (the user's OWN key, not the project's).
+	// Created 0600 up front (no umask-default window where it is readable),
+	// and fchmod'd in case an older file already existed with wider bits.
+	int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+	if (fd < 0) {
+		return false;
+	}
+	bool ok = fchmod(fd, S_IRUSR | S_IWUSR) == 0;
+	ok = ok && ::write(fd, line.data(), line.size()) == (ssize_t)line.size();
+	ok = (::close(fd) == 0) && ok;
+	return ok;
+#else
 	std::ofstream f(path, std::ios::trunc);
 	if (!f) {
 		return false;
 	}
-	f << "key=" << key << "\n";
+	f << line;
 	f.close();
-#ifndef _WIN32
-	// Per-user secret: rw------- (the user's OWN key, not the project's).
-	chmod(path.c_str(), S_IRUSR | S_IWUSR);
-#endif
 	return f.good();
+#endif
 }
 
 bool
