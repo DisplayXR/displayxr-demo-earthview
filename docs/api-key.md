@@ -31,6 +31,44 @@ never exposed, and the planned in-app key-entry flow.
   persists `%APPDATA%\DisplayXR\EarthView\earthview.ini` — byte-identical to a
   known-good ini from an earlier session. To re-exercise it, move that ini
   aside and launch with `GOOGLE_MAPS_API_KEY` unset.
+- **Linux:** the same flow as the Win32 dialog, as an async desktop dialog
+  (`keydlg` in `linux/main.cpp`). A keyless start opens it and `Ctrl+K` opens
+  it any time. Details below.
+
+## Linux
+
+The Linux app has no toolkit of its own, so the dialog is a **child process**
+(the displayxr-demo-modelviewer file-picker pattern): `zenity --entry`, else
+`kdialog --inputbox`, spawned with `posix_spawnp` and polled once per frame.
+The key probe (`TileEngine::probeKey`, the `EV_PROBE` path) runs on a worker
+thread. Neither one blocks the frame loop. The dialog wording matches the macOS
+card. The buttons are **Save & Start**, **Close**, **Get a Key…** (runs
+`xdg-open` on the Cloud Console) and, when a saved key exists, **Remove key**.
+
+- **Save & Start** strips whitespace and probes the key against Google. If
+  Google rejects it, the dialog reopens with the reason above the text and the
+  key still in the field. If Google accepts it, the key is saved to
+  `$XDG_CONFIG_HOME/displayxr/earthview.ini` (`~/.config/displayxr/…` when
+  `XDG_CONFIG_HOME` is unset or relative). The file is created with mode
+  `0600`, and an existing file is `fchmod`ed to `0600`. The key is also
+  exported as `GOOGLE_MAPS_API_KEY` for this session, and the frame loop
+  late-inits the tile engine, so tiles stream **without a restart** (as on
+  Windows).
+- **Close** with no key leaves the globe untiled. The window title then reads
+  *"no API key (Ctrl+K to enter one)"*.
+- **No dialog tool** (neither zenity nor kdialog on `PATH`, or no
+  `DISPLAY`/`WAYLAND_DISPLAY`): the old log line is printed, and the window
+  title reads *"no API key: set GOOGLE_MAPS_API_KEY or install zenity"*. The
+  `.deb` has `Recommends: zenity`, so a default install has the dialog.
+- At startup the log names the store that supplied the key, and shows only the
+  key's last 4 characters (`API key …abcd from <source>`).
+
+Test hooks (dev only, for headless runs):
+
+- `EV_KEY_DIALOG=zenity|kdialog|none|<cmd>` forces a dialog tool. Any other
+  value is run as a zenity-compatible command, such as a stub.
+- `EV_KEY_PROBE_ACCEPT_FOR_TEST=<key>` makes that exact key pass validation
+  without contacting Google. Persistence and the late-init still run for real.
 
 ## Android (#46)
 
@@ -68,6 +106,8 @@ one. Whitespace is stripped from pasted keys for the same reason.
    outside the repo and the .app bundle):
    - macOS: `~/Library/Application Support/DisplayXR/EarthView/earthview.ini`
    - Windows: `%APPDATA%\DisplayXR\EarthView\earthview.ini`
+   - Linux: `$XDG_CONFIG_HOME/displayxr/earthview.ini` (else
+     `~/.config/displayxr/earthview.ini`)
    - Android: app-private storage.
 3. `earthview.ini` next to the exe / cwd — dev convenience (gitignored).
 4. None → first-run key-entry UI.
@@ -80,9 +120,10 @@ so the local dev key “just works” without hand-exporting. `.env.local`,
 All four steps are implemented in `tiles_common/tile_engine.cpp`:
 `earthviewKeyConfigPath()` resolves the per-user path (`%APPDATA%\DisplayXR\
 EarthView\earthview.ini` on Windows, `~/Library/Application Support/...` on
-macOS), `earthviewGetApiKey()` walks env → per-user ini → cwd ini,
-`earthviewSaveApiKey()` writes the per-user ini (creating the directory, and
-`chmod 0600` on POSIX — Windows inherits the default `%APPDATA%` ACL), and
+macOS, `$XDG_CONFIG_HOME/displayxr/earthview.ini` on desktop Linux), `earthviewGetApiKey()` walks env → per-user ini → cwd ini,
+`earthviewSaveApiKey()` writes the per-user ini (creating the directory; on
+POSIX it is opened with mode `0600` and `fchmod`ed to it, so no window exists
+where it is world-readable — Windows inherits the default `%APPDATA%` ACL), and
 `earthviewClearApiKey()` deletes only that file, leaving the dev stores alone.
 
 ## First-run entry UI (macOS, Cocoa)
@@ -105,7 +146,10 @@ of the app-support ini.
 - **Never** bake or default a key in source, CI, or installers.
 - `.gitignore` excludes `earthview.ini` and `*.key` — keep it.
 - The installer (`installer/macos/`, `scripts/build_macos.sh`) never stages a
-  key; CI builds keyless. The `.pkg` payload assertion lists exactly the
+  key; CI builds keyless. The Linux `.deb` (`scripts/package_deb_linux.sh`)
+  fails to build if its payload contains an `earthview.ini`, `*.key` or
+  `.env*` file, or any `AIza…` key literal. The Windows CI asserts the same of
+  its installer listing. The `.pkg` payload assertion lists exactly the
   expected files — a key file appearing there should fail review.
 - Each developer's key lives only in their local gitignored `earthview.ini`.
 - The persisted **user** key is per-user, mode 600; it is the end user's own

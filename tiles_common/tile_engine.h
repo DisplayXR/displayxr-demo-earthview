@@ -107,7 +107,9 @@ earthviewGetApiKey();
 
 // Per-user config path where the in-app key entry persists (created on demand;
 // outside the repo and the .app bundle). macOS:
-// ~/Library/Application Support/DisplayXR/EarthView/earthview.ini.
+// ~/Library/Application Support/DisplayXR/EarthView/earthview.ini; Windows:
+// %APPDATA%\DisplayXR\EarthView\earthview.ini; desktop Linux:
+// $XDG_CONFIG_HOME/displayxr/earthview.ini (else ~/.config/displayxr/...).
 std::string
 earthviewKeyConfigPath();
 
