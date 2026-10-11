@@ -55,6 +55,8 @@ add_library(tile_renderer STATIC
     tile_engine.cpp
     tile_renderer.h
     tile_renderer.cpp
+    tile_raycast.h
+    tile_raycast.cpp          # per-tile CPU BVH: the depth-aware cursor's ray cast
     model_vulkan_utils.h
     model_vulkan_utils.cpp
     ${SHADER_HEADERS}

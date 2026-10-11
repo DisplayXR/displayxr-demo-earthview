@@ -23,11 +23,13 @@
 #pragma once
 
 #include "model_vulkan_utils.h"
+#include "tile_raycast.h"
 
 #include <Cesium3DTilesSelection/IPrepareRendererResources.h>
 
 #include <glm/glm.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <unordered_set>
 #include <vector>
@@ -164,6 +166,42 @@ public:
 		return ssaaFactor_;
 	}
 
+	// ── Depth-aware cursor (XR_DXR_cursor_depth; docs/depth-cursor.md) ──
+
+	// Nearest hit along origin + t * dir (XR space — the locate space the
+	// views and the draw list share), 0 <= t < tMax, over the tiles the LAST
+	// buildDrawList selected: exactly what is on screen. Per tile: map the ray
+	// into tile-local space (the double inverse of the draw matrix, cast once
+	// per frame in buildDrawList), reject on the tile's root box, then walk the
+	// tile's BVH (built at tile load on the worker thread). Render thread only.
+	bool
+	raycast(const float origin[3], const float dir[3], float &tOut, float tMax = 1e30f) const;
+
+	// Build a BVH for every tile loaded from now on (off by default: a leg
+	// without the depth cursor — Android, DISPLAYXR_CURSOR_DEPTH=0, a runtime
+	// without the extension — pays nothing, neither build time nor the ~50 B
+	// per resident triangle). Set before the first frame streams tiles.
+	void
+	setRaycastEnabled(bool on)
+	{
+		raycastEnabled_.store(on);
+	}
+
+	// Load-thread BVH build cost since startup (diagnostics / the cost line).
+	struct BvhBuildStats
+	{
+		uint64_t tiles = 0, triangles = 0;
+		double totalMs = 0.0, maxMs = 0.0;
+		double residentMB = 0.0; // BVHs of the tiles alive now (CPU RAM)
+	};
+	BvhBuildStats
+	bvhBuildStats() const;
+	int
+	pickTileCount() const
+	{
+		return (int)pickList_.size();
+	}
+
 	// HUD stats.
 	double
 	gpuResidentMB() const
@@ -239,5 +277,26 @@ private:
 
 	std::unordered_set<TileGpu *> liveTiles_;
 	uint64_t gpuBytes_ = 0;
+
+	// Depth-cursor ray cast: one entry per tile in the last draw list.
+	struct PickItem
+	{
+		const TileBvh *bvh;
+		float inv[12];   // BVH-space-from-XR (frame * tile-local-from-XR), rows of a 3x4
+		float center[3]; // XR-space bounding sphere of the BVH root box
+		float radius2;
+	};
+	mutable std::vector<PickItem> pickList_;
+	struct PickRay // one ray mapped into one candidate tile (raycast scratch)
+	{
+		float o[3], d[3], invD[3];
+		float tEnter;
+		uint32_t item;
+	};
+	mutable std::vector<PickRay> pickHits_;
+	uint64_t bvhBytes_ = 0;
+	// Written by cesium's worker threads (prepareInLoadThread).
+	std::atomic<bool> raycastEnabled_{false};
+	std::atomic<uint64_t> bvhBuildNs_{0}, bvhBuildMaxNs_{0}, bvhBuildTiles_{0}, bvhBuildTris_{0};
 	mutable int lastStagingSkipped_ = 0;
 };

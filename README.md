@@ -112,6 +112,13 @@ releases; CI then installs it into pristine 22.04 / 24.04 / 26.04 containers
 | `B` | cycle city bookmarks (Paris, SF, NYC, Tokyo, Sydney) |
 | `V` / `0`–`3`, `T`, Tab, `I` | mode cycle/select, eye-tracking, HUD, atlas capture |
 
+**Depth-aware cursor.** Where the city pops out of the glass under the
+pointer, the runtime draws the cursor just in front of it (runtime ≥ v2.36,
+`XR_DXR_cursor_depth`; macOS and Linux today, Windows once the runtime's D3D
+compositors draw it). Over the sky, or over ground behind the glass, the OS
+cursor is unchanged. `DISPLAYXR_CURSOR_DEPTH=0` turns it off. How it is wired
+(a per-tile BVH over the streamed tiles): [docs/depth-cursor.md](docs/depth-cursor.md).
+
 ## Layout
 
 ```

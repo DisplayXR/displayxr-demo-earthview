@@ -25,6 +25,9 @@
 // flag (displayxr::common's XrSessionManager carries no app-named fields,
 // #396 W4); set by InitializeOpenXR.
 extern bool g_hasViewRigExt;
+//! XR_DXR_cursor_depth spec version when ENABLED at xrCreateInstance, else 0
+//! (absent, or opted out with DISPLAYXR_CURSOR_DEPTH=0).
+extern uint32_t g_cursorDepthSpecVersion;
 
 // XrDisplayDesktopPositionDXR (XR_DXR_display_info v16, runtime#715): the 3D
 // panel's top-left in virtual-desktop pixels (top-down, origin = primary

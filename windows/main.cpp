@@ -43,6 +43,7 @@
 
 #include "tile_engine.h"
 #include "tile_renderer.h"
+#include "earthview_cursor_depth.h" // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, tile ray cast
 #include "geo_math.h"
 #include "dxr_view_math.h"  // rig converters (cam<->display) for focus mode
 #include "display3d_view.h"
@@ -1311,6 +1312,16 @@ static void RenderThreadFunc(
 {
     LOG_INFO("[RenderThread] Started");
 
+    // Depth-aware cursor: the runtime draws it in front of the terrain/buildings
+    // where they pop out of the glass; the app supplies the depth
+    // (TileRenderer::raycast, same thread as buildDrawList). Until the
+    // D3D11/D3D12 compositors draw it (runtime #1944) willDraw stays false here
+    // and the OS cursor stays: inert.
+    dxr::CursorDepth cursor;
+    earthview::CursorDepthAdoption cursorAdopt;
+    cursorAdopt.setup(cursor, g_tileRenderer, g_cursorDepthSpecVersion);
+    if (!cursorAdopt.scripted()) cursor.setWindowWin32(hwnd);
+
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
@@ -1613,6 +1624,7 @@ static void RenderThreadFunc(
                         uint32_t viewCount = 8;
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
+                        cursor.chain(locateInfo, viewState);
                         const XrResult locateResult =
                             xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
@@ -1712,6 +1724,8 @@ static void RenderThreadFunc(
                             activeViewCount = tileCapacity;
                         }
                         const int eyeCount = monoMode ? 1 : (int)activeViewCount;
+                        cursor.afterLocate(rawViews, (uint32_t)eyeCount);
+                        if (cursorAdopt.endFrame(cursor)) LOG_INFO("%s", cursorAdopt.summary());
 
                         // --- Consume the runtime's render-ready XrView{pose, fov} (#396 W7) ---
                         // The runtime owns the off-axis Kooima (window resolve included —
