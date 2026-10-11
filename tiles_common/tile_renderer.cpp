@@ -1286,8 +1286,18 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	toDst.image = swapchainImage;
 	toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-	                     0, nullptr, 0, nullptr, 1, &toDst);
+	// Later tiles: the previous view left the swapchain in COLOR_ATTACHMENT
+	// after a transfer write — its src stage must be one that performs that
+	// access (TOP_OF_PIPE performs none: VUID-vkCmdPipelineBarrier-
+	// pImageMemoryBarriers-02819, latent while every eye drained the queue).
+	if (!firstEye) {
+		toDst.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	}
+	const VkPipelineStageFlags toDstSrcStage =
+	    firstEye ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+	             : (VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+	vkCmdPipelineBarrier(cmd, toDstSrcStage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+	                     nullptr, 1, &toDst);
 
 	/*
 	 * colorImage_ holds the authored, sRGB-ENCODED bytes. vkCmdBlitImage is not
