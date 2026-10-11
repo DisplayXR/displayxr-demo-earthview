@@ -23,6 +23,7 @@ extern "C" int stbi_write_png(const char *filename, int w, int h, int comp, cons
                               int stride_bytes);
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -87,6 +88,9 @@ struct TileStaging
 	std::vector<uint32_t> indices;
 	std::vector<StagedTexture> textures;
 	std::vector<StagedPrimitive> prims;
+	// Depth-cursor ray cast (tile_raycast.h): built here on the load thread,
+	// handed to TileGpu by prepareInMainThread. Tile-local, like the vertices.
+	TileBvh bvh;
 };
 
 struct PushBlock
@@ -113,6 +117,7 @@ struct TileGpu
 	std::vector<VkDescriptorSet> texSets; // parallel to textures
 	std::vector<StagedPrimitive> prims;
 	uint64_t bytes = 0;
+	TileBvh bvh; // CPU only (depth-cursor ray cast); not counted in `bytes`
 };
 
 // ── Load thread: glTF -> TileStaging (CPU only) ──────────────────────────
@@ -296,6 +301,53 @@ TileRenderer::prepareInLoadThread(const CesiumAsync::AsyncSystem &asyncSystem,
 	if (staging->prims.empty()) {
 		delete staging;
 		staging = nullptr;
+	} else if (raycastEnabled_.load(std::memory_order_relaxed)) {
+		// Depth-cursor BVH over every triangle the GPU will draw, in the same
+		// tile-local float space (indices are per-primitive + vertexOffset).
+		const auto t0 = std::chrono::steady_clock::now();
+		std::vector<float> pos(staging->vertices.size() * 3);
+		for (size_t i = 0; i < staging->vertices.size(); ++i) {
+			std::memcpy(&pos[i * 3], staging->vertices[i].pos, sizeof(float) * 3);
+		}
+		std::vector<uint32_t> idx;
+		idx.reserve(staging->indices.size());
+		for (const StagedPrimitive &sp : staging->prims) {
+			for (uint32_t k = 0; k < sp.indexCount; ++k) {
+				idx.push_back(staging->indices[sp.firstIndex + k] + (uint32_t)sp.vertexOffset);
+			}
+		}
+		// BVH frame = the tile's local east/north/up axes (see TileBvh::build):
+		// ENU-from-ECEF rotation at the tile's origin, times the linear part of
+		// ECEF-from-local (the same yz * transform the draw matrix uses).
+		float frame[9];
+		{
+			const glm::dmat4 w = geo::yUpToZUp() * transform;
+			const glm::dvec3 c(w[3]);
+			const double cl = glm::length(c);
+			glm::dvec3 up = cl > 1.0 ? c / cl : glm::dvec3(0.0, 0.0, 1.0);
+			glm::dvec3 east = glm::cross(glm::dvec3(0.0, 0.0, 1.0), up);
+			east = glm::length(east) > 1e-9 ? glm::normalize(east) : glm::dvec3(1.0, 0.0, 0.0);
+			const glm::dvec3 north = glm::cross(up, east);
+			const glm::dmat3 lin(w);
+			const glm::dvec3 rows[3] = {east, north, up};
+			for (int r = 0; r < 3; ++r) {
+				for (int k = 0; k < 3; ++k) {
+					// (R_enu * lin)[r][k] = dot(rows[r], lin column k)
+					frame[r * 3 + k] = (float)glm::dot(rows[r], lin[k]);
+				}
+			}
+		}
+		staging->bvh.build(pos.data(), (uint32_t)staging->vertices.size(), idx.data(),
+		                   (uint32_t)idx.size(), frame);
+		const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                        std::chrono::steady_clock::now() - t0)
+		                        .count();
+		bvhBuildNs_ += ns;
+		bvhBuildTiles_ += 1;
+		bvhBuildTris_ += staging->bvh.triangleCount();
+		uint64_t prev = bvhBuildMaxNs_.load();
+		while (ns > prev && !bvhBuildMaxNs_.compare_exchange_weak(prev, ns)) {
+		}
 	}
 	return asyncSystem.createResolvedFuture(
 	    Cesium3DTilesSelection::TileLoadResultAndRenderResources{std::move(tileLoadResult),
@@ -315,6 +367,7 @@ TileRenderer::prepareInMainThread(Cesium3DTilesSelection::Tile &tile, void *pLoa
 
 	auto *gpu = new TileGpu();
 	gpu->prims = staging->prims;
+	gpu->bvh = std::move(staging->bvh);
 
 	const VkDeviceSize vbytes = staging->vertices.size() * sizeof(TileVertex);
 	const VkDeviceSize ibytes = staging->indices.size() * sizeof(uint32_t);
@@ -354,6 +407,7 @@ TileRenderer::prepareInMainThread(Cesium3DTilesSelection::Tile &tile, void *pLoa
 	}
 	liveTiles_.insert(gpu);
 	gpuBytes_ += gpu->bytes;
+	bvhBytes_ += gpu->bvh.bytes();
 	return gpu;
 }
 
@@ -372,7 +426,13 @@ TileRenderer::free(Cesium3DTilesSelection::Tile &tile,
 	// (renderEye submits and waits) → nothing here is GPU-in-flight.
 	if (liveTiles_.erase(gpu)) {
 		gpuBytes_ -= gpu->bytes;
+		bvhBytes_ -= gpu->bvh.bytes();
 	}
+	// The ray-cast list may name this tile. Every free inside updateView is
+	// followed by buildDrawList (which rebuilds the list), so dropping it here
+	// only matters for frees outside a frame (shutdown, key re-init) — and
+	// there it keeps a dangling pointer from ever being cast against.
+	pickList_.clear();
 	if (device_ != VK_NULL_HANDLE) {
 		for (VkDescriptorSet set : gpu->texSets) {
 			if (set != VK_NULL_HANDLE) {
@@ -403,6 +463,8 @@ TileRenderer::buildDrawList(const Cesium3DTilesSelection::ViewUpdateResult &resu
 {
 	std::vector<DrawItem> items;
 	items.reserve(result.tilesToRenderThisFrame.size());
+	pickList_.clear();
+	pickList_.reserve(result.tilesToRenderThisFrame.size());
 	lastStagingSkipped_ = 0;
 	const glm::dmat4 yz = geo::yUpToZUp();
 	for (const auto &pTile : result.tilesToRenderThisFrame) {
@@ -423,6 +485,56 @@ TileRenderer::buildDrawList(const Cesium3DTilesSelection::ViewUpdateResult &resu
 		glm::mat4 mf(m);
 		std::memcpy(item.model, glm::value_ptr(mf), sizeof(item.model));
 		items.push_back(item);
+
+		// Depth cursor: the XR->tile-local inverse of the SAME double matrix,
+		// so a cast ray lands on exactly the triangles this frame draws.
+		// The BVH lives in frame * tile-local, so the pick matrix is
+		// frame * inverse(m) (still affine: t is preserved).
+		if (!gpu->bvh.empty()) {
+			const glm::dmat4 inv = glm::inverse(m);
+			const float *F = gpu->bvh.frame();
+			PickItem pi;
+			pi.bvh = &gpu->bvh;
+			for (int r = 0; r < 3; ++r) {
+				for (int c = 0; c < 4; ++c) {
+					// glm is column-major: inv[col][row]
+					const double v = (double)F[r * 3] * inv[c][0] + (double)F[r * 3 + 1] * inv[c][1] +
+					                 (double)F[r * 3 + 2] * inv[c][2];
+					pi.inv[r * 4 + c] = (float)v;
+				}
+			}
+			// XR-space bounding sphere of the tile's BVH root box: the cheap
+			// first reject (one dot product per tile per ray).
+			{
+				glm::dmat3 Fm;
+				for (int r = 0; r < 3; ++r) {
+					for (int c = 0; c < 3; ++c) {
+						Fm[c][r] = (double)F[r * 3 + c];
+					}
+				}
+				const glm::dmat3 Finv = glm::inverse(Fm);
+				const float *bmn = gpu->bvh.boundsMin(), *bmx = gpu->bvh.boundsMax();
+				glm::dvec3 corners[8];
+				glm::dvec3 ctr(0.0);
+				for (int k = 0; k < 8; ++k) {
+					const glm::dvec3 pb((k & 1) ? bmx[0] : bmn[0], (k & 2) ? bmx[1] : bmn[1],
+					                    (k & 4) ? bmx[2] : bmn[2]);
+					corners[k] = glm::dvec3(m * glm::dvec4(Finv * pb, 1.0));
+					ctr += corners[k];
+				}
+				ctr /= 8.0;
+				double rad2 = 0.0;
+				for (int k = 0; k < 8; ++k) {
+					const glm::dvec3 dd = corners[k] - ctr;
+					rad2 = std::max(rad2, glm::dot(dd, dd));
+				}
+				pi.center[0] = (float)ctr.x;
+				pi.center[1] = (float)ctr.y;
+				pi.center[2] = (float)ctr.z;
+				pi.radius2 = (float)rad2;
+			}
+			pickList_.push_back(pi);
+		}
 	}
 	return items;
 }
@@ -1382,4 +1494,74 @@ TileRenderer::cleanup()
 TileRenderer::~TileRenderer()
 {
 	cleanup();
+}
+
+// ── Depth-cursor ray cast (tile_raycast.h) ───────────────────────────────
+
+bool
+TileRenderer::raycast(const float origin[3], const float dir[3], float &tOut, float tMax) const
+{
+	// Pass 1 — broad phase over the tile bounding volumes: map the ray into
+	// each tile's space (affine, so t is preserved: no rescale of the hit) and
+	// keep the tiles whose root box it enters, with the entry t.
+	pickHits_.clear();
+	const float dlen2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+	const float invDlen2 = dlen2 > 0.0f ? 1.0f / dlen2 : 0.0f;
+	for (uint32_t i = 0; i < (uint32_t)pickList_.size(); ++i) {
+		const PickItem &pi = pickList_[i];
+		// Sphere reject in XR space (most tiles stop here).
+		{
+			const float v[3] = {pi.center[0] - origin[0], pi.center[1] - origin[1], pi.center[2] - origin[2]};
+			const float tc = v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2];
+			const float vv = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+			if (vv > pi.radius2 && (tc < 0.0f || vv - tc * tc * invDlen2 > pi.radius2)) {
+				continue;
+			}
+		}
+		const float *M = pi.inv;
+		PickRay pr;
+		for (int r = 0; r < 3; ++r) {
+			pr.o[r] = M[r * 4 + 0] * origin[0] + M[r * 4 + 1] * origin[1] + M[r * 4 + 2] * origin[2] +
+			          M[r * 4 + 3];
+			pr.d[r] = M[r * 4 + 0] * dir[0] + M[r * 4 + 1] * dir[1] + M[r * 4 + 2] * dir[2];
+			pr.invD[r] = 1.0f / pr.d[r]; // +-inf on an axis-parallel ray: the slab test handles it
+		}
+		pr.tEnter = tileRayAabb(pr.o, pr.invD, pi.bvh->boundsMin(), pi.bvh->boundsMax(), tMax);
+		if (pr.tEnter < 0.0f) {
+			continue;
+		}
+		pr.item = i;
+		pickHits_.push_back(pr);
+	}
+	// Pass 2 — front to back: a grazing ray (looking toward the horizon)
+	// crosses dozens of tile boxes, but once a surface is hit, no tile whose
+	// box starts beyond it can be nearer.
+	std::sort(pickHits_.begin(), pickHits_.end(),
+	          [](const PickRay &a, const PickRay &b) { return a.tEnter < b.tEnter; });
+	float best = tMax;
+	bool hit = false;
+	for (const PickRay &pr : pickHits_) {
+		if (pr.tEnter >= best) {
+			break;
+		}
+		if (pickList_[pr.item].bvh->raycast(pr.o, pr.d, pr.invD, best)) {
+			hit = true;
+		}
+	}
+	if (hit) {
+		tOut = best;
+	}
+	return hit;
+}
+
+TileRenderer::BvhBuildStats
+TileRenderer::bvhBuildStats() const
+{
+	BvhBuildStats s;
+	s.tiles = bvhBuildTiles_.load();
+	s.triangles = bvhBuildTris_.load();
+	s.totalMs = (double)bvhBuildNs_.load() * 1e-6;
+	s.maxMs = (double)bvhBuildMaxNs_.load() * 1e-6;
+	s.residentMB = (double)bvhBytes_ / (1024.0 * 1024.0);
+	return s;
 }

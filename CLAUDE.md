@@ -18,6 +18,9 @@ common/               # displayxr-common FetchContent (HUD, input, dxr_math)
 tiles_common/         # scene layer: cesium glue + VK tile renderer + geo math
 │   tile_engine.{h,cpp}      # Tileset wrapper, accessor, credits, ViewState
 │   tile_renderer.{h,cpp}    # IPrepareRendererResources + unlit draw
+│   tile_raycast.{h,cpp}     # per-tile CPU BVH (built at tile load) — the
+│                            #   depth-aware cursor's ray cast (docs/depth-cursor.md)
+│   earthview_cursor_depth.h # the legs' shared XR_DXR_cursor_depth adoption
 │   geo_math.{h,cpp}         # ECEF/ENU doubles, RTC, GeoCamera, bookmarks
 │   model_vulkan_utils.{h,cpp} # buffer/image upload (from modelviewer, verbatim)
 │   shaders/tile.{vert,frag}   # unlit textured, sRGB (glslangValidator → .h)

@@ -91,6 +91,7 @@
 #include "geo_math.h"
 #include "tile_engine.h"
 #include "tile_renderer.h"
+#include "earthview_cursor_depth.h" // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, tile ray cast
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp> // glm::rotate — focus orbit / turntable
@@ -155,6 +156,14 @@ static volatile sig_atomic_t g_running = 1;
 //! (displayxr::linux_window). Destroyed LAST (the runtime's VkSurfaceKHR
 //! borrows its connection).
 static DxrLinuxWindow g_window;
+// Depth-aware cursor (XR_DXR_cursor_depth): the runtime draws it in front of
+// the terrain/buildings where they pop out of the glass; the app supplies the
+// depth (TileRenderer::raycast). displayxr::linux_window is X11 OR Wayland, so
+// this leg feeds the pointer by hand (setPointerUV from Motion events) and
+// hides the OS cursor with the window's own set_cursor() - the helper's manual
+// path. Declared after g_window: destroyed BEFORE it.
+static dxr::CursorDepth g_cursor;
+static earthview::CursorDepthAdoption g_cursorAdopt;
 static void
 SignalHandler(int)
 {
@@ -230,6 +239,7 @@ struct AppXrSession
 
 	bool hasDisplayInfoExt = false;
 	bool hasViewRigExt = false;
+	uint32_t cursorDepthSpecVersion = 0; //!< XR_DXR_cursor_depth, 0 = not enabled
 	bool hasXlibBindingExt = false;
 	bool hasWaylandBindingExt = false;
 	//! Window platform resolved before xrCreateInstance; Auto = hosted-NULL.
@@ -287,6 +297,9 @@ InitializeOpenXR(AppXrSession &xr, DxrWindowBackend requestedBackend)
 			xr.hasDisplayInfoExt = true;
 		if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
 			xr.hasViewRigExt = true;
+		if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+		    earthview::CursorDepthWanted())
+			xr.cursorDepthSpecVersion = e.extensionVersion;
 		if (strcmp(e.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0)
 			xr.hasXlibBindingExt = true;
 		if (strcmp(e.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0)
@@ -303,6 +316,10 @@ InitializeOpenXR(AppXrSession &xr, DxrWindowBackend requestedBackend)
 		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	if (xr.hasViewRigExt)
 		enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+	if (xr.cursorDepthSpecVersion > 0)
+		enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+	LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", xr.cursorDepthSpecVersion ? "ENABLED" : "off",
+	         xr.cursorDepthSpecVersion);
 	// Window platform, resolved BEFORE xrCreateInstance so only the binding the
 	// session will chain is enabled. A capability probe, never session env
 	// vars; an explicit --platform wins. Nothing usable -> hosted-NULL.
@@ -1559,6 +1576,8 @@ PumpWindow(AppXrSession &xr)
 			    }
 			    break;
 		    case T::Motion:
+			    if (!g_cursorAdopt.scripted() && g_windowW > 0 && g_windowH > 0)
+				    g_cursor.setPointerUV((float)ev.x / (float)g_windowW, (float)ev.y / (float)g_windowH);
 			    if (g_leftDown) {
 				    if (g_dragValid) {
 					    g_lookDX += (float)(ev.x - g_lastDragX) * 0.005f;
@@ -1569,6 +1588,10 @@ PumpWindow(AppXrSession &xr)
 				    g_lastDragY = ev.y;
 				    g_dragValid = true;
 			    }
+			    break;
+		    case T::PointerLeave:
+			    if (!g_cursorAdopt.scripted())
+				    g_cursor.clearPointerUV(); // off the canvas: no hint
 			    break;
 		    case T::Scroll:
 			    // +1 per notch up/away, as Windows' WHEEL_DELTA notches.
@@ -1823,6 +1846,11 @@ main(int argc, char **argv)
 	// ground distance in geo metres, scaled to XR metres, exp-smoothed.
 	// (g_convDiopters: 1/m; default = 1/kTargetXrDist.)
 	constexpr double kConvSmoothTau = 0.15;
+
+	g_cursorAdopt.setup(g_cursor, g_tileRenderer, xr.cursorDepthSpecVersion);
+	g_cursor.onDepthCursorShownChanged(
+	    [](bool shown) { g_window.set_cursor(shown ? DxrCursor::Hidden : DxrCursor::Default); });
+
 	auto lastTime = std::chrono::high_resolution_clock::now();
 
 	while (g_running && !xr.exitRequested) {
@@ -1983,6 +2011,9 @@ main(int argc, char **argv)
 			uint32_t viewCap = xr.maxViewCount > 8 ? 8 : (xr.maxViewCount ? xr.maxViewCount : 2);
 			std::vector<XrView> xrViews(viewCap, {XR_TYPE_VIEW});
 			uint32_t viewCount = 0;
+			// Depth cursor: prepends its structs (ray cast vs LAST frame's
+			// views + draw list, which share one space).
+			g_cursor.chain(locateInfo, viewState);
 			XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState,
 			                            viewCap, &viewCount, xrViews.data());
 			// Runtime-resolved canvas size (m) drives the cam->display rig
@@ -2061,6 +2092,9 @@ main(int argc, char **argv)
 				// is told every LOCATED view (viewCount) — the tail past
 				// eyeCount is aliased onto view 0 after the fill below.
 				const uint32_t eyeCount = monoMode ? 1 : activeViewCount;
+				g_cursor.afterLocate(xrViews.data(), eyeCount);
+				if (g_cursorAdopt.endFrame(g_cursor))
+					LOG_INFO("%s", g_cursorAdopt.summary());
 				uint32_t renderW = (uint32_t)((double)g_windowW * scaleX);
 				uint32_t renderH = (uint32_t)((double)g_windowH * scaleY);
 				if (renderW == 0)
@@ -2316,6 +2350,7 @@ main(int argc, char **argv)
 		vkDestroyDevice(vkDevice, nullptr);
 	if (vkInstance)
 		vkDestroyInstance(vkInstance, nullptr);
+	g_cursor.enable(0); // restores the OS cursor while the window still exists
 	g_window.destroy(); // LAST: the runtime's VkSurfaceKHR borrowed this connection
 	LOG_INFO("EarthView Linux exited cleanly.");
 	return 0;

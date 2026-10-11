@@ -32,6 +32,7 @@ Pins in force:
 
 | Runtime commit | Headers |
 |---|---|
+| `bbc1292c948855badd4402c2aa2e83a2891ba347`<br>bbc1292c9 (2026-10-11) feat(cursor): the runtime draws the depth cursor — Vulkan + GL (ADR-046 Amendment 2 §B) (#1946) | `XR_DXR_cursor_depth.h` (spec v6) |
 | `98d46018d16f226e021fb4e6b9ac6e8ee9cd3647`<br>98d46018d (2026-09-22) fix(d3d11_service): run the combine pass's draws under immediate_ctx_mutex (#1589/#1610) | `XR_DXR_wayland_surface_binding.h` |
 | `220e9393511aab23c1ef2c6bb796d452f4fe3060`<br>220e93935 (2026-09-07) feat(android): XR_DXR_android_surface_binding v2 — mini-window layout hint (#1396) (#1398) | `XR_DXR_xlib_window_binding.h`, `XR_MNDX_ball_on_a_stick_controller.h`, `XR_MNDX_blubur_s1.h`, `XR_MNDX_hydra.h`, `XR_MNDX_oculus_remote.h`, `XR_MNDX_system_buttons.h`, `XR_MNDX_xdev_space.h`, `openxr.h`, `openxr_extension_helpers.h`, `openxr_loader_negotiation.h`, `openxr_platform.h`, `openxr_platform_defines.h`, `openxr_reflection.h`, `openxr_reflection_parent_structs.h`, `openxr_reflection_structs.h` |
 | `c1e4fe00da0f189122eca14e61e9faaa88e4b38e`<br>c1e4fe00d (2026-09-18) chore(cts): drop the by-name exclusion of xrLocateSpace_xrLocateViews — #1502 landed<br>(the commit the demo-opt-in brief pins for `XR_DXR_display_info` spec v19 + `dxr_view_config.h`) | `XR_DXR_display_info.h` |

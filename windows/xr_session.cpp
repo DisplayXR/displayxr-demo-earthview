@@ -7,9 +7,12 @@
 
 #include "xr_session.h"
 #include "logging.h"
+#include "cursor_depth_wanted.h" // earthview::CursorDepthWanted (XR_DXR_cursor_depth opt-out)
+#include <openxr/XR_DXR_cursor_depth.h>
 #include <cstring>
 
 bool g_hasViewRigExt = false;
+uint32_t g_cursorDepthSpecVersion = 0;
 
 // XrDisplayDesktopPositionDXR (display_info v16, runtime#715) — see xr_session.h.
 int32_t g_displayDesktopLeft = 0;
@@ -65,6 +68,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            earthview::CursorDepthWanted()) {
+            g_cursorDepthSpecVersion = ext.extensionVersion;
+        }
         // XR_DXR_mcp_tools (#26): app-defined agent tools on the runtime-hosted
         // per-process MCP server. The whole path is inert when the extension or
         // the MCP capability gate is absent — never load-bearing.
@@ -79,6 +86,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", g_cursorDepthSpecVersion ? "ENABLED" : "off",
+        g_cursorDepthSpecVersion);
     LOG_INFO("XR_DXR_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
@@ -107,6 +116,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasViewRigExt) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_cursorDepthSpecVersion > 0) {
+        enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
     }
     if (xr.hasMcpToolsExt) {
         enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
