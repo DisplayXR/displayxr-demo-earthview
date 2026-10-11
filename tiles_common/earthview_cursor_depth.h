@@ -48,6 +48,7 @@
 #pragma once
 
 #include "cursor_depth.h" // displayxr-common v2.29.0+
+#include "cursor_depth_wanted.h"
 #include "tile_renderer.h"
 
 #include <chrono>
@@ -56,14 +57,6 @@
 #include <cstring>
 
 namespace earthview {
-
-//! False when DISPLAYXR_CURSOR_DEPTH=0: do not enable the extension.
-inline bool
-CursorDepthWanted()
-{
-	const char *e = std::getenv("DISPLAYXR_CURSOR_DEPTH");
-	return !(e != nullptr && std::strcmp(e, "0") == 0);
-}
 
 class CursorDepthAdoption
 {

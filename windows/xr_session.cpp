@@ -7,7 +7,7 @@
 
 #include "xr_session.h"
 #include "logging.h"
-#include "earthview_cursor_depth.h" // earthview::CursorDepthWanted (XR_DXR_cursor_depth)
+#include "cursor_depth_wanted.h" // earthview::CursorDepthWanted (XR_DXR_cursor_depth opt-out)
 #include <cstring>
 
 bool g_hasViewRigExt = false;

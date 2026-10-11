@@ -57,6 +57,8 @@ add_library(tile_renderer STATIC
     tile_renderer.cpp
     tile_raycast.h
     tile_raycast.cpp          # per-tile CPU BVH: the depth-aware cursor's ray cast
+    earthview_cursor_depth.h  # the legs' shared XR_DXR_cursor_depth adoption
+    cursor_depth_wanted.h     # its opt-out, light enough for xrCreateInstance sites
     model_vulkan_utils.h
     model_vulkan_utils.cpp
     ${SHADER_HEADERS}
