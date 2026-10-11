@@ -1860,9 +1860,10 @@ main(int argc, char **argv)
 		// API-key dialog: async child + worker-thread probe, polled (never
 		// blocks). A validated + saved key late-inits the engine HERE, on
 		// the frame-loop thread (cesium's prepareInMainThread/free thread),
-		// before this frame's updateView — the loop is serialized (each eye
-		// ends in vkQueueWaitIdle), so the old tileset frees nothing in
-		// flight. TileEngine::init() drops any previous tileset itself.
+		// before this frame's updateView. Frames are in flight (the tile
+		// renderer's dxr::VkFrameRing), but TileRenderer::free() retires tile
+		// resources through the ring, so dropping the old tileset is safe.
+		// TileEngine::init() drops any previous tileset itself.
 		keydlg::Poll();
 		if (keydlg::TakeApply()) {
 			g_tilesActive = g_tileRendererReady && g_tileEngine.init(&g_tileRenderer);
@@ -2196,6 +2197,9 @@ main(int argc, char **argv)
 						selCam.dir = glm::normalize(invRot * glm::dvec3(0.0, 0.0, -1.0));
 						selCam.up = glm::normalize(invRot * glm::dvec3(0.0, 1.0, 0.0));
 					}
+					// Open the frame's ONE command buffer before the tileset
+					// update: cesium's tile uploads record into it.
+					g_tileRenderer.beginFrame();
 					const auto &tiles = g_tileEngine.update(
 					    selCam, (double)renderW, (double)renderH, hfov, vfov);
 					g_drawList = g_tileRenderer.buildDrawList(tiles, xrFromEcef);
@@ -2311,6 +2315,9 @@ main(int argc, char **argv)
 						}
 					}
 
+					// The frame's single submit (no wait), BEFORE the release
+					// so the runtime's compose is ordered after our work.
+					g_tileRenderer.endFrame();
 					XrSwapchainImageReleaseInfo ri = {
 					    XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 					xrReleaseSwapchainImage(xr.swapchain.swapchain, &ri);
@@ -2318,6 +2325,10 @@ main(int argc, char **argv)
 				}
 			}
 		}
+
+		// Catch-all: a frame opened for tile uploads whose acquire failed
+		// still gets its one submit (no-op when no frame is open).
+		g_tileRenderer.endFrame();
 
 		XrCompositionLayerProjection layer = {
 		    XR_TYPE_COMPOSITION_LAYER_PROJECTION};

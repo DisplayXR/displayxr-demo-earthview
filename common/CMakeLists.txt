@@ -55,10 +55,12 @@ FetchContent_Declare(
     # v2.27.0: window-space / HUD swapchains are created as the _SRGB sibling
     # of R8G8B8A8 (displayxr-common#72, runtime ADR-044 §7) — the HUD, toasts and
     # button bar no longer wash out on D3D11/D3D12/GL.
+    # v2.28.0: dxr::VkFrameRing (common/vk_frame_ring.h, via displayxr::rules) —
+    # the tile renderer's N-frames-in-flight / one-submit-per-frame ring
+    # (runtime INV-4.10, displayxr-demo-modelviewer#170, runtime#1917).
     # v2.29.0: dxr::CursorDepth (common/cursor_depth.h) — the app side of the
     # runtime-drawn depth cursor (XR_DXR_cursor_depth v5+, runtime ADR-046
     # Amendment 2); needs openxr_includes' XR_DXR_cursor_depth.h (spec >= 5).
-    # v2.28.0 in between added the shared Vulkan frame ring (unused here).
     GIT_TAG v2.29.0
     GIT_SHALLOW TRUE
 )

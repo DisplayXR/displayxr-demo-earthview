@@ -146,9 +146,9 @@ VkPhysicalDevice g_vk_phys_device = VK_NULL_HANDLE;
 VkDevice g_vk_device = VK_NULL_HANDLE;
 VkQueue g_vk_queue = VK_NULL_HANDLE;
 uint32_t g_vk_queue_family = UINT32_MAX;
-VkCommandPool g_cmd_pool = VK_NULL_HANDLE;
-VkCommandBuffer g_cmd = VK_NULL_HANDLE;
-VkFence g_fence = VK_NULL_HANDLE;
+// No app-owned command pool / fence: every per-frame command (tiles AND the
+// keyless clear) records into the tile renderer's dxr::VkFrameRing — ONE
+// vkQueueSubmit per frame, 3 frames in flight (runtime INV-4.10, #1917).
 XrSession g_session = XR_NULL_HANDLE;
 bool g_session_running = false;
 bool g_exit_requested = false;
@@ -366,15 +366,6 @@ create_vulkan_device()
 	log_xr_result("xrCreateVulkanDeviceKHR", res);
 	if (res != XR_SUCCESS || vr != VK_SUCCESS) return false;
 	vkGetDeviceQueue(g_vk_device, g_vk_queue_family, 0, &g_vk_queue);
-
-	VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-	pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pci.queueFamilyIndex = g_vk_queue_family;
-	if (vkCreateCommandPool(g_vk_device, &pci, nullptr, &g_cmd_pool) != VK_SUCCESS) return false;
-	VkCommandBufferAllocateInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-	cbi.commandPool = g_cmd_pool; cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbi.commandBufferCount = 1;
-	if (vkAllocateCommandBuffers(g_vk_device, &cbi, &g_cmd) != VK_SUCCESS) return false;
-	VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-	if (vkCreateFence(g_vk_device, &fci, nullptr, &g_fence) != VK_SUCCESS) return false;
 	LOGI("Vulkan device ready: queue_family=%u", g_vk_queue_family);
 	return true;
 }
@@ -599,19 +590,19 @@ poll_xr_events()
 	}
 }
 
-void
+// Keyless placeholder: RECORDS the clear into the frame ring's command buffer
+// (the caller's endFrame() submits it). False if the renderer isn't up.
+bool
 clear_atlas(VkImage image, float r, float g, float b)
 {
-	vkResetCommandBuffer(g_cmd, 0);
-	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(g_cmd, &bi);
+	VkCommandBuffer cmd = g_tile_renderer.beginFrame();
+	if (cmd == VK_NULL_HANDLE) return false;
 	VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 	auto bar = [&](VkImageLayout f, VkImageLayout t, VkAccessFlags sa, VkAccessFlags da, VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
 		VkImageMemoryBarrier m = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
 		m.oldLayout = f; m.newLayout = t; m.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; m.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		m.image = image; m.subresourceRange = range; m.srcAccessMask = sa; m.dstAccessMask = da;
-		vkCmdPipelineBarrier(g_cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &m);
+		vkCmdPipelineBarrier(cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &m);
 	};
 	bar(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 	// A clear value is taken in the image's own space: an `_SRGB` swapchain
@@ -620,13 +611,9 @@ clear_atlas(VkImage image, float r, float g, float b)
 	const bool srgb = g_swapchain_format == VK_FORMAT_R8G8B8A8_SRGB || g_swapchain_format == VK_FORMAT_B8G8R8A8_SRGB;
 	auto lin = [srgb](float v) { return !srgb ? v : (v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f)); };
 	VkClearColorValue c = {}; c.float32[0]=lin(r); c.float32[1]=lin(g); c.float32[2]=lin(b); c.float32[3]=1.0f;
-	vkCmdClearColorImage(g_cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &range);
+	vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &range);
 	bar(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-	vkEndCommandBuffer(g_cmd);
-	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &g_cmd;
-	vkResetFences(g_vk_device, 1, &g_fence);
-	vkQueueSubmit(g_vk_queue, 1, &si, g_fence);
-	vkWaitForFences(g_vk_device, 1, &g_fence, VK_TRUE, UINT64_MAX);
+	return true;
 }
 
 // Orbit the camera around a POI (focus mode) or auto-orbit turntable. Mirrors
@@ -915,6 +902,9 @@ render_frame()
 			double vfov = camVFov * 1.15;  // selection frustum matches the render FOV (§5)
 			double hfov = 2.0 * std::atan(std::tan(0.5 * camVFov) * aspect) * 1.15;
 
+			// Open the frame's ONE command buffer BEFORE the tileset update, so the
+			// tile uploads cesium runs in prepareInMainThread record into it too.
+			g_tile_renderer.beginFrame();
 			const auto &result = g_tile_engine.update(selCam, (double)g_tile_w, (double)g_tile_h, hfov, vfov);
 			auto drawList = g_tile_renderer.buildDrawList(result, g_xrFromEcef);
 
@@ -994,6 +984,8 @@ render_frame()
 							if (std::abs(w.w) > 1e-12) { pickAccum = glm::dvec3(w) / w.w; pickHits = 1; }
 						}
 					}
+					// Both eyes into the SAME command buffer; renderEye's leading
+					// barrier orders eye 2 after eye 1 (shared internal targets).
 					for (uint32_t e = 0; e < kViewCount; ++e) {
 						g_tile_renderer.renderEye(g_images[idx].image, g_swapchain_format,
 						    g_atlas_w, g_atlas_h, e * g_tile_w, 0, g_tile_w, g_tile_h,
@@ -1001,6 +993,9 @@ render_frame()
 					}
 					rendered = true;
 				}
+				// The frame's single submit (no wait) — BEFORE the release, so the
+				// runtime's compose on this queue is ordered after our work.
+				g_tile_renderer.endFrame();
 				XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 				xrReleaseSwapchainImage(g_swapchain, &ri);
 			}
@@ -1047,7 +1042,8 @@ render_frame()
 			if (xrAcquireSwapchainImage(g_swapchain, &ai, &idx) == XR_SUCCESS) {
 				XrSwapchainImageWaitInfo wii = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 				wii.timeout = XR_INFINITE_DURATION;
-				if (xrWaitSwapchainImage(g_swapchain, &wii) == XR_SUCCESS) { clear_atlas(g_images[idx].image, 0.04f, 0.16f, 0.38f); rendered = true; }
+				if (xrWaitSwapchainImage(g_swapchain, &wii) == XR_SUCCESS) rendered = clear_atlas(g_images[idx].image, 0.04f, 0.16f, 0.38f);
+				g_tile_renderer.endFrame();  // the frame's one submit, before the release
 				XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 				xrReleaseSwapchainImage(g_swapchain, &ri);
 			}
@@ -1060,6 +1056,10 @@ render_frame()
 			}
 		}
 	}
+
+	// Catch-all: a frame opened for tile uploads whose swapchain acquire failed
+	// still gets its one submit (no-op when no frame is open).
+	g_tile_renderer.endFrame();
 
 	XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 	layer.space = g_app_space; layer.viewCount = kViewCount; layer.views = pviews;
@@ -1083,8 +1083,6 @@ destroy_all()
 	if (g_vk_device != VK_NULL_HANDLE) vkDeviceWaitIdle(g_vk_device);
 	g_tile_engine.shutdown();
 	g_tile_renderer.cleanup();
-	if (g_fence) { vkDestroyFence(g_vk_device, g_fence, nullptr); g_fence = VK_NULL_HANDLE; }
-	if (g_cmd_pool) { vkDestroyCommandPool(g_vk_device, g_cmd_pool, nullptr); g_cmd_pool = VK_NULL_HANDLE; }
 	if (g_session != XR_NULL_HANDLE) { xrDestroySession(g_session); g_session = XR_NULL_HANDLE; }
 	if (g_swapchain != XR_NULL_HANDLE) { xrDestroySwapchain(g_swapchain); g_swapchain = XR_NULL_HANDLE; }
 	if (g_app_space != XR_NULL_HANDLE) { xrDestroySpace(g_app_space); g_app_space = XR_NULL_HANDLE; }

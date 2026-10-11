@@ -380,23 +380,31 @@ TileRenderer::prepareInMainThread(Cesium3DTilesSelection::Tile &tile, void *pLoa
 	                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 	                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 	bool ok = gpu->vbuf.buffer != VK_NULL_HANDLE && gpu->ibuf.buffer != VK_NULL_HANDLE;
-	ok = ok && modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, gpu->vbuf,
-	                             staging->vertices.data(), vbytes);
-	ok = ok && modelUploadBuffer(device_, physDevice_, queue_, cmdPool_, gpu->ibuf,
-	                             staging->indices.data(), ibytes);
 	gpu->bytes = vbytes + ibytes;
 
+	// All of this tile's copies are RECORDED into the frame's command buffer
+	// (beginFrame() runs before TileEngine::update, so prepareInMainThread is
+	// inside the frame) — no per-tile submit, no wait. The staging buffers are
+	// retired through the ring. The first renderEye's leading tileBarrier()
+	// orders these transfer writes before any vertex / index / sampler read.
 	if (ok) {
-		gpu->textures.reserve(staging->textures.size());
-		gpu->texSets.reserve(staging->textures.size());
-		for (const auto &st : staging->textures) {
-			ModelImage img = uploadTexture(st.rgba.data(), st.width, st.height);
-			VkDescriptorSet set =
-			    img.view != VK_NULL_HANDLE ? allocateTextureSet(img.view) : VK_NULL_HANDLE;
-			gpu->bytes += (uint64_t)st.width * st.height * 4 * 4 / 3; // + mips
-			gpu->textures.push_back(img);
-			gpu->texSets.push_back(set);
-		}
+		recordUpload([&](VkCommandBuffer cmd) {
+			ok = uploadBuffer(cmd, gpu->vbuf, staging->vertices.data(), vbytes) &&
+			     uploadBuffer(cmd, gpu->ibuf, staging->indices.data(), ibytes);
+			if (!ok) {
+				return;
+			}
+			gpu->textures.reserve(staging->textures.size());
+			gpu->texSets.reserve(staging->textures.size());
+			for (const auto &st : staging->textures) {
+				ModelImage img = uploadTexture(cmd, st.rgba.data(), st.width, st.height);
+				VkDescriptorSet set =
+				    img.view != VK_NULL_HANDLE ? allocateTextureSet(img.view) : VK_NULL_HANDLE;
+				gpu->bytes += (uint64_t)st.width * st.height * 4 * 4 / 3; // + mips
+				gpu->textures.push_back(img);
+				gpu->texSets.push_back(set);
+			}
+		});
 	}
 
 	delete staging;
@@ -422,8 +430,10 @@ TileRenderer::free(Cesium3DTilesSelection::Tile &tile,
 	if (!gpu) {
 		return;
 	}
-	// Render-thread call (contract) + the frame is queue-wait-idle serialized
-	// (renderEye submits and waits) → nothing here is GPU-in-flight.
+	// Render-thread call (contract). Up to N frames may still be reading this
+	// tile on the GPU, so the Vulkan objects are handed to the frame ring and
+	// destroyed once every frame submitted so far has retired. The CPU record
+	// itself dies now: the draw list is rebuilt after updateView every frame.
 	if (liveTiles_.erase(gpu)) {
 		gpuBytes_ -= gpu->bytes;
 		bvhBytes_ -= gpu->bvh.bytes();
@@ -434,22 +444,26 @@ TileRenderer::free(Cesium3DTilesSelection::Tile &tile,
 	// there it keeps a dangling pointer from ever being cast against.
 	pickList_.clear();
 	if (device_ != VK_NULL_HANDLE) {
-		for (VkDescriptorSet set : gpu->texSets) {
-			if (set != VK_NULL_HANDLE) {
-				vkFreeDescriptorSets(device_, descPool_, 1, &set);
+		ring_.deferDestroy([dev = device_, pool = descPool_, sets = std::move(gpu->texSets),
+		                    textures = std::move(gpu->textures), vbuf = gpu->vbuf,
+		                    ibuf = gpu->ibuf]() mutable {
+			for (VkDescriptorSet set : sets) {
+				if (set != VK_NULL_HANDLE) {
+					vkFreeDescriptorSets(dev, pool, 1, &set);
+				}
 			}
-		}
-		for (auto &img : gpu->textures) {
-			if (img.image != VK_NULL_HANDLE) {
-				modelDestroyImage(device_, img);
+			for (auto &img : textures) {
+				if (img.image != VK_NULL_HANDLE) {
+					modelDestroyImage(dev, img);
+				}
 			}
-		}
-		if (gpu->vbuf.buffer != VK_NULL_HANDLE) {
-			modelDestroyBuffer(device_, gpu->vbuf);
-		}
-		if (gpu->ibuf.buffer != VK_NULL_HANDLE) {
-			modelDestroyBuffer(device_, gpu->ibuf);
-		}
+			if (vbuf.buffer != VK_NULL_HANDLE) {
+				modelDestroyBuffer(dev, vbuf);
+			}
+			if (ibuf.buffer != VK_NULL_HANDLE) {
+				modelDestroyBuffer(dev, ibuf);
+			}
+		});
 	}
 	gpu->magic = 0; // poison: a stale draw-list pointer now fails the tag check
 	delete gpu;
@@ -558,11 +572,13 @@ TileRenderer::init(VkInstance instance,
 	width_ = renderWidth;
 	height_ = renderHeight;
 
-	VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-	poolInfo.queueFamilyIndex = queueFamilyIndex;
-	if (vkCreateCommandPool(device, &poolInfo, nullptr, &cmdPool_) != VK_SUCCESS) {
-		std::fprintf(stderr, "TileRenderer: failed to create command pool\n");
+	// One frame ring for the device: N (default 3) command buffers + fences,
+	// allocated once. Push constants carry the per-draw MVP, so the ring owns
+	// no UBO. framesInFlight 0 = the helper's default (3); desktop builds can
+	// A/B it with DXR_VK_FRAMES_IN_FLIGHT (Android has no usable env).
+	dxr::VkFrameRing::Config ringCfg;
+	if (!ring_.init(device, physicalDevice, queue, queueFamilyIndex, ringCfg)) {
+		std::fprintf(stderr, "TileRenderer: failed to create the frame ring\n");
 		return false;
 	}
 
@@ -570,7 +586,8 @@ TileRenderer::init(VkInstance instance,
 		return false;
 	}
 	initialized_ = true;
-	std::printf("TileRenderer: initialized (%ux%u)\n", width_, height_);
+	std::printf("TileRenderer: initialized (%ux%u, %u frames in flight)\n", width_, height_,
+	            ring_.framesInFlight());
 	return true;
 }
 
@@ -643,23 +660,19 @@ TileRenderer::ensureTargets(uint32_t w, uint32_t h)
 	if (h == 0) {
 		h = 1;
 	}
-	if (device_ != VK_NULL_HANDLE) {
-		vkDeviceWaitIdle(device_);
-	}
+	// Resize: in-flight frames may still use the old targets — retire them
+	// through the ring instead of draining the device.
 	if (framebuffer_ != VK_NULL_HANDLE) {
-		vkDestroyFramebuffer(device_, framebuffer_, nullptr);
+		ring_.deferDestroy(
+		    [dev = device_, fb = framebuffer_]() { vkDestroyFramebuffer(dev, fb, nullptr); });
 		framebuffer_ = VK_NULL_HANDLE;
 	}
-	if (colorImage_.image != VK_NULL_HANDLE) {
-		modelDestroyImage(device_, colorImage_);
-	}
+	deferDestroyImage(colorImage_);
 	if (swapScratch_.image != VK_NULL_HANDLE) {
-		modelDestroyImage(device_, swapScratch_);
+		deferDestroyImage(swapScratch_);
 		swapScratchFormat_ = VK_FORMAT_UNDEFINED;
 	}
-	if (depthImage_.image != VK_NULL_HANDLE) {
-		modelDestroyImage(device_, depthImage_);
-	}
+	deferDestroyImage(depthImage_);
 	width_ = w;
 	height_ = h;
 
@@ -885,7 +898,7 @@ TileRenderer::createSamplerAndDefaults()
 		return false;
 	}
 	const uint8_t white[4] = {255, 255, 255, 255};
-	whiteTex_ = uploadTexture(white, 1, 1);
+	recordUpload([&](VkCommandBuffer cmd) { whiteTex_ = uploadTexture(cmd, white, 1, 1); });
 	if (whiteTex_.view == VK_NULL_HANDLE) {
 		return false;
 	}
@@ -894,7 +907,7 @@ TileRenderer::createSamplerAndDefaults()
 }
 
 ModelImage
-TileRenderer::uploadTexture(const uint8_t *rgba, uint32_t w, uint32_t h)
+TileRenderer::uploadTexture(VkCommandBuffer cmd, const uint8_t *rgba, uint32_t w, uint32_t h)
 {
 	ModelImage img;
 	if (!rgba || w == 0 || h == 0) {
@@ -944,20 +957,17 @@ TileRenderer::uploadTexture(const uint8_t *rgba, uint32_t w, uint32_t h)
 	                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 	                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 	                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	if (staging.buffer == VK_NULL_HANDLE) {
+		modelDestroyImage(device_, img);
+		return ModelImage{};
+	}
 	void *mapped = nullptr;
 	vkMapMemory(device_, staging.memory, 0, (VkDeviceSize)w * h * 4, 0, &mapped);
 	std::memcpy(mapped, rgba, (size_t)w * h * 4);
 	vkUnmapMemory(device_, staging.memory);
 
-	VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-	cbai.commandPool = cmdPool_;
-	cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	cbai.commandBufferCount = 1;
-	VkCommandBuffer cmd;
-	vkAllocateCommandBuffers(device_, &cbai, &cmd);
-	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
+	// Recorded into the caller's command buffer (the frame's, or the ring's
+	// one-off buffer at init) — no submit, no wait here.
 
 	auto barrier = [&](uint32_t mip, uint32_t count, VkImageLayout oldL, VkImageLayout newL,
 	                   VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS,
@@ -1012,15 +1022,96 @@ TileRenderer::uploadTexture(const uint8_t *rgba, uint32_t w, uint32_t h)
 	        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 	        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
-	vkEndCommandBuffer(cmd);
-	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-	vkQueueWaitIdle(queue_);
-	vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
-	modelDestroyBuffer(device_, staging);
+	// The staging buffer is read by the copy above: retire it with the frame.
+	ring_.deferDestroy([dev = device_, staging]() mutable { modelDestroyBuffer(dev, staging); });
 	return img;
+}
+
+bool
+TileRenderer::uploadBuffer(VkCommandBuffer cmd, ModelBuffer &dst, const void *data,
+                           VkDeviceSize size)
+{
+	if (size == 0) {
+		return true;
+	}
+	ModelBuffer staging = modelCreateBuffer(device_, physDevice_, size,
+	                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	if (staging.buffer == VK_NULL_HANDLE) {
+		return false;
+	}
+	void *mapped = nullptr;
+	vkMapMemory(device_, staging.memory, 0, size, 0, &mapped);
+	std::memcpy(mapped, data, (size_t)size);
+	vkUnmapMemory(device_, staging.memory);
+
+	VkBufferCopy region = {};
+	region.size = size;
+	vkCmdCopyBuffer(cmd, staging.buffer, dst.buffer, 1, &region);
+	ring_.deferDestroy([dev = device_, staging]() mutable { modelDestroyBuffer(dev, staging); });
+	return true;
+}
+
+void
+TileRenderer::recordUpload(const std::function<void(VkCommandBuffer)> &rec)
+{
+	if (ring_.frameOpen()) {
+		rec(ring_.current());
+		return;
+	}
+	// Outside a frame: init (the 1x1 white texture) or a caller that runs
+	// TileEngine::update without beginFrame(). The ring's one sanctioned
+	// blocking path — never per frame when the legs follow the contract.
+	ring_.submitImmediate(rec);
+}
+
+void
+TileRenderer::submitAndWait(const std::function<void(VkCommandBuffer)> &rec)
+{
+	auto recWithBarrier = [&](VkCommandBuffer cmd) {
+		// Everything submitted/recorded before (render passes, uploads) is made
+		// visible to the readback copy.
+		dxr::VkFrameRing::tileBarrier(cmd);
+		rec(cmd);
+	};
+	if (ring_.frameOpen()) {
+		// The readback reads what THIS frame just rendered, so it must ride the
+		// frame's own command buffer: end the frame (its submit), wait for it,
+		// then reopen a fresh frame for the caller's remaining views + its
+		// endFrame(). Only on the rare pick / dump path.
+		recWithBarrier(ring_.current());
+		ring_.endFrame();
+		ring_.waitAll();
+		ring_.beginFrame();
+		return;
+	}
+	ring_.submitImmediate(recWithBarrier);
+}
+
+void
+TileRenderer::deferDestroyImage(ModelImage &img)
+{
+	if (img.image == VK_NULL_HANDLE) {
+		return;
+	}
+	ring_.deferDestroy([dev = device_, old = img]() mutable { modelDestroyImage(dev, old); });
+	img = ModelImage{};
+}
+
+VkCommandBuffer
+TileRenderer::beginFrame()
+{
+	if (!initialized_) {
+		return VK_NULL_HANDLE;
+	}
+	return ring_.beginFrame();
+}
+
+VkResult
+TileRenderer::endFrame()
+{
+	return ring_.endFrame();
 }
 
 VkDescriptorSet
@@ -1068,14 +1159,13 @@ TileRenderer::renderEye(VkImage swapchainImage,
 			return;
 		}
 	}
-	// Staging image for the byte-exact hand-off (see the blit below). Every
-	// renderEye ends in a queue wait, so it is idle here. On failure the blit
-	// falls back to going straight to the swapchain.
+	// Staging image for the byte-exact hand-off (see the blit below). A format
+	// change retires the old one through the ring (in-flight frames may still
+	// use it). On failure the blit falls back to going straight to the
+	// swapchain.
 	const VkFormat stagingFormat = srgbStagingFormatFor(swapchainFormat);
 	if (stagingFormat != swapScratchFormat_) {
-		if (swapScratch_.image != VK_NULL_HANDLE) {
-			modelDestroyImage(device_, swapScratch_);
-		}
+		deferDestroyImage(swapScratch_);
 		swapScratchFormat_ = stagingFormat;
 		if (stagingFormat != VK_FORMAT_UNDEFINED) {
 			// SAMPLED only so the helper's image view is valid.
@@ -1103,15 +1193,18 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	const glm::mat4 proj = glm::make_mat4(projMatrix);
 	const glm::mat4 vp = proj * view;
 
-	VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-	ai.commandPool = cmdPool_;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd;
-	vkAllocateCommandBuffers(device_, &ai, &cmd);
-	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
+	// Record into the frame's ONE command buffer (opened here if the leg did
+	// not call beginFrame()).
+	VkCommandBuffer cmd = ring_.beginFrame();
+	if (cmd == VK_NULL_HANDLE) {
+		return;
+	}
+	// Every view reuses the same internal colour / depth / scratch targets,
+	// and so does every in-flight frame: a full barrier orders this view after
+	// everything earlier on the queue (the previous view's blit, the previous
+	// frame, this frame's tile uploads). It is the ordering the old per-eye
+	// vkQueueWaitIdle gave, without the CPU in the loop.
+	dxr::VkFrameRing::tileBarrier(cmd);
 
 	// A clear value is LINEAR: an sRGB colour target (colorFormat_ is
 	// R8G8B8A8_SRGB) encodes it on store, exactly like a shader output.
@@ -1264,14 +1357,7 @@ TileRenderer::renderEye(VkImage swapchainImage,
 	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
 	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr,
 	                     1, &toColor);
-
-	vkEndCommandBuffer(cmd);
-	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-	vkQueueWaitIdle(queue_);
-	vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+	// No submit: the leg's endFrame() submits every view at once.
 }
 
 float
@@ -1292,52 +1378,36 @@ TileRenderer::readDepth(uint32_t px, uint32_t py)
 		return 1.0f;
 	}
 
-	VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-	ai.commandPool = cmdPool_;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd;
-	vkAllocateCommandBuffers(device_, &ai, &cmd);
-	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
+	submitAndWait([&](VkCommandBuffer cmd) {
+		VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+		toSrc.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		toSrc.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		toSrc.image = depthImage_.image;
+		toSrc.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
 
-	VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-	toSrc.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-	toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-	toSrc.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-	toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-	toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toSrc.image = depthImage_.image;
-	toSrc.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-	                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+		VkBufferImageCopy region = {};
+		region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+		region.imageOffset = {(int32_t)px, (int32_t)py, 0};
+		region.imageExtent = {1, 1, 1};
+		vkCmdCopyImageToBuffer(cmd, depthImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                       readback.buffer, 1, &region);
 
-	VkBufferImageCopy region = {};
-	region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-	region.imageOffset = {(int32_t)px, (int32_t)py, 0};
-	region.imageExtent = {1, 1, 1};
-	vkCmdCopyImageToBuffer(cmd, depthImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                       readback.buffer, 1, &region);
-
-	VkImageMemoryBarrier back = toSrc;
-	back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-	back.dstAccessMask =
-	    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-	back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-	back.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr, 1,
-	                     &back);
-
-	vkEndCommandBuffer(cmd);
-	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-	vkQueueWaitIdle(queue_);
-	vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+		VkImageMemoryBarrier back = toSrc;
+		back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		back.dstAccessMask =
+		    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		back.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+		                     &back);
+	});
 
 	float depth = 1.0f;
 	void *mapped = nullptr;
@@ -1369,31 +1439,15 @@ TileRenderer::dumpColorTarget(const char *path, uint32_t w, uint32_t h)
 		return;
 	}
 
-	VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-	ai.commandPool = cmdPool_;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd;
-	vkAllocateCommandBuffers(device_, &ai, &cmd);
-	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
-
-	// colorImage_ rests in TRANSFER_SRC after a render pass; copy its top-left
-	// w×h directly.
-	VkBufferImageCopy region = {};
-	region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	region.imageExtent = {w, h, 1};
-	vkCmdCopyImageToBuffer(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.buffer,
-	                       1, &region);
-
-	vkEndCommandBuffer(cmd);
-	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-	vkQueueWaitIdle(queue_);
-	vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+	submitAndWait([&](VkCommandBuffer cmd) {
+		// colorImage_ rests in TRANSFER_SRC after a render pass; copy its
+		// top-left w×h directly.
+		VkBufferImageCopy region = {};
+		region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		region.imageExtent = {w, h, 1};
+		vkCmdCopyImageToBuffer(cmd, colorImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                       rb.buffer, 1, &region);
+	});
 
 	void *mapped = nullptr;
 	vkMapMemory(device_, rb.memory, 0, bytes, 0, &mapped);
@@ -1411,7 +1465,9 @@ TileRenderer::cleanup()
 	if (device_ == VK_NULL_HANDLE) {
 		return;
 	}
-	vkDeviceWaitIdle(device_);
+	// Wait every in-flight frame, run the deferred deletions (they still need
+	// descPool_ etc., so this comes first), then free the ring itself.
+	ring_.destroy();
 
 	// Tiles should already be gone (TileEngine/Tileset destroyed first —
 	// its destructor free()s each). Sweep any stragglers defensively.
@@ -1477,10 +1533,6 @@ TileRenderer::cleanup()
 	if (renderPass_ != VK_NULL_HANDLE) {
 		vkDestroyRenderPass(device_, renderPass_, nullptr);
 		renderPass_ = VK_NULL_HANDLE;
-	}
-	if (cmdPool_ != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(device_, cmdPool_, nullptr);
-		cmdPool_ = VK_NULL_HANDLE;
 	}
 	initialized_ = false;
 	// Null the device so a second cleanup() (static destructor at exit, after
