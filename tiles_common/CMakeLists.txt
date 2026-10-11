@@ -75,3 +75,15 @@ target_link_libraries(tile_renderer PUBLIC
     Cesium3DTilesContent
     CesiumCurl
 )
+
+# dxr::VkFrameRing (common/vk_frame_ring.h, displayxr-common >= v2.28.0): the
+# renderer's 3-deep command-buffer ring — ONE vkQueueSubmit per frame, never a
+# wait on the frame just submitted (runtime INV-4.10). Header-only, reached
+# through displayxr-common's platform-neutral INTERFACE target. The desktop
+# build defines it via common/ (FetchContent_MakeAvailable); the Android leg
+# defines an equivalent sources-only target before adding this directory.
+if(NOT TARGET displayxr::rules)
+    message(FATAL_ERROR "tiles_common needs displayxr::rules (displayxr-common >= v2.28.0) — "
+                        "add common/ (desktop) or define it (android/src/main/cpp) first")
+endif()
+target_link_libraries(tile_renderer PUBLIC displayxr::rules)

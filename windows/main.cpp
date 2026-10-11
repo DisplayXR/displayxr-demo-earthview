@@ -1042,20 +1042,10 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
     }
 }
 
-// Render a simple "no scene" placeholder by clearing to dark gray
-static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdPool,
-                               VkImage image, uint32_t width, uint32_t height) {
-    VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocInfo.commandPool = cmdPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
-
-    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+// Render a simple "no scene" placeholder by clearing to dark gray. RECORDS into
+// the frame ring's command buffer (TileRenderer::beginFrame()); the frame
+// loop's endFrame() is the one submit — no per-frame alloc / wait (INV-4.10).
+static void RenderPlaceholder(VkCommandBuffer cmd, VkImage image, uint32_t width, uint32_t height) {
 
     // Transition to TRANSFER_DST
     VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1081,16 +1071,6 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
-
-    vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
 }
 
 // ============================================================================
@@ -1325,14 +1305,8 @@ static void RenderThreadFunc(
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
-    // Command pool for placeholder rendering
-    VkCommandPool renderCmdPool = VK_NULL_HANDLE;
-    {
-        VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        poolInfo.queueFamilyIndex = queueFamilyIndex;
-        vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &renderCmdPool);
-    }
+    // (No placeholder command pool: the placeholder clear records into the
+    // tile renderer's frame ring — one submit per frame, INV-4.10.)
 
     while (g_running.load() && !xr->exitRequested) {
         InputState inputSnapshot;
@@ -1922,6 +1896,9 @@ static void RenderThreadFunc(
                                 selCam.up = glm::normalize(invRot * glm::dvec3(0.0, 1.0, 0.0));
                             }
 
+                            // Open the frame's ONE command buffer before the
+                            // tileset update: cesium's tile uploads record into it.
+                            g_tileRenderer.beginFrame();
                             const auto& tiles = g_tileEngine.update(
                                 selCam, (double)renderW, (double)renderH, hfov, vfov);
                             g_drawList = g_tileRenderer.buildDrawList(tiles, g_xrFromEcef);
@@ -2136,8 +2113,10 @@ static void RenderThreadFunc(
                                     }
                                 }
                             } else {
-                                RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
-                                    (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
+                                if (VkCommandBuffer pcmd = g_tileRenderer.beginFrame()) {
+                                    RenderPlaceholder(pcmd, (*swapchainVkImages)[imageIndex],
+                                        xr->swapchain.width, xr->swapchain.height);
+                                }
                             }
 
                             // 'I' key: snapshot the multi-view atlas via xrCaptureAtlasDXR
@@ -2218,10 +2197,16 @@ static void RenderThreadFunc(
                             // INV-3.1: this is the count xrEndFrame gets.
                             filledViewCount = (locatedViewCount > (uint32_t)eyeCount)
                                                   ? locatedViewCount : (uint32_t)eyeCount;
+                            // The frame's single submit (no wait), BEFORE the
+                            // release so the runtime's compose is ordered after it.
+                            g_tileRenderer.endFrame();
                             ReleaseSwapchainImage(*xr);
                         } else {
                             rendered = false;
                         }
+                        // Catch-all: a frame opened for tile uploads whose acquire
+                        // failed still gets its one submit (no-op if none is open).
+                        g_tileRenderer.endFrame();
 
                         // Render the HUD info-panel window-space layer. Body-only
                         // now (chrome buttons moved to the top-bar layer below).
@@ -2575,9 +2560,6 @@ static void RenderThreadFunc(
             Sleep(100);
         }
     }
-
-    if (renderCmdPool != VK_NULL_HANDLE)
-        vkDestroyCommandPool(vkDevice, renderCmdPool, nullptr);
 
     if (xr->exitRequested && g_running.load()) {
         PostMessage(hwnd, WM_CLOSE, 0, 0);

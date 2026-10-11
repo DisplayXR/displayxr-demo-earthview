@@ -12,9 +12,20 @@
 //  - prepareInMainThread + free: ALWAYS the thread that calls
 //    Tileset::updateView (our render thread). All Vulkan object create /
 //    destroy happens there — no locks needed.
-//  - free() destroys immediately: the frame loop is fully serialized
-//    (renderEye ends in vkQueueWaitIdle, and updateView runs before the
-//    frame's draws), so no tile resource is ever GPU-in-flight when freed.
+//  - free() DEFERS destruction through the frame ring (deferDestroy): up to
+//    N frames are GPU-in-flight, so a tile's buffers / images / descriptor
+//    sets are destroyed only once every frame that could read them retired.
+//
+// Frame-submit discipline (runtime INV-4.10, displayxr-common
+// dxr::VkFrameRing): ONE vkQueueSubmit per frame, 3 frames in flight, no
+// queue/device drain and no wait on the frame just submitted. Per frame:
+//    beginFrame()                 // before TileEngine::update, so this frame's
+//                                 // tile uploads record into the same buffer
+//    renderEye() × views          // all views into the ONE command buffer
+//    endFrame()                   // the single submit — BEFORE
+//                                 // xrReleaseSwapchainImage
+// renderEye() opens the frame itself if the caller didn't; endFrame() is a
+// no-op when no frame is open, so calling it unconditionally is safe.
 //
 // Lifetime: the app owns one TileRenderer; the TileEngine (Tileset) must be
 // destroyed FIRST (its destructor free()s every live tile through this
@@ -24,6 +35,7 @@
 
 #include "model_vulkan_utils.h"
 #include "tile_raycast.h"
+#include "vk_frame_ring.h" // displayxr-common (displayxr::rules), >= v2.28.0
 
 #include <Cesium3DTilesSelection/IPrepareRendererResources.h>
 
@@ -31,6 +43,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <unordered_set>
 #include <vector>
 
@@ -106,6 +119,25 @@ public:
 	{
 	}
 
+	// ── Frame ring (see the header comment) ──────────────────────────────
+
+	// Open this frame's command buffer (waits only the fence of the frame that
+	// used the slot N frames ago). Returns the open buffer if one is already
+	// open; VK_NULL_HANDLE if the renderer isn't initialized.
+	VkCommandBuffer
+	beginFrame();
+	// The frame's ONE submit (no wait). VK_NOT_READY (harmless) if no frame is
+	// open. Call before xrReleaseSwapchainImage.
+	VkResult
+	endFrame();
+	// The device's frame ring, for a leg that records its own per-frame work
+	// (placeholder clears) into the same command buffer.
+	dxr::VkFrameRing &
+	frameRing()
+	{
+		return ring_;
+	}
+
 	// ── Per-frame draw ───────────────────────────────────────────────────
 
 	struct DrawItem
@@ -124,8 +156,8 @@ public:
 
 	// Mirror of ModelRenderer::renderEye: render the draw list into an
 	// internal color+depth target, then blit into the [vpX,vpY,vpW,vpH]
-	// region of the swapchain image. Clears to sky. Submit + wait (M1;
-	// batching is an M1.x optimization).
+	// region of the swapchain image. Clears to sky. RECORDS into the open
+	// frame's command buffer (opening it if needed) — no submit, no wait.
 	void
 	renderEye(VkImage swapchainImage,
 	          VkFormat swapchainFormat,
@@ -141,13 +173,14 @@ public:
 
 	// Read one depth texel ([0,1], 1.0 = far/no hit) from the internal depth
 	// image at framebuffer pixel (px, py) — the LAST renderEye's contents.
-	// Used by double-click picking (depth-readback unproject). Submit+wait.
+	// Used by double-click picking (depth-readback unproject). Blocking (rare,
+	// user-click path): flushes the open frame and waits — see submitAndWait.
 	float
 	readDepth(uint32_t px, uint32_t py);
 
 	// Dump the internal color target (the LAST renderEye's mono content, the
 	// top-left w×h region) to a PNG. Self-verification on vk_native, where the
-	// runtime atlas capture is unreliable. Submit+wait; dev/diagnostic only.
+	// runtime atlas capture is unreliable. Blocking; dev/diagnostic only.
 	void
 	dumpColorTarget(const char *path, uint32_t w, uint32_t h);
 
@@ -231,7 +264,23 @@ private:
 	bool
 	createSamplerAndDefaults();
 	ModelImage
-	uploadTexture(const uint8_t *rgba, uint32_t w, uint32_t h);
+	uploadTexture(VkCommandBuffer cmd, const uint8_t *rgba, uint32_t w, uint32_t h);
+	bool
+	uploadBuffer(VkCommandBuffer cmd, ModelBuffer &dst, const void *data, VkDeviceSize size);
+	// Record `rec` into the open frame's command buffer, or — outside a frame
+	// (init, a late tile prepare) — into the ring's one-off buffer via
+	// submitImmediate. Never blocks inside a frame.
+	void
+	recordUpload(const std::function<void(VkCommandBuffer)> &rec);
+	// Rare blocking readback (pick / dump): record `rec` after a full barrier,
+	// get it executed, wait. Inside a frame it ENDS the frame (its one submit),
+	// waits, and reopens a fresh frame for the caller's remaining views.
+	void
+	submitAndWait(const std::function<void(VkCommandBuffer)> &rec);
+	// Retire an image / buffer through the ring (destroyed once no in-flight
+	// frame can still reference it).
+	void
+	deferDestroyImage(ModelImage &img);
 	VkDescriptorSet
 	allocateTextureSet(VkImageView view);
 
@@ -250,7 +299,8 @@ private:
 	uint32_t ssaaFactor_ = 1;  // 1 = off (default); shell cycles 1→2→4 via 'S'
 	bool initialized_ = false;
 
-	VkCommandPool cmdPool_ = VK_NULL_HANDLE;
+	// One ring per device: N command buffers + fences, allocated once.
+	dxr::VkFrameRing ring_;
 	VkRenderPass renderPass_ = VK_NULL_HANDLE;
 	VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
 	ModelImage colorImage_;

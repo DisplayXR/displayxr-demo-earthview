@@ -45,10 +45,6 @@ endif()
 set(CESIUM_TESTS_ENABLED OFF CACHE BOOL "" FORCE)
 add_subdirectory(${REPO_ROOT}/third_party/cesium-native cesium-native EXCLUDE_FROM_ALL)
 
-# ── Shared scene layer (tile_renderer: cesium glue + Vulkan draw + geo math) ─
-# Reuses the maintained tiles_common/CMakeLists.txt — same renderer the desktop
-# legs build. It bakes the tile.vert/tile.frag SPIR-V headers and links cesium.
-add_subdirectory(${REPO_ROOT}/tiles_common tiles_common)
 
 # ── NativeActivity glue (ships with the NDK) ─────────────────────────────
 add_library(native_app_glue STATIC
@@ -59,19 +55,34 @@ target_include_directories(native_app_glue PUBLIC
 # Khronos OpenXR loader from the openxr_loader_for_android .aar (prefab).
 find_package(OpenXR REQUIRED CONFIG)
 
-# displayxr-common's cam<->display rig converter (dxr_view_rig_camera_to_display)
-# for the focus/orbit display-rig model — the same source the desktop legs link
-# via displayxr::common. Self-contained pure math; fetch sources + compile the
-# one TU (don't run its CMake, which carries desktop platform deps).
+# displayxr-common, SOURCES ONLY (don't run its CMake — the STATIC lib carries
+# desktop platform sources). Two things come from it:
+#   - the cam<->display rig converter (dxr_view_rig_camera_to_display) for the
+#     focus/orbit display-rig model: include/dxr_view_math.c, one pure-math TU;
+#   - dxr::VkFrameRing (common/vk_frame_ring.h, header-only, >= v2.28.0): the
+#     tile renderer's N-frames-in-flight / one-submit-per-frame ring. Exposed
+#     as displayxr::rules — the same name displayxr-common's own CMake gives
+#     its header-only target on desktop — so tiles_common links it identically
+#     on every leg.
+# Keep this tag equal to common/CMakeLists.txt (desktop legs).
 include(FetchContent)
 FetchContent_Declare(displayxr_common_dxr
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.0.0 GIT_SHALLOW TRUE)
+    GIT_TAG v2.28.0 GIT_SHALLOW TRUE)
 FetchContent_GetProperties(displayxr_common_dxr)
 if(NOT displayxr_common_dxr_POPULATED)
     FetchContent_Populate(displayxr_common_dxr)
 endif()
 set(DXR_VIEW_MATH_DIR ${displayxr_common_dxr_SOURCE_DIR}/include)
+add_library(displayxr_rules INTERFACE)
+add_library(displayxr::rules ALIAS displayxr_rules)
+target_include_directories(displayxr_rules INTERFACE ${displayxr_common_dxr_SOURCE_DIR}/common)
+
+# ── Shared scene layer (tile_renderer: cesium glue + Vulkan draw + geo math) ─
+# Reuses the maintained tiles_common/CMakeLists.txt — same renderer the desktop
+# legs build. It bakes the tile.vert/tile.frag SPIR-V headers, links cesium and
+# displayxr::rules (above).
+add_subdirectory(${REPO_ROOT}/tiles_common tiles_common)
 
 # stb_impl.c provides stbi_write_png (tile_renderer's dumpColorTarget needs it;
 # the desktop legs get it from displayxr-common, which the Android leg omits).
