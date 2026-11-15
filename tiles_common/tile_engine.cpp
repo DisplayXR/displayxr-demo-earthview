@@ -20,6 +20,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -355,6 +356,41 @@ earthviewClearApiKey()
 	return !ec;
 }
 
+std::string
+earthviewRedactKey(const std::string &text)
+{
+	if (text.find("key=") == std::string::npos && text.find("AIza") == std::string::npos) {
+		return text;
+	}
+	const auto isValueEnd = [](char c) {
+		return c == '&' || c == '#' || c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+		       c == '`' || c == '\'' || c == '"' || c == '<' || c == '>' || c == ')';
+	};
+	std::string out;
+	out.reserve(text.size());
+	for (size_t i = 0; i < text.size();) {
+		if (text.compare(i, 4, "key=") == 0) {
+			out += "key=REDACTED";
+			i += 4;
+			while (i < text.size() && !isValueEnd(text[i])) {
+				++i;
+			}
+			continue;
+		}
+		if (text.compare(i, 4, "AIza") == 0) {
+			out += "REDACTED";
+			i += 4;
+			while (i < text.size() && (std::isalnum((unsigned char)text[i]) || text[i] == '-' ||
+			                           text[i] == '_')) {
+				++i;
+			}
+			continue;
+		}
+		out += text[i++];
+	}
+	return out;
+}
+
 bool
 TileEngine::probeKey(const std::string &key, std::string &errOut)
 {
@@ -404,7 +440,9 @@ TileEngine::probeKey(const std::string &key, std::string &errOut)
 		}
 		return false;
 	} catch (const std::exception &e) {
-		errOut = std::string("Validation error: ") + e.what();
+		// CesiumCurl's exception text is "GET `<url>` failed: ...", and the
+		// URL carries the key; errOut is shown on screen and logged.
+		errOut = std::string("Validation error: ") + earthviewRedactKey(e.what());
 		return false;
 	}
 }
