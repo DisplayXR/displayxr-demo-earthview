@@ -69,7 +69,7 @@ jobs:
   BuildInstaller:
     name: Build macOS
     needs: DetectChanges
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       GH_TOKEN: ${{ github.token }}
       # Pin cesium's ezvcpkg dependency tree to a fixed path so it is
