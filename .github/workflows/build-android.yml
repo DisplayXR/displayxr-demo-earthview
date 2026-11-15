@@ -20,7 +20,8 @@ name: Build Android
 # too old for cesium, and matching dev's exact 3.31.6 avoids version drift).
 # Instead CI installs the official Kitware 3.31.6 Linux tarball, drops a `ninja`
 # (from apt) alongside it — AGP requires `ninja` next to `cmake` in cmake.dir/bin
-# — and points AGP at it through a generated local.properties.
+# — and points AGP at it through a generated local.properties at the repo root
+# (the Gradle root project; see the "Write local.properties" step).
 
 on:
   pull_request: {}
@@ -153,6 +154,14 @@ jobs:
           "$HOME/cmake-dist/bin/cmake" --version
           echo "EARTHVIEW_CMAKE_DIR=$HOME/cmake-dist" >> "$GITHUB_ENV"
 
+      # AGP reads local.properties from the Gradle ROOT project, which is the
+      # repo root (settings.gradle there includes ':android'; the build step
+      # runs `./gradlew :android:...` from it). This used to be written to
+      # android/local.properties, which AGP never reads: the pin only resolved
+      # through the CMake on the ubuntu-24.04 image's PATH.
+      # ubuntu-latest moved to 26.04 (different CMake on PATH) and the build
+      # broke with "[CXX1300] CMake '3.31.6' was not found in SDK, PATH, or by
+      # cmake.dir property".
       - name: Write local.properties (sdk.dir + cmake.dir)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
@@ -160,8 +169,8 @@ jobs:
           {
             echo "sdk.dir=$ANDROID_SDK_ROOT"
             echo "cmake.dir=$EARTHVIEW_CMAKE_DIR"
-          } > android/local.properties
-          cat android/local.properties
+          } > local.properties
+          cat local.properties
 
       # ezvcpkg cross-builds ~118 vcpkg libs (OpenSSL/curl/draco/KTX/…) for
       # arm64-android on first configure — slow and potentially flaky. Cache the
