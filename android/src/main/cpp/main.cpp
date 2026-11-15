@@ -30,6 +30,7 @@
 #include <glm/gtc/type_ptr.hpp>
 
 #include "geo_math.h"
+#include "redacting_sink.h"
 #include "tile_engine.h"
 #include "tile_renderer.h"
 #include "dxr_view_math.h"  // cam->display rig converter (focus/orbit display rig)
@@ -520,8 +521,11 @@ tiles_init()
 {
 	// Route cesium's spdlog to logcat (tag "cesium") so HTTP/TLS/tile errors are
 	// visible — tile_engine otherwise mutes spdlog to `critical` with no sink.
+	// Through a redacting sink: cesium's error lines carry the full tile URL,
+	// and the URL carries the API key (`key=` query parameter).
 	spdlog::set_default_logger(std::make_shared<spdlog::logger>(
-	    "cesium", std::make_shared<spdlog::sinks::android_sink_mt>("cesium")));
+	    "cesium", std::make_shared<earthview::redacting_sink_mt>(
+	                  std::make_shared<spdlog::sinks::android_sink_mt>("cesium"))));
 
 	std::string ca = build_ca_bundle();
 	if (!ca.empty()) setenv("EARTHVIEW_CA_BUNDLE", ca.c_str(), 1);

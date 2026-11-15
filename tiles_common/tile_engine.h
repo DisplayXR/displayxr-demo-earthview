@@ -124,3 +124,11 @@ earthviewSaveApiKey(const std::string &key);
 // (env / repo earthview.ini / .env.local) are untouched.
 bool
 earthviewClearApiKey();
+
+// `text` with any Map Tiles API key in it masked: the value of every `key=`
+// query parameter, and any bare Google API key (`AIza` + 35 chars), become
+// `REDACTED`. For anything that may be logged or shown that can carry a
+// request URL: cesium-native and CesiumCurl put the full URL, query string
+// and all, into their error messages and exceptions.
+std::string
+earthviewRedactKey(const std::string &text);
