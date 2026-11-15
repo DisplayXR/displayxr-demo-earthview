@@ -20,12 +20,18 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <thread>
+#include <vector>
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -44,14 +50,124 @@ constexpr double kMainThreadLoadingTimeLimitMs = 5.0;
 // Attribution recount cadence (frames). HUD refreshes ~2 Hz anyway.
 constexpr int kAttributionEveryNFrames = 30;
 
-class ThreadTaskProcessor : public CesiumAsync::ITaskProcessor
+// How long shutdown() keeps pumping main-thread tasks while the Tileset's
+// in-flight loads finish (getAsyncDestructionCompleteEvent). Proposed default
+// (#85): long enough for a normal drain, short enough that a stalled request
+// cannot hang app exit. Past it, teardown proceeds and logs once.
+constexpr std::chrono::milliseconds kShutdownDrainTimeout{2000};
+
+// Worker count for the tile pool: leave one core for the render thread, but
+// never fewer than two so one slow task cannot serialise all loading.
+unsigned
+tileWorkerThreadCount()
+{
+	const unsigned hw = std::thread::hardware_concurrency();
+	return hw > 3 ? hw - 1 : 2;
+}
+
+// Fixed-size worker pool behind cesium's ITaskProcessor (#85). It replaces a
+// thread-per-task processor that detached one std::thread per cesium task with
+// no cap, so tile bursts could spawn hundreds of threads and nothing could wait
+// for them at shutdown.
+//
+// The owner calls stop() explicitly from its own thread: stop() lets the
+// workers drain the queue, then joins them. A task submitted while the pool is
+// stopped runs inline on the submitting thread rather than being dropped, so a
+// promise somebody awaits is never orphaned. start() makes the pool reusable
+// (TileEngine::init re-creates the Tileset after shutdown()).
+class WorkerPool : public CesiumAsync::ITaskProcessor
 {
 public:
+	explicit WorkerPool(unsigned threadCount) : threadCount_(threadCount)
+	{
+		start();
+	}
+
+	~WorkerPool() override
+	{
+		stop();
+	}
+
 	void
 	startTask(std::function<void()> f) override
 	{
-		std::thread(std::move(f)).detach();
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (running_) {
+				queue_.push_back(std::move(f));
+				cv_.notify_one();
+				return;
+			}
+		}
+		f();
 	}
+
+	void
+	start()
+	{
+		std::lock_guard<std::mutex> control(controlMutex_);
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (running_) {
+				return;
+			}
+			running_ = true;
+		}
+		for (unsigned i = 0; i < threadCount_; ++i) {
+			workers_.emplace_back([this] { run(); });
+		}
+	}
+
+	void
+	stop()
+	{
+		std::lock_guard<std::mutex> control(controlMutex_);
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (!running_) {
+				return;
+			}
+			running_ = false;
+		}
+		cv_.notify_all();
+		for (std::thread &t : workers_) {
+			// Only reachable if the last reference is dropped on a worker
+			// without an explicit stop(); joining self would throw.
+			if (t.get_id() == std::this_thread::get_id()) {
+				t.detach();
+			} else {
+				t.join();
+			}
+		}
+		workers_.clear();
+	}
+
+private:
+	void
+	run()
+	{
+		for (;;) {
+			std::function<void()> task;
+			{
+				std::unique_lock<std::mutex> lock(mutex_);
+				cv_.wait(lock, [this] { return !running_ || !queue_.empty(); });
+				if (queue_.empty()) {
+					return; // stopped and drained
+				}
+				task = std::move(queue_.front());
+				queue_.pop_front();
+			}
+			task();
+		}
+	}
+
+	const unsigned threadCount_;
+	std::mutex controlMutex_; // serialises start()/stop()
+	std::mutex mutex_;        // guards running_ + queue_
+	std::condition_variable cv_;
+	std::deque<std::function<void()>> queue_;
+	std::vector<std::thread> workers_;
+	bool running_ = false;
 };
 
 // cesium-native propagates the root URL's `key` query param to every child
@@ -251,8 +367,19 @@ TileEngine::probeKey(const std::string &key, std::string &errOut)
 		errOut = "Paste a key first.";
 		return false;
 	}
+	// Own small pool, stopped before returning: probeKey may run off the main
+	// thread (linux/main.cpp) and is independent of init()/shutdown().
+	auto workers = std::make_shared<WorkerPool>(2);
+	struct StopOnExit
+	{
+		WorkerPool &pool;
+		~StopOnExit()
+		{
+			pool.stop();
+		}
+	} stopOnExit{*workers};
 	try {
-		CesiumAsync::AsyncSystem async(std::make_shared<ThreadTaskProcessor>());
+		CesiumAsync::AsyncSystem async(workers);
 		auto accessor = std::make_shared<CesiumCurl::CurlAssetAccessor>(curlOptions());
 		const std::string url =
 		    "https://tile.googleapis.com/v1/3dtiles/root.json?key=" + key;
@@ -284,10 +411,20 @@ TileEngine::probeKey(const std::string &key, std::string &errOut)
 
 struct TileEngine::Impl
 {
-	CesiumAsync::AsyncSystem asyncSystem{std::make_shared<ThreadTaskProcessor>()};
+	// Declared before asyncSystem: the AsyncSystem (and every copy cesium
+	// keeps) holds a reference to it.
+	std::shared_ptr<WorkerPool> workers{std::make_shared<WorkerPool>(tileWorkerThreadCount())};
+	CesiumAsync::AsyncSystem asyncSystem{workers};
 	std::shared_ptr<CesiumUtility::CreditSystem> credits;
 	std::unique_ptr<Cesium3DTilesSelection::Tileset> tileset;
 	const Cesium3DTilesSelection::ViewUpdateResult *lastResult = nullptr;
+
+	~Impl()
+	{
+		// Join from the owning thread, never from a worker that happens to
+		// drop the last reference.
+		workers->stop();
+	}
 };
 
 TileEngine::TileEngine() : impl_(std::make_unique<Impl>()) {}
@@ -307,6 +444,7 @@ TileEngine::init(Cesium3DTilesSelection::IPrepareRendererResources *prepare)
 	// Re-callable: changing the key mid-session (via the entry card) drops the
 	// old tileset first so we don't leak it / double-register content types.
 	shutdown();
+	impl_->workers->start(); // shutdown() stopped the pool
 
 	spdlog::set_level(spdlog::level::critical); // mute per-request parse-warning spam
 
@@ -348,7 +486,28 @@ void
 TileEngine::shutdown()
 {
 	impl_->lastResult = nullptr;
-	impl_->tileset.reset();
+	if (impl_->tileset) {
+		// The Tileset dtor does not wait for tiles that are still loading;
+		// they finish asynchronously and free() through the renderer on the
+		// main thread. Keep pumping main-thread tasks until that completes,
+		// so the caller can destroy the renderer and VkDevice afterwards.
+		CesiumAsync::SharedFuture<void> destroyed =
+		    impl_->tileset->getAsyncDestructionCompleteEvent();
+		impl_->tileset.reset();
+		const auto deadline = std::chrono::steady_clock::now() + kShutdownDrainTimeout;
+		while (!destroyed.isReady() && std::chrono::steady_clock::now() < deadline) {
+			impl_->asyncSystem.dispatchMainThreadTasks();
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		if (!destroyed.isReady()) {
+			fprintf(stderr,
+			        "tile_engine: tileset async destruction did not finish within %lld ms; "
+			        "continuing shutdown
+",
+			        (long long)kShutdownDrainTimeout.count());
+		}
+	}
+	impl_->workers->stop();
 	lastRenderTiles_ = 0;
 }
 
