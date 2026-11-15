@@ -502,8 +502,7 @@ TileEngine::shutdown()
 		if (!destroyed.isReady()) {
 			fprintf(stderr,
 			        "tile_engine: tileset async destruction did not finish within %lld ms; "
-			        "continuing shutdown
-",
+			        "continuing shutdown\n",
 			        (long long)kShutdownDrainTimeout.count());
 		}
 	}
