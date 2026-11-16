@@ -220,7 +220,7 @@ an orbit center and (exploratory) switches to the display-centric diorama rig.
 | **Double-click** | raycast pick → acquire orbit center → display-centric diorama rig (gauss-demo pattern) |
 | Esc / Space | release orbit center, back to camera-centric; reset to bookmark framing |
 | `B` / HUD | cycle city bookmarks (**Paris default**, SF, NYC, Tokyo, Sydney, …) with a short fly-over interpolation |
-| V / 0–3, T, Tab, I | runtime-standard: mode cycle/select, eye-tracking toggle, HUD, capture — as in modelviewer |
+| V / 0–3, Tab, I | runtime-standard: mode cycle/select, HUD, capture — as in modelviewer (no eye-tracking toggle: the demo stays on MANAGED) |
 
 ### 7.2 Android (v1)
 Auto-orbit the current bookmark (gauss-demo pattern); bookmark cycle via a
