@@ -1331,6 +1331,9 @@ static void RenderThreadFunc(
             // above); clear them on the shared state so they fire exactly once.
             g_inputState.cycleRenderingModeRequested = false;
             g_inputState.absoluteRenderingModeRequested = -1;
+            // T (eye-tracking MANAGED/MANUAL) is a cube-test-app key only: this
+            // demo stays on the runtime default (MANAGED). Clear the shared flag
+            // so it never latches.
             g_inputState.eyeTrackingModeToggleRequested = false;
             g_inputState.animateToggleRequested = false;
             if (animateToggle) {
@@ -1365,18 +1368,6 @@ static void RenderThreadFunc(
         // lands on inputSnapshot.viewParams.ipdFactor (what the render path reads).
         // Runtime owns current mode via xr->currentModeIndex.
         XrSessionUpdateModeSwitch(*xr, inputSnapshot, perfStats.deltaTime);
-
-        // Handle eye tracking mode toggle (T key)
-        if (inputSnapshot.eyeTrackingModeToggleRequested) {
-            if (xr->pfnRequestEyeTrackingModeEXT && xr->session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeDXR newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
-                XrResult etResult = xr->pfnRequestEyeTrackingModeEXT(xr->session, newMode);
-                LOG_INFO("Eye tracking mode -> %s (%s)",
-                    newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
-                    XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
-            }
-        }
 
         UpdatePerformanceStats(perfStats);
         // Geo navigation (replaces UpdateCameraMovement). The XR rig pose stays

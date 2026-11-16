@@ -110,7 +110,7 @@ releases; CI then installs it into pristine 22.04 / 24.04 / 26.04 containers
 | `C` | release orbit → camera-centric fly (continuous) |
 | Esc / Space | release orbit / reset framing |
 | `B` | cycle city bookmarks (Paris, SF, NYC, Tokyo, Sydney) |
-| `V` / `0`–`3`, `T`, Tab, `I` | mode cycle/select, eye-tracking, HUD, atlas capture |
+| `V` / `0`–`3`, Tab, `I` | mode cycle/select, HUD, atlas capture |
 
 **Depth-aware cursor.** Where the city pops out of the glass under the
 pointer, the runtime draws the cursor just in front of it (runtime ≥ v2.36,

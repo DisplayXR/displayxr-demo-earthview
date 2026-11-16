@@ -112,7 +112,6 @@ struct InputState {
     bool hudVisible = false;  // Hidden by default; toggle with Tab.
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
-    bool eyeTrackingModeToggleRequested = false;
     bool teleportRequested = false;
     float teleportMouseX = 0.0f, teleportMouseY = 0.0f; // logical points
 
@@ -723,9 +722,6 @@ static void ShowKeyCard() {
         case 'i': case 'I':
             g_input.captureAtlasRequested = true;
             break;
-        case 't': case 'T':
-            g_input.eyeTrackingModeToggleRequested = true;
-            break;
         case '-': case '_': {
             // Edit steadyIpdFactor (the ModeSwitch ramp target); seed ipdFactor
             // in lockstep for the idle/non-ramp render path.
@@ -1192,7 +1188,6 @@ struct AppXrSession {
 
     // Function pointers
     PFN_xrRequestDisplayModeDXR pfnRequestDisplayModeEXT = nullptr;
-    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingModeEXT = nullptr;
     PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
@@ -1384,8 +1379,6 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             LOG_INFO("Display desktop position: (%d, %d)", xr.displayScreenLeft, xr.displayScreenTop);
         }
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
-        if (xr.supportedEyeTrackingModes != 0)
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
 
         // Load unified rendering mode function pointers (v7)
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR", (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
@@ -2243,7 +2236,7 @@ int main() {
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Controls: WASD=Pan  E/Q=Climb  LMB-drag=Look  Scroll=Dolly  DblClick=Orbit-acquire");
     LOG_INFO("          B=City  C=Orbit->Fly  Esc/Space=Release/Reset  -/= Depth  M=Auto-Orbit  V=Mode");
-    LOG_INFO("          I=Capture  T=EyeTracking  Cmd+K=API key  Tab=HUD  ESC=Quit");
+    LOG_INFO("          I=Capture  Cmd+K=API key  Tab=HUD  ESC=Quit");
 
     // Depth-aware cursor: the runtime draws it (default look) in front of the
     // terrain/buildings where they pop out of the glass; the app supplies the
@@ -2353,16 +2346,6 @@ int main() {
                 }
             } else {
                 g_input.viewParams.ipdFactor = steady;
-            }
-        }
-
-        // Handle eye tracking mode toggle
-        if (g_input.eyeTrackingModeToggleRequested) {
-            g_input.eyeTrackingModeToggleRequested = false;
-            if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeDXR newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
-                xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
             }
         }
 
