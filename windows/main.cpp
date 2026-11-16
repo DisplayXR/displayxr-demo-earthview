@@ -2279,7 +2279,8 @@ static void RenderThreadFunc(
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->eyePositions, (uint32_t)eyeCount,
                                     xr->eyeTrackingActive, xr->isEyeTracking,
-                                    xr->activeEyeTrackingMode, xr->supportedEyeTrackingModes);
+                                    xr->activeEyeTrackingMode, xr->supportedEyeTrackingModes,
+                                    /*showModeToggleHint=*/false); // no T toggle in this demo
 
                                 float fwdX = -sinf(inputSnapshot.yaw) * cosf(inputSnapshot.pitch);
                                 float fwdY =  sinf(inputSnapshot.pitch);
