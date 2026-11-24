@@ -290,6 +290,7 @@ InitializeOpenXR(AppXrSession &xr, DxrWindowBackend requestedBackend)
 	                                        exts.data());
 
 	bool hasVulkan = false;
+	bool hasWorkspaceInput = false;
 	for (const auto &e : exts) {
 		if (strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0)
 			hasVulkan = true;
@@ -304,6 +305,8 @@ InitializeOpenXR(AppXrSession &xr, DxrWindowBackend requestedBackend)
 			xr.hasXlibBindingExt = true;
 		if (strcmp(e.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0)
 			xr.hasWaylandBindingExt = true;
+		if (strcmp(e.extensionName, XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME) == 0)
+			hasWorkspaceInput = true;
 	}
 	if (!hasVulkan) {
 		LOG_ERROR("XR_KHR_vulkan_enable not available");
@@ -338,6 +341,15 @@ InitializeOpenXR(AppXrSession &xr, DxrWindowBackend requestedBackend)
 		enabled.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
 	if (xr.windowBackend == DxrWindowBackend::Wayland)
 		enabled.push_back(XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME);
+	// XR_DXR_workspace_client_input: inside the DisplayXR workspace the window
+	// is hidden and the service owns the pointer and keyboard; this lets the
+	// window helper drain the app's routed share and deliver it as ordinary
+	// window events (displayxr-common's DxrLinuxWindow, armed by
+	// attach_session). A no-op outside a workspace, so enable it whenever the
+	// runtime advertises it.
+	if (hasWorkspaceInput)
+		enabled.push_back(XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME);
+	LOG_INFO("XR_DXR_workspace_client_input: %s", hasWorkspaceInput ? "ENABLED" : "NOT FOUND");
 
 	XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
 	strncpy(ci.applicationInfo.applicationName, "DisplayXREarthViewLinux",
