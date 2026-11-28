@@ -352,7 +352,7 @@ InitializeOpenXR(AppXrSession &xr, DxrWindowBackend requestedBackend)
 	LOG_INFO("XR_DXR_workspace_client_input: %s", hasWorkspaceInput ? "ENABLED" : "NOT FOUND");
 
 	XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
-	strncpy(ci.applicationInfo.applicationName, "DisplayXREarthViewLinux",
+	strncpy(ci.applicationInfo.applicationName, "DisplayXR EarthView",
 	        sizeof(ci.applicationInfo.applicationName) - 1);
 	ci.applicationInfo.applicationVersion = 1;
 	strncpy(ci.applicationInfo.engineName, "None",
@@ -458,7 +458,7 @@ CreateVulkanInstance(AppXrSession &xr, VkInstance &vkInstance)
 
 	VkApplicationInfo ai = {};
 	ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-	ai.pApplicationName = "DisplayXREarthViewLinux";
+	ai.pApplicationName = "DisplayXR EarthView";
 	ai.apiVersion = VK_API_VERSION_1_2;
 	VkInstanceCreateInfo ci = {};
 	ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;

@@ -267,7 +267,7 @@ create_instance(struct android_app *app)
 	XrInstanceCreateInfo ci = {};
 	ci.type = XR_TYPE_INSTANCE_CREATE_INFO;
 	ci.next = &ainfo;
-	std::strncpy(ci.applicationInfo.applicationName, "earthview_vk_android", XR_MAX_APPLICATION_NAME_SIZE - 1);
+	std::strncpy(ci.applicationInfo.applicationName, "DisplayXR EarthView", XR_MAX_APPLICATION_NAME_SIZE - 1);
 	ci.applicationInfo.applicationVersion = 1;
 	std::strncpy(ci.applicationInfo.engineName, "displayxr", XR_MAX_ENGINE_NAME_SIZE - 1);
 	ci.applicationInfo.engineVersion = 1;
@@ -317,7 +317,7 @@ create_vulkan_instance()
 	PFN_xrCreateVulkanInstanceKHR fn = nullptr;
 	if (xrGetInstanceProcAddr(g_instance, "xrCreateVulkanInstanceKHR", (PFN_xrVoidFunction *)&fn) != XR_SUCCESS || !fn) return false;
 	VkApplicationInfo ai = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
-	ai.pApplicationName = "earthview_vk_android"; ai.pEngineName = "displayxr";
+	ai.pApplicationName = "DisplayXR EarthView"; ai.pEngineName = "displayxr";
 	ai.apiVersion = VK_MAKE_VERSION(XR_VERSION_MAJOR(g_required_vk_version), XR_VERSION_MINOR(g_required_vk_version), 0);
 	VkInstanceCreateInfo vci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
 	vci.pApplicationInfo = &ai;
