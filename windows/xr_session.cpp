@@ -125,7 +125,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
-    strcpy_s(createInfo.applicationInfo.applicationName, "SR3DGSOpenXRExtVK");
+    strcpy_s(createInfo.applicationInfo.applicationName, "DisplayXR EarthView");
     createInfo.applicationInfo.applicationVersion = 1;
     strcpy_s(createInfo.applicationInfo.engineName, "None");
     createInfo.applicationInfo.engineVersion = 0;
@@ -321,7 +321,7 @@ bool CreateVulkanInstance(XrSessionManager& xr, VkInstance& vkInstance) {
 
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "SR3DGSOpenXRExtVK";
+    appInfo.pApplicationName = "DisplayXR EarthView";
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.pEngineName = "None";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
